@@ -1,0 +1,28 @@
+{
+  "skill": "ftth-address-extractor",
+  "skill_version": "0.65.0",
+  "skill_version_basis": "minor 位 = SKILL_CHANGELOG 修订序号（本条基线时为「六十五」＝65）；patch 位对应同一修订序号内的「·补」条目（如「五十三·补」）；major 位固定 0，待对外发布时由人工提升。不采用未经验证的语义化版本号，避免出现无据可查的版本事实。",
+  "versioning_since": "2026-09-18",
+  "versioning_purpose": "使技能包输出可复现、可回滚、可 diff。此前追溯只能靠 SKILL_CHANGELOG 的中文修订序号，且真源不在任何版本控制下。",
+
+  "schema_version": {
+    "_note": "以下三项的值与 scripts/ledger_state.py 内的常量一一对应，是台账 JSON 的机器可校验标识。改台账结构时改代码常量，本文件同步；本文件不得被当作台账 schema 的独立来源。",
+    "understanding_snapshot": "ftth.understanding_snapshot/v1",
+    "ruling_ledger": "ftth.ruling_ledger/v1",
+    "alias_ledger": "ftth.alias_ledger/v1"
+  },
+
+  "runtime_tested_with": {
+    "_note": "实测事实，非版本要求。实测口径：真实执行 `import ezdxf` 并读取其 __version__。",
+    "python": "3.13.12",
+    "ezdxf": "1.4.4",
+    "measured_at": "2026-09-18"
+  },
+  "runtime_note": "解释器一律经 scripts/ftth.cmd 探测后调用 —— 它以真实 `import ezdxf` 决定可用解释器（本机实测存在无 ezdxf 的解释器排在 PATH 前面），探测不到返回 rc=9；禁止按路径猜解释器，见 L1-C7 调用契约。",
+
+  "traceability": {
+    "result_fields": "脚本产物须带 result_origin / result_confirmation 两字段（L1-C8），并由 inspect_closure.py C9 校验闭合。",
+    "state_carrier": "跨阶段状态由三本台账承载（理解快照 / 裁决台账 / 别名台账），非由独立状态机文件承载；迁移门禁另由 scripts/check_transitions.py 核对。",
+    "changelog": "SKILL_CHANGELOG.md（完整修订记录，中文序号追溯）"
+  }
+}
