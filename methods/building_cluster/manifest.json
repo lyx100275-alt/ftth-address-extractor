@@ -1,0 +1,191 @@
+{
+  "name": "楼-簇组织型图纸",
+  "kind": "drawing_profile",
+  "version": "2.0",
+  "description": "【图纸类型档案，非方法绑定、非项目绑定】适用于『每楼成独立簇 + 有户数标注 + 有皮线米数V形标注』这类图纸。方法按测量原理命名（读取标注/区间法/竖线法/V型计算），本档案只记录『这类图纸上各步骤该选哪些方法、候选如何排序』，不绑定任何具体项目。新图纸必须按 Step 1a 探查信号重新选法，本档案仅供选法参考。",
+  "signals": {
+    "cluster_layout": {
+      "status": "present",
+      "evidence": "每楼信息聚成独立簇，标题是簇内锚点；楼层 y 坐标楼内独立有效"
+    },
+    "household_annotation": {
+      "status": "present",
+      "evidence": "存在可直接读取的『X户』层户数标注"
+    },
+    "fiber_length_vshape": {
+      "status": "present",
+      "evidence": "存在形如『Xm*N』的皮线长度标注，且沿楼层排列出现局部极小（谷底）"
+    },
+    "dedicated_wire_layer": {
+      "status": "absent",
+      "evidence": "连线与建筑线同图层（线段集中在通用图层，混建筑/暖通），无独立电信连线图层"
+    },
+    "vertical_bus_traceable": {
+      "status": "absent",
+      "evidence": "因 dedicated_wire_layer 缺失，竖干无法与建筑线区分，竖线法前置条件不成立"
+    }
+  },
+  "steps": {
+    "探查": {
+      "description": "标准探查：图层/文字类型/坐标尺度/线段图层分布/INSERT检查",
+      "actions": [
+        "列出所有图层名，找到含FTTH标注信息的图层",
+        "确认文字实体类型(MTEXT/TEXT)",
+        "随机采样文字内容",
+        "统计坐标分布范围",
+        "统计LINE/LWPOLYLINE的图层分布（判断 dedicated_wire_layer）",
+        "检查INSERT实体及ATTRIB属性"
+      ],
+      "output": "图纸画像JSON（含 suggested_params）",
+      "next": "解析"
+    },
+    "解析": {
+      "楼栋分组": {
+        "candidates": [
+          {
+            "role": "primary",
+            "method": "标题锚点+x中分",
+            "requires": [
+              "cluster_layout"
+            ],
+            "script": "parse_dxf_structured.py",
+            "params": {
+              "title_pattern": "由探查枚举全部楼栋标题实际写法后确定"
+            }
+          }
+        ]
+      },
+      "户数提取": {
+        "candidates": [
+          {
+            "role": "primary",
+            "method": "读取标注（直读『X户』）",
+            "requires": [
+              "household_annotation"
+            ],
+            "script": "parse_dxf_structured.py",
+            "params": {
+              "hu_pattern": "由探查采样后确定"
+            }
+          },
+          {
+            "role": "alternate",
+            "method": "家居配线箱图标法（系统图内图标贴皮线末端计户，A/B/C 三级置信）",
+            "requires": [
+              "floor_scale",
+              "dedicated_wire_layer",
+              "box_icon_annotation"
+            ],
+            "script": "count_box_icons.py",
+            "params": {
+              "前置": "**三前置**——① 区间法公共前置 floor_scale（图标法是区间法的一种，锚点取家居配线箱图标，与皮线法同属「锚点落楼层带」；无楼层刻度则建不成楼层带、归层合计恒为 0）；② 图标标识 box_icon_annotation；③ 可自动识别的专用连线层 dedicated_wire_layer。缺皮线图元时 count_box_icons.py 硬失败 rc=2、产不出结果"
+            }
+          },
+          {
+            "role": "alternate",
+            "method": "区间法（皮线锚点落楼层带计数）",
+            "requires": [
+              "floor_scale"
+            ],
+            "script": "count_households.py",
+            "params": {
+              "前置否决": "**图标法可用时不得选本法**（数图标，不数皮线）；图标法不可用时允许回落"
+            }
+          }
+        ],
+        "cross_check": "**本子任务按候选顺序取首个可用者，非并跑**（2026-09-16 用户裁决）：①有『X户』标注或图签『N层/M户』→ 直读；②两者皆无 → 区间法，其中图标法（floor_scale + 专用连线层 + 图标标识三前置齐备）优先于皮线计数，图标法不可用才回落皮线。划定实体口径后仍须与『X户』直读值（若有）对账，不一致不得自动择一，交用户裁定"
+      },
+      "覆盖判定": {
+        "candidates": [
+          {
+            "role": "primary",
+            "method": "V型计算（皮线米数谷底）",
+            "requires": [
+              "fiber_length_vshape"
+            ],
+            "script": "analyze_coverage_vshape.py",
+            "params": {
+              "cable_pattern": "由探查采样后确定",
+              "include_basement": "默认False——V型计算的数据来源是米数列标注，覆盖范围的每一项都必须来自米数列实际存在的行（SKILL.md 原则三）"
+            }
+          },
+          {
+            "role": "alternate",
+            "method": "竖线法（竖干断口/端点直推·三步走）",
+            "requires": [
+              "dedicated_wire_layer",
+              "vertical_bus_traceable"
+            ],
+            "script": "analyze_coverage.py",
+            "params": {
+              "wire_layer": "必须显式传入连线图层名"
+            }
+          }
+        ],
+        "cross_check": "两者 requires 同时成立时必须并跑比对：覆盖楼层集合一致才通过；不一致列入待确认。仅一个前置成立时用该法，并在输出中标注『无第二来源』",
+        "independent_check": "V形法自检：V谷底对应楼层线 y vs 箱号文字 y（两个独立来源，偏差应恒定）；另有『区间法测箱安装层 vs V谷底楼层』互证",
+        "notes": [
+          "方法按测量原理命名，禁止用小区名冠名",
+          "竖线法/V型计算只测覆盖楼层，区间法只测户数与安装楼层，不得混用",
+          "严禁用『按安装楼层排序切分』或『取箱附近全部竖干min~max』判覆盖"
+        ]
+      },
+      "INSERT提取": {
+        "candidates": [
+          {
+            "role": "primary",
+            "method": "INSERT块ATTRIB属性读取（按属性值识别设备，不按块名）",
+            "script": "parse_dxf_structured.py",
+            "params": {
+              "insert_blocks": "由探查枚举全部设备块名",
+              "insert_attrib_tag": "由探查确定",
+              "insert_attrib_val": "由探查确定"
+            }
+          }
+        ]
+      }
+    },
+    "自检": {
+      "checks": [
+        "两类图纸交叉验证（总图（若有）/系统图，户数以系统图为准）",
+        "楼层完整性（连续性/无混入）",
+        "楼层归属方法校验（区间法）",
+        "楼层数两方交叉校验（系统图楼层线数 vs INSERT列覆盖楼层数）",
+        "户数/皮线匹配",
+        "分纤箱安装楼层口径标注",
+        "覆盖范围第二来源核对（两法前置都成立时必须双跑）",
+        "矛盾检查"
+      ]
+    },
+    "出表": {
+      "method": "standard_assembly",
+      "script": "gen_addressbook.py",
+      "params": {
+        "template": "assets/标准地址表模板.xlsx",
+        "cover_rule": "floor100"
+      },
+      "output": "xlsx（每户一行，9级地址+分纤箱编号）",
+      "notes": [
+        "分纤箱编号用 DXF 原文，不加小区名前缀",
+        "楼层表户数 null 的楼层需先剔除再出表，否则守恒校验报错",
+        "同一内部字段多列时模板示例取首个非空值"
+      ]
+    }
+  },
+  "param_source": {
+    "note": "本档案不提供任何检测类参数的默认值——图层名、标题写法、编号格式每张图都不同，必须由 Step 1a 探查结果提供。",
+    "must_probe": {
+      "text_layer": "含FTTH标注的文字图层（探查列出图层清单并采样后确定）",
+      "text_type": "文字实体类型（MTEXT / TEXT）",
+      "title_pattern": "楼栋标题正则（探查必须枚举全部标题实际写法：配套楼/商业楼/无『楼』字的写法）",
+      "floor_pattern": "保持 None（内置统一解析，支持 3F/17F/-1F/B1/B2/WF）；仅当图纸用非标楼层写法时才显式指定",
+      "hu_pattern": "层户数标注正则（探查采样后确定）",
+      "cable_pattern": "皮线米数标注正则（探查采样后确定）",
+      "fx_pattern": "分纤箱编号正则（探查采样后确定）",
+      "unit_pattern": "单元标注正则（探查采样后确定）"
+    },
+    "algorithm_defaults": {
+      "note": "判据是【是否随图纸坐标尺度变化】，不是【名字里带不带容差】。本技能**没有**不随尺度变化的算法常数：unit_cluster / unit_range / y_tol 等阈值一律由本图层高自适应推导（量测失败时回退 ftth_common.py 的 DEFAULT_*，日志显式标注），**不得跨图沿用**。2026-09-16 移除 install_tol —— 该参数已废除，安装楼层一律走纯区间法，不再接受距离闸门"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+# 本文件位于 scripts/，只作用于本目录及子目录。
+# 注意：不要在这里写 `*.json` / `*.xlsx` 这类宽泛规则——
+# 技能赖以运行的关键文件（methods/signals.json、methods/*/manifest.json、
+# assets/标准地址表模板.xlsx）会因此被误排除。见上级 .gitignore。
+__pycache__/
+*.pyc

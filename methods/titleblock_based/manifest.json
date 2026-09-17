@@ -1,0 +1,118 @@
+{
+  "name": "图签标注型图纸",
+  "kind": "drawing_profile",
+  "version": "1.0",
+  "description": "【图纸类型档案，非方法绑定、非项目绑定】适用于『入户规模（单元数/层数/每层户数）直接写在图签（标题栏）层』或『项目另附《楼宇信息采集表》』的图纸。两者任一存在即可跳过『数实体』直接取得栋级入户规模；两者同时存在时构成三来源协议，必须逐栋比对。",
+  "signals": {
+    "cluster_layout": {
+      "status": "absent",
+      "evidence": "标题与内容常分离（标题在图签层、内容在标注层），不构成簇式组织"
+    },
+    "shared_drawing": {
+      "status": "variant",
+      "evidence": "标题可能写成 `N/M号楼` 斜杠并列式（共享图纸），必须由 parse_bldg_nums 展开为多栋，否则后续楼栋整栋静默丢失"
+    },
+    "household_annotation": {
+      "status": "variant",
+      "evidence": "层户数不在楼层列旁逐层标注，而是以 `N层/M户` 的栋级汇总形式出现在图签层"
+    },
+    "fiber_length_vshape": {
+      "status": "absent",
+      "evidence": "无逐层皮线米数标注，V型计算前置条件不成立（除非另附系统图带米数列）"
+    },
+    "titleblock_annotation": {
+      "status": "present",
+      "evidence": "图签层内 楼名 / `N层/M户` / `N单元` 三件套成对出现，几何偏移在同图内为常数"
+    },
+    "intake_table": {
+      "status": "present",
+      "evidence": "项目另附《楼宇信息采集表》，按小区给出 单元数 / 层数 / 每层住户数"
+    }
+  },
+  "steps": {
+    "探查": {
+      "description": "标准探查 + 图签层定位 + 几何偏移量测 + 采集表定位",
+      "actions": [
+        "列出全部图层，定位承载楼名 / `N层/M户` / `N单元` 的图签（标题栏）图层",
+        "枚举标题实际写法（`N号楼` / `N#楼` / `N/M号楼` / `N#、N#`），交给 parse_bldg_nums 验证覆盖率",
+        "量测 楼名 → 层户标注 → 单元标注 的 x 容差与 y 偏移区间（六个几何容差）。这些值随图纸坐标尺度变化，故不设固定默认值；可直接跑 probe_titleblock_tolerances.py 量测（推荐），read_titleblock_households.py 缺省时也会按本图自适应并打印推定值",
+        "若一张 DXF 混排多个地块，确定各地块的 y 分段（band）",
+        "检查是否附有《楼宇信息采集表》，定位 sheet 与列序",
+        "记录同一楼名的出现次数分布，为后续识别重复绘制/楼名笔误建立基准"
+      ],
+      "output": "图纸画像JSON（含 suggested_params：图签层、几何容差、band 分段、采集表位置）",
+      "next": "解析"
+    },
+    "解析": {
+      "入户规模": {
+        "primary": {
+          "method": "读取标注（图签形态）",
+          "script": "read_titleblock_households.py",
+          "requires": ["titleblock_annotation"]
+        },
+        "secondary": {
+          "method": "读取标注（采集表形态）",
+          "source": "《楼宇信息采集表》",
+          "requires": ["intake_table"]
+        },
+        "cross_check": "两来源同时成立时必须逐栋比对 `(单元数, 层数, 每层户数)`；聚合计数不得作判据（图纸重复绘制会翻倍）；不一致列双来源证据交人裁定，不得自动择一",
+        "notes": [
+          "图签原文若出现『共覆盖住户N户』这类整段复制文字，不得作户数依据（常见于跨地块复制未改）",
+          "同一楼名出现次数偏离基准（如某栋 4 次、另一栋 0 次）→ 成对定位为楼名笔误，按配对关系纠正并在裁定覆盖表中留痕"
+        ]
+      }
+    },
+    "自检": {
+      "checks": [
+        "逐栋比对：图签 vs 采集表，逐栋 `(单元数,层数,每层户数)` 一致",
+        "楼号覆盖率：标题展开出的栋数 = 采集表该地块栋数（不等即查笔误/漏读）",
+        "重复绘制识别：同一楼名出现次数分布，偏离基准者报告"
+      ]
+    },
+    "出表": {
+      "method": "九级地址树（每级节点各占一行）",
+      "script": "gen_9level_addressbook.py",
+      "requires": ["read_titleblock_households.py 产出的 households.json"],
+      "params": {
+        "header_xlsx": "项目已定稿的标准地址表（表头与列序必须取自它，不得自行重排）",
+        "addr": "分公司,一级,二级,三级,四级",
+        "alias_idx": "别名列下标",
+        "memo_idx": "备注列下标"
+      },
+      "workflow": [
+        "read_titleblock_households.py 产出 households.json（含逐栋比对与质量报告）",
+        "gen_9level_addressbook.py 以 header_xlsx 的表头为骨架展开地址树",
+        "行数恒等式门禁：行数 = 1 + 1 + 楼栋数 + 单元数 + Σ层数 + Σ户数"
+      ],
+      "output": "xlsx（九级地址树，含逐栋校验页与核验说明页）"
+    }
+  },
+  "param_source": {
+    "note": "本档案不提供任何检测类参数的【固定】默认值：图签图层名、标题写法、几何容差、地块 y 分段每张图都不同，必须由 Step 1a 探查结果提供。其中几何容差可由脚本从本图量出（probe_titleblock_tolerances.py，或 read_titleblock_households.py 的缺省自适应）—— 这不等于给了默认值：量的是当前这张图。",
+    "must_probe": {
+      "text_layer": "含FTTH标注的文字图层（探查列出图层清单并采样后确定）",
+      "floor_layer": "图签/标题栏图层名（承载 楼名 + `N层/M户` + `N单元`）",
+      "title_pattern": "楼栋标题正则（探查必须枚举全部实际写法）",
+      "bldg_pattern": "楼名正则（默认 `\\d+\\s*[#＃号]?\\s*楼`，覆盖 `1#楼` / `1号楼` / `1楼`）",
+      "level_pattern": "层户标注正则（默认 `(\\d+)层/(\\d+)户`）",
+      "unit_pattern": "单元标注正则（默认 `\\d+单元`）",
+      "geometry_tolerances": "六个几何容差 dx-tol / dy-lo / dy-hi / unit-dx / unit-dy-lo / unit-dy-hi —— 与图纸坐标尺度绑定，故不设固定默认值。可跑 probe_titleblock_tolerances.py 量测（输出建议值与实测证据）；read_titleblock_households.py 缺省时按本图自适应，并把推定值与依据写进结果 JSON 的【几何容差】字段",
+      "band": "多地块混排时的 y 分段 name:ymin:ymax（顺序即图纸自上而下）",
+      "intake_table": "《楼宇信息采集表》路径、sheet 名、列序（小区名称,楼宇名称,单元数,层数,每层住户数）",
+      "intake_area_map": "地块 → 采集表小区名 映射（一个采集表小区被图纸拆成多个地块分段时必需）"
+    },
+    "algorithm_defaults": {
+      "note": "判据是【是否随图纸坐标尺度变化】，不是【名字里带不带容差】。几何容差随尺度变化，归 must_probe（由本图量出）；下列**无量纲比值**与尺度无关，保留常数默认值。",
+      "geometry_tolerance_estimator": {
+        "location": "scripts/ftth_common.py 模块级 TOL_* 常量",
+        "TOL_CLUSTER_REL_TOL": 0.10,
+        "TOL_CORE_LO": 0.80,
+        "TOL_CORE_HI": 1.25,
+        "TOL_BAND_REL": 0.10,
+        "TOL_PAD_REL": 0.02,
+        "safety": 1.25,
+        "note": "全部为相对比值（× 本图主簇中位数），与坐标尺度无关，故不做成命令行参数；集中定义且每次量测都写进结果 JSON 的证据字段「算法常数」，便于复核。"
+      }
+    }
+  }
+}

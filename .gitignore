@@ -1,0 +1,33 @@
+# 技能根目录忽略规则
+# 只忽略"运行产物"，绝不忽略技能赖以运行的关键文件。
+
+__pycache__/
+*.pyc
+
+# 运行产物（脚本输出，默认落在被解析 DXF 的同目录）
+*_解析结果.json
+*_户数统计.json
+*_覆盖范围.json
+*_fx映射表.json
+*_hdd验证.json
+*_解析结果_*.json
+
+# 出表产物
+标准地址表*.xlsx
+
+# 修订备份（临时物）——按 SKILL.md「总则 · 维护约定」应存放于技能目录之外，
+# 此处再兜一道，防误留、防误入库。
+*.bak_*
+*.pre_patch*
+
+# ⚠️ 以下目录是技能本体，必须入库，禁止被上面的通配规则误伤
+!methods/
+!methods/**
+!assets/
+!assets/**
+!references/
+!references/**
+!scripts/
+!scripts/**
+!SKILL.md
+!SKILL_CHANGELOG.md

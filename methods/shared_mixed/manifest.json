@@ -1,0 +1,145 @@
+{
+  "name": "共享图纸+混合布局型图纸",
+  "kind": "drawing_profile",
+  "version": "2.0",
+  "description": "【图纸类型档案，非方法绑定、非项目绑定】适用于『多栋共享一张图纸 + 无户数标注 + 无皮线米数 + 有独立电信连线图层 + 有分纤箱总图』这类图纸。方法按测量原理命名（读取标注/区间法/竖线法/V型计算），本档案只记录『这类图纸上各步骤该选哪些方法、候选如何排序』，不绑定任何具体项目。新图纸必须按 Step 1a 探查信号重新选法，本档案仅供选法参考。",
+  "signals": {
+    "cluster_layout": {
+      "status": "absent",
+      "evidence": "标题是图框角标签，与内容分离；楼层线贯穿所有楼栋，无独立簇结构"
+    },
+    "shared_drawing": {
+      "status": "present",
+      "evidence": "标题中含多个楼栋号，多栋共享同一份图"
+    },
+    "household_annotation": {
+      "status": "absent",
+      "evidence": "无『X户』层户数标注"
+    },
+    "fiber_length_vshape": {
+      "status": "absent",
+      "evidence": "无皮线长度标注，V型计算前置条件不成立"
+    },
+    "dedicated_wire_layer": {
+      "status": "present",
+      "evidence": "存在独立于建筑线的电信连线图层，连线可单独提取"
+    },
+    "vertical_bus_traceable": {
+      "status": "present",
+      "evidence": "竖干在专用图层上连续，物理断口/断头端点可识别"
+    },
+    "fx_overview_map": {
+      "status": "present",
+      "evidence": "存在分纤箱总图，集中标注 FX 编号、楼栋、单元、安装楼层"
+    },
+    "coverage_table": {
+      "status": "present",
+      "evidence": "存在覆盖表（光交配纤表 / 楼栋覆盖标注）"
+    }
+  },
+  "steps": {
+    "探查": {
+      "description": "标准探查 + 总图定位 + 覆盖表检查",
+      "actions": [
+        "列出所有图层名",
+        "确认文字实体类型",
+        "随机采样文字内容",
+        "统计坐标分布范围",
+        "统计LINE/LWPOLYLINE的图层分布（判断 dedicated_wire_layer）",
+        "检查INSERT实体及ATTRIB属性",
+        "定位分纤箱总图（含FX+楼栋+单元标注的区域）",
+        "定位覆盖表（含'至'+'箱'的区域）"
+      ],
+      "output": "图纸画像JSON（含suggested_params、总图区域、覆盖表区域）",
+      "next": "解析"
+    },
+    "解析": {
+      "楼栋分组": {
+        "candidates": [
+          {"role": "primary", "method": "区域归属法（标题锚点+y区间兜底）", "requires": ["shared_drawing"], "script": "parse_dxf_structured.py",
+           "params": {"title_pattern": "由探查枚举全部楼栋标题实际写法后确定"}}
+        ],
+        "notes": ["共享图纸读一份后复制N份，分别挂到各楼名下；『各栋结构确实一致』仍列入待确认项"]
+      },
+      "户数提取": {
+        "candidates": [
+          {"role": "primary", "method": "区间法（皮线标注落楼层带计数）", "requires": ["floor_scale"], "script": "count_households.py"}
+        ],
+        "cross_check": "户数以系统图为准：系统图 INSERT 为示意画法（如画1个家居配线箱图标+乘数标注代表N户），不作户数依据；每层户数 = 归属该层的皮线标注条数（或『X户』直读）"
+      },
+      "覆盖判定": {
+        "candidates": [
+          {"role": "primary", "method": "竖线法（竖干断口/端点直推·三步走）", "requires": ["dedicated_wire_layer", "vertical_bus_traceable"], "script": "analyze_coverage.py",
+           "description": "三步走：①每层y坐标；②区间法求分纤箱安装楼层；③从安装楼层沿竖线向上/下延伸，竖线断头落在哪层就覆盖到哪层；断口是区间，用断头端点做区间法测层，不用中点",
+           "params": {"wire_layer": "必须显式传入连线图层名", "bldg_map": "图纸含分纤箱总图时必须传（extract_fx_map.py 输出）", "fx_symbol_layer": "系统图里分纤箱只画符号、不写编号时必须传"}},
+          {"role": "alternate", "method": "V型计算（皮线米数谷底）", "requires": ["fiber_length_vshape"], "script": "analyze_coverage_vshape.py"}
+        ],
+        "cross_check": "两者 requires 同时成立时必须并跑比对：覆盖楼层集合一致才通过；不一致列入待确认。仅一个前置成立时用该法，并在输出中标注『无第二来源』",
+        "notes": [
+          "覆盖表（光交配纤表+楼栋覆盖标注）不作为覆盖判据，仅作参考线索",
+          "严禁用『按安装楼层排序切分』或『取箱附近全部竖干min~max』判覆盖",
+          "方法按测量原理命名，禁止用小区名冠名",
+          "竖线法只测覆盖楼层，区间法只测户数与安装楼层，两法不混"
+        ]
+      },
+      "分纤箱提取": {
+        "candidates": [
+          {"role": "primary", "method": "总图FX映射表提取+逐栋交叉校验（安装楼层用区间法）", "requires": ["fx_overview_map"], "script": "extract_fx_map.py",
+           "description": "分纤箱安装楼层：读取标注（图上直写）优先，未直写用区间法（箱体y落进哪条楼层带即属哪层）",
+           "params": {"bldg_pattern": "由探查枚举全部楼栋标注写法后确定", "proximity_tol": "必须按探查实测的 FX↔楼栋标注距离设置"}},
+          {"role": "alternate", "method": "逐栋独立提取", "requires": [], "script": "parse_dxf_structured.py"}
+        ],
+        "cross_check": "提取后必须与总图布局人工目视核对（几何最近 ≠ 正确归属），矛盾项列入待确认"
+      },
+      "INSERT提取": {
+        "candidates": [
+          {"role": "primary", "method": "INSERT块ATTRIB属性读取（按属性值识别设备，不按块名）", "script": "parse_dxf_structured.py",
+           "params": {"insert_blocks": "由探查枚举全部设备块名", "insert_attrib_tag": "由探查确定", "insert_attrib_val": "由探查确定"}}
+        ]
+      }
+    },
+    "自检": {
+      "checks": [
+        "两类图纸交叉验证（总图（若有）/系统图，户数以系统图为准）",
+        "系统图INSERT为示意画法，不作户数依据（户数以皮线标注/『X户』直读为准）",
+        "区间法楼层归属校验（户数与分纤箱安装楼层同用区间法）",
+        "竖线法覆盖判定校验（断口定分界，禁止安装楼层排序切分）",
+        "方法不混用检查：竖线法/V型计算只测覆盖、区间法只测户数/箱位",
+        "分纤箱编号总图vs逐栋一致性",
+        "覆盖表仅作参考线索，不作覆盖判据",
+        "覆盖范围第二来源核对（两法前置都成立时必须双跑）",
+        "楼层完整性",
+        "矛盾检查"
+      ]
+    },
+    "出表": {
+      "method": "多楼栋合并出表",
+      "script": "gen_addressbook.py + merge_json.py",
+      "params": {"template": "assets/标准地址表模板.xlsx", "cover_rule": "floor100", "branch": "用户提供的分公司名称"},
+      "workflow": [
+        "逐栋解析(parse_dxf_structured.py) → 各楼独立JSON",
+        "合并(merge_json.py) → 全小区嵌套JSON",
+        "多单元拆分(split_units.py) → 按用户确认规则拆分",
+        "出表(gen_addressbook.py --dxf-json 合并JSON) → xlsx"
+      ],
+      "output": "xlsx（每户一行，含地下层，9级地址+分公司+分纤箱编号）"
+    }
+  },
+  "param_source": {
+    "note": "本档案不提供任何检测类参数的默认值——图层名、标题写法、编号格式每张图都不同，必须由 Step 1a 探查结果提供。",
+    "must_probe": {
+      "text_layer": "含FTTH标注的文字图层（探查列出图层清单并采样后确定）",
+      "text_type": "文字实体类型（MTEXT / TEXT）",
+      "title_pattern": "楼栋标题正则（探查必须枚举全部标题实际写法）",
+      "floor_pattern": "保持 None（内置统一解析，支持 3F/17F/-1F/B1/B2/WF）",
+      "fx_pattern": "分纤箱编号正则（探查采样后确定）",
+      "bldg_pattern": "楼栋标注正则（探查必须枚举全部写法：配套楼/商业楼/无『楼』字）",
+      "unit_pattern": "单元标注正则（探查采样后确定）",
+      "wire_layer": "电信连线图层名（探查统计线段图层分布后确定）",
+      "proximity_tol": "FX 编号与最近楼栋标注的实测距离"
+    },
+    "algorithm_defaults": {
+      "note": "判据是【是否随图纸坐标尺度变化】，不是【名字里带不带容差】。以下阈值（unit_cluster / title_band_tol / bldg_pad / fx_symbol_cluster / fx_symbol_max_size / total_pad）均由本图层高推导，**随坐标尺度变化**，故此处不再给数值：一律由脚本按本图自适应（analyze_coverage.py 的 AUTO_RATIOS / AUTO_FALLBACK），量测失败时回退内置兜底值并告警，不得跨图沿用"
+    }
+  }
+}

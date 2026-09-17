@@ -1,0 +1,1214 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+FTTH DXF 结构化解析脚本（通用版 v2）
+从 DXF 文件中提取：楼栋、单元、分纤箱编号(FX)、楼层表(每层户数/皮线米数)、光缆型号。
+
+用法：
+    python parse_dxf_structured.py <输入DXF> [输出JSON] [选项]
+
+示例：
+    python parse_dxf_structured.py 图纸.dxf out.json
+    python parse_dxf_structured.py 图纸.dxf --text-layer <探查图层> --text-type MTEXT,TEXT
+    python parse_dxf_structured.py 图纸.dxf --probe        # 先探查图层/文字样例
+
+关键参数（换新图纸前务必用 --probe 确认实际标注格式再传参）：
+    --text-layer    文字所在图层，逗号分隔（必填，由探查提供）
+    --title-pattern 楼栋标题正则，需含捕获组数字（必填，由探查枚举标题写法后提供）
+    --floor-pattern 楼层标注正则（留空＝内置统一解析，支持 3F/17F/-1F/B1/B2/WF）
+    --hu-pattern    每层户数正则（由探查采样后提供）
+    --cable-pattern 皮线米数正则（由探查采样后提供）
+    --fx-pattern    分纤箱编号正则（由探查采样后提供）
+    --unit-pattern  单元标注正则（由探查采样后提供）
+
+规则：
+- 不硬编码项目特有参数；所有标注格式均可通过命令行覆盖。
+- 换新图纸先跑 --probe 确认实际图层与标注格式，再按需传参。
+- 同时支持 MTEXT 与 TEXT（默认都取）。
+- 户数直读、布线、安装楼层（口径B y坐标关联），均禁止猜测。
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+from ftth_common import (
+    DEFAULT_UNIT_CLUSTER, DEFAULT_UNIT_RANGE, DEFAULT_Y_TOL,
+    INF_COORD, NEG_INF_COORD,
+    setup_logger, bldg_num, floor_num_or_zero, parse_floor_label,
+    load_dxf, collect_texts, find_bldg_anchors, cluster_by_x, compute_bldg_ranges, match_y_to_floor,
+    MultiPlotDuplicateAnchorError,
+    assign_floor_by_interval, clean_text, is_floor_text, require_params,
+    floor_step_from_texts, set_expand_bldg_ranges,
+    extract_geom, is_bldg_title_text, suggest_fx_symbol_layers,
+    ensure_parent, write_json,
+)
+
+log = setup_logger("parse_dxf")
+
+# ---------- 参数 ----------
+ap = argparse.ArgumentParser(description="FTTH DXF 结构化解析（通用版 v2）")
+ap.add_argument("--expand-bldg-ranges", action="store_true",
+                help="楼栋区间标题（如 `1-3号楼`）按**区间**语义展开为 1,2,3。\n"
+                     "默认不展开（只取字面数字并 WARNING 待裁决）——连字符写法\n"
+                     "既可能是并列也可能是区间，**须用户确认语义后**才可开启，\n"
+                     "不得替用户静默选定语义。")
+ap.add_argument("dxf", help="输入DXF文件路径")
+ap.add_argument("out", nargs="?", default=None, help="输出JSON路径（默认DXF同目录 _解析结果.json）")
+ap.add_argument("--text-layer", default=None, help="文字所在图层，逗号分隔（必填，由探查提供）")
+ap.add_argument("--text-type", default="MTEXT,TEXT", help="文字实体类型，逗号分隔（默认两者都取）")
+ap.add_argument("--title-pattern", default=None, help="楼栋标题正则，含捕获组数字（必填，由探查提供）")
+ap.add_argument("--floor-pattern", default=None, help="楼层标注正则。默认 None＝内置统一解析（支持 3F/17F/-1F/B1/B2/WF）")
+ap.add_argument("--hu-pattern", default=None, help="每层户数正则，捕获组为户数（由探查采样后提供；留空＝不提取户数）")
+ap.add_argument("--cable-pattern", default=None, help="皮线米数正则，组1米数/组2根数（由探查采样后提供；留空＝不提取皮线）")
+ap.add_argument("--fx-pattern", default=None, help="分纤箱编号正则（由探查采样后提供；留空＝不提取分纤箱）")
+ap.add_argument("--fx-map", dest="fx_map", default=None,
+                help="总图 FX 对照表 JSON（extract_fx_map.py 产物，含「FX映射表」数组）。"
+                     "只回填 parse 侧**缺失**的安装楼层，不覆盖已测出的值；"
+                     "重号编号不回填、登记交人工。用于消除「未关联到楼层」类 FAIL")
+ap.add_argument("--bldg-map", dest="bldg_map", default=None,
+                help="总图 FX 对照表 JSON（同上，extract_fx_map.py 产物）。提供后箱的"
+                     "**楼栋/单元归属以对照表为准**（SKILL.md 硬约束②：严禁用标题 x 中分"
+                     "硬切）。总图对照表形态的图纸（编号集中在独立图区，x 不落在任何楼栋"
+                     "标题区间内）不传它则逐栋 0 箱。只改归属，不改安装楼层")
+ap.add_argument("--unit-pattern", default=None, help="单元标注正则，捕获组为单元号（由探查采样后提供；留空＝用分纤箱x聚类分单元）")
+ap.add_argument("--cable-keywords", default=None, help="光缆识别关键词正则（由探查采样后提供；留空＝不提取光缆名）")
+ap.add_argument("--unit-cluster", type=float, default=None, help="无单元标注时fx聚类阈值（None=按 1.0 倍层高自适应，层高由楼层标注实测）")
+ap.add_argument("--unit-range", type=float, default=None, help="单元文字x归属半宽（None=按 4.0 倍层高自适应）")
+ap.add_argument("--y-tol", type=float, default=None, help="户数/皮线与楼层y坐标匹配容差（None=按 1/15 倍层高自适应）")
+ap.add_argument("--insert-blocks", default=None, help="INSERT块名列表，逗号分隔。指定后提取INSERT实体的ATTRIB属性（由探查枚举全部设备块名）")
+ap.add_argument("--insert-attrib-tag", default=None, help="ATTRIB属性tag名，逗号分隔（由探查确定）")
+ap.add_argument("--insert-attrib-val", default=None, help="ATTRIB属性值筛选正则（由探查确定，如 HDD/家居配线箱）")
+ap.add_argument("--probe", action="store_true", help="探查模式：只打印图层/文字样例，不解析")
+args = ap.parse_args()
+# 楼栋区间标题语义（`1-3号楼` = 并列 还是 区间？）由用户裁定后经本开关启用，
+# 不设默认开启——替用户静默选定语义会丢/多解楼栋。
+set_expand_bldg_ranges(getattr(args, "expand_bldg_ranges", False))
+
+DXF_PATH = args.dxf
+OUT = args.out or (os.path.splitext(DXF_PATH)[0] + "_解析结果.json")
+
+if not args.probe:
+    require_params([
+        ("--text-layer", args.text_layer, "含FTTH标注的文字图层（探查图层清单+采样后确定）"),
+        ("--title-pattern", args.title_pattern, "楼栋标题正则，需含组1=楼栋号"),
+    ], "parse_dxf_structured")
+
+LAYERS = [x.strip() for x in (args.text_layer or "").split(",") if x.strip()]
+TYPES = [x.strip().upper() for x in args.text_type.split(",") if x.strip()]
+TITLE_RE = re.compile(args.title_pattern) if args.title_pattern else None
+FLOOR_RE = re.compile(args.floor_pattern) if args.floor_pattern else None
+HU_RE = re.compile(args.hu_pattern) if args.hu_pattern else None
+CABLE_RE = re.compile(args.cable_pattern) if args.cable_pattern else None
+CABLE_KW_RE = re.compile(args.cable_keywords) if args.cable_keywords else None
+FX_RE = re.compile(args.fx_pattern) if args.fx_pattern else None
+UNIT_RE = re.compile(args.unit_pattern) if args.unit_pattern else None
+
+# ---------- 2026-09-17（R2 参数自检）：正则捕获组契约，编译后立刻校验 ----------
+# 背景（2026-09-16 22:03 实测）：--cable-pattern 传入无捕获组的正则（如 "\d+Px\d+芯x\d+m"），
+#   编译通过，直到解析期 m.group(1) 才以 IndexError 裸崩——崩点远离传参处，排查成本高。
+#   需要几组不是拍脑袋的默认值，取自本脚本内各正则的实际用法（m.group(n) 的最大 n）：
+#   TITLE_RE→find_bldg_anchors group(1)；HU_RE→787 group(1)；
+#   CABLE_RE→792 group(1)(2)；UNIT_RE→717 group(1)。
+#   校验失败立刻显式退出并给出正确形态示例，不再带病运行。通用判据，与具体项目无关。
+for _arg, _pat, _rex, _need, _eg in (
+    ("--title-pattern", args.title_pattern, TITLE_RE, 1, r'"(\d+)#楼"（组1=楼栋号）'),
+    ("--hu-pattern", args.hu_pattern, HU_RE, 1, r'"(\d+)户"（组1=户数）'),
+    ("--cable-pattern", args.cable_pattern, CABLE_RE, 2, r'"(\d+(?:\.\d+)?)m\*(\d+)芯"（组1=米数 组2=根数）'),
+    ("--unit-pattern", args.unit_pattern, UNIT_RE, 1, r'"(\d+)单元"（组1=单元号）'),
+):
+    if _rex is not None and _rex.groups < _need:
+        raise SystemExit(
+            f"[参数自检] {_arg} 本脚本解析期需要至少 {_need} 个捕获组，"
+            f"当前 pattern 只有 {_rex.groups} 个: {_pat!r}\n"
+            f"  正确形态{_eg}\n"
+            f"  （2026-09-16 实测：无捕获组编译通过、rc=0 假象，到解析期才 IndexError 裸崩）")
+
+
+def _is_floor_text(s):
+    """楼层标注判定：统一走 ftth_common.is_floor_text（支持 3F/17F/-1F/B1/B2/WF）。"""
+    return is_floor_text(s, FLOOR_RE)
+
+doc, msp = load_dxf(DXF_PATH, log)
+
+# ---------- 探查模式 ----------
+if args.probe:
+    log.info("== 图层清单 ==")
+    for lay in doc.layers:
+        log.info(f"  {lay.dxf.name}")
+    log.info("\n== 文字实体（按图层/类型统计） ==")
+    cnt = Counter()
+    for e in msp:
+        if e.dxftype() in ("TEXT", "MTEXT"):
+            cnt[(e.dxf.layer, e.dxftype())] += 1
+    for (lay, typ), n in cnt.most_common():
+        log.info(f"  {lay} {typ}: {n}")
+    log.info(f"\n== 文字样例（前40条） ==")
+    shown = 0
+    for e in msp:
+        if e.dxftype() not in ("TEXT", "MTEXT"):
+            continue
+        txt = e.plain_text().strip() if e.dxftype() == "MTEXT" else str(e.dxf.text).strip()
+        if not txt:
+            continue
+        p = e.dxf.insert
+        log.info(f"  [{e.dxf.layer}] {txt!r} @ ({p.x:.1f},{p.y:.1f})")
+        shown += 1
+        if shown >= 40:
+            break
+    # INSERT/ATTRIB 探查
+    insert_blocks_seen = {}  # {块名: 数量}
+    for e in msp:
+        if e.dxftype() != "INSERT":
+            continue
+        bname = e.dxf.name
+        insert_blocks_seen[bname] = insert_blocks_seen.get(bname, 0) + 1
+    if insert_blocks_seen:
+        log.info("\n== INSERT 块统计 ==")
+        for bn, cnt in sorted(insert_blocks_seen.items(), key=lambda x: -x[1]):
+            log.info(f"  {bn}: {cnt} 个")
+            # 读取块定义中的 ATTDEF 和子实体
+            try:
+                block = doc.blocks.get(bname)
+                if block:
+                    attdefs = []
+                    for sub in block:
+                        if sub.dxftype() == "ATTDEF":
+                            attdefs.append(f"tag={sub.dxf.tag} text={sub.dxf.text}")
+                        elif sub.dxftype() in ("TEXT", "MTEXT"):
+                            txt = sub.plain_text().strip() if sub.dxftype() == "MTEXT" else str(sub.dxf.text).strip()
+                            if txt:
+                                attdefs.append(f"{sub.dxftype()}={txt}")
+                    if attdefs:
+                        log.info(f"    块定义: {', '.join(attdefs)}")
+            except Exception:
+                pass
+        # 统计 INSERT 实例的 ATTRIB 属性值
+        log.info("\n== INSERT 实例 ATTRIB 属性样例（前20个） ==")
+        shown = 0
+        for e in msp:
+            if e.dxftype() != "INSERT":
+                continue
+            if not e.has_attrib:
+                continue
+            p = e.dxf.insert
+            attribs = []
+            for attrib in e.attribs:
+                attribs.append(f"{attrib.dxf.tag}={attrib.dxf.text}")
+            if attribs:
+                log.info(f"  [{e.dxf.name}] @ ({p.x:.1f},{p.y:.1f}) {', '.join(attribs)}")
+                shown += 1
+                if shown >= 20:
+                    break
+        log.info("\n  提示：若需在解析模式提取INSERT，用 --insert-blocks 指定块名，")
+        log.info("  --insert-attrib-tag 指定属性tag，--insert-attrib-val 指定属性值筛选正则。")
+    log.info("\n（提示：根据上面样例，用 --text-layer 指定含标注的图层；")
+    log.info("  **楼栋标题**＝含『系统图/布线图/示意图』的图纸标题（如「1#住宅光纤入户系统图」），")
+    log.info("  用 --title-pattern 指定，必须枚举本图**标题的实际写法**；")
+    log.info("  标题里的楼栋号后不一定写『楼』（可能是 住宅/配套/商业 等）；")
+    log.info("  **不要用 --bldg-pattern 的值顶替 --title-pattern** —— bldg-pattern 匹配的是")
+    log.info("  总图对照表里的楼栋行，不是系统图标题；顶替后楼栋 x 范围会被切在对照表区，")
+    log.info("  逐栋找不到箱符号（该情形已由 analyze_coverage 的同区护栏明确报出）；")
+    log.info("  楼层/户数/皮线/分纤箱编号格式不同，分别用 --floor/--hu/--cable/--fx-pattern 指定。）")
+    # 写入建议参数 JSON + 全量文字样例（供 --config 使用）
+    if args.out:
+        all_samples = []
+        for e in msp:
+            if e.dxftype() not in ("TEXT", "MTEXT"):
+                continue
+            txt = e.plain_text().strip() if e.dxftype() == "MTEXT" else str(e.dxf.text).strip()
+            if not txt:
+                continue
+            p = e.dxf.insert
+            all_samples.append({"层": e.dxf.layer, "类型": e.dxftype(), "内容": txt, "x": round(p.x, 2), "y": round(p.y, 2)})
+        # 2026-09-12 修正（P0-1 / 通用性）：
+        #   ① probe 必须真分析文字样例，而不是回显命令行默认值（旧实现回显 args.*，
+        #      而现在 args.* 已无项目默认值 → 照文档用 config 必然拿到 None）。
+        #   ② text_layer 候选不能"按文字条数取前N个"（会把暖通/消防/建筑等文字量大的
+        #      无关图层混进来），也不能只取"文本最多的那一个"（FTTH 信息在各图纸上
+        #      常常分散在多个图层：楼层刻度一个图层、编号/标题另一个图层——漏掉任一
+        #      都会让后续步骤静默缺数据）。改为按【强特征标记】逐图层计数：
+        #      只有真正含 楼层标注 / 楼栋标题 / 编号 / 皮线米数 / 户数 / 单元标记 的图层
+        #      才进候选；这些标记在建筑/暖通/消防图层上几乎不会出现。
+        #   ③ 推断不出的一律返回 None，交由使用者按探查输出人工确认，不猜。
+        def _guess_params(samples):
+            """从全量文字样例中推断参数候选；推断不出返回 None（不猜）。"""
+            from collections import Counter as _C
+
+            def _strong_marks(t):
+                """返回该文字命中的强特征标记集合（用于判定它所在图层是否为 FTTH 图层）。"""
+                m = set()
+                if is_floor_text(t):
+                    m.add("楼层")
+                if is_bldg_title_text(t):
+                    m.add("标题")   # 图纸类词 + 楼栋号，避免「防护分区抗爆单元示意图」这类无关标题
+                    # 判据统一走 ftth_common.is_bldg_title_text：楼栋号后**不要求紧跟
+                    # 『楼』**，`N#楼`/`N号楼`/`N#住宅`/`N#配套` 一并命中 —— 只认
+                    # `数字+#+楼` 时，整类写作「N#住宅…系统图」的图纸标题标记全不命中
+                    # → 标题图层不进 text_layer（2026-09-16 实测踩坑）
+                    # 候选 → 采集不到标题 → 「标题锚点 0 个、楼栋分组不可用」。
+                if re.search(r"[A-Za-z]{1,4}\s*\d+\s*[-_ ]?\s*FX\s*\d+|FX\s*\d+", t):
+                    m.add("编号")
+                    # `\bFX\d+` 对 `FL01FX01` 不命中（`1` 与 `F` 之间无词边界），
+                    # 故前缀形态必须显式写出，否则整类带前缀编号的图层漏选。
+                if re.search(r"\d+\s*m\s*[*×]\s*\d+", t):
+                    m.add("米数")
+                if re.fullmatch(r"\d+\s*户", t.strip()):
+                    m.add("户数")
+                if re.fullmatch(r"\d+\s*单元", t.strip()):
+                    m.add("单元")
+                if re.search(r"\d+芯|光分|分光器|光交", t):
+                    m.add("芯数")
+                return m
+
+            layer_marks = {}          # 图层 -> Counter(标记 -> 条数)
+            for s in samples:
+                ms = _strong_marks(s["内容"])
+                if ms:
+                    c = layer_marks.setdefault(s["层"], _C())
+                    for k in ms:
+                        c[k] += 1
+            if layer_marks:
+                # 按"命中的强特征种类数"再按"命中总条数"排序；取前 8 个图层
+                ranked = sorted(layer_marks.items(),
+                                key=lambda kv: (len(kv[1]), sum(kv[1].values())),
+                                reverse=True)[:8]
+                suggested_text_layer = ",".join(lay for lay, _ in ranked)
+                log.info("  [探查] FTTH 图层候选（图层: 强特征命中）:")
+                for lay, c in ranked:
+                    log.info("    %s: %s" % (lay, dict(c)))
+            else:
+                suggested_text_layer = None
+
+            # 标题正则候选：含 系统图/布线图/示意图 且含楼栋号的标题。
+            # 2026-09-15 修正：楼栋号写法必须**并列枚举** `N#楼` 与 `N号楼` —— 旧条件
+            #   写死 `\d+#`，而真实图纸整类标题可能全写成「N号楼」（实测柳辛庄 15 条
+            #   标题全是「N号楼/综合布线系统图」）→ title_pattern 推断为 None，
+            #   整个标题体系未被识别，楼栋边界只能靠猜。
+            # 2026-09-16 再修：**楼栋号后不要求紧跟『楼』**（判据统一到
+            #   ftth_common.is_bldg_title_text）—— 实测某图整类标题写作
+            #   「N#住宅光纤入户系统图」「N#配套光纤入户系统图」，数字后接 住宅/配套，
+            #   旧判据整类失配 → 本项与下方「标题图层并入 text_layer」**同时**失效，
+            #   且失败是静默的（只表现为 title_pattern: None）。
+            title_texts = [s["内容"] for s in samples if is_bldg_title_text(s["内容"])]
+            suggested_title = None
+            if title_texts:
+                _has_hash = any(re.search(r"\d+#", t) for t in title_texts)
+                _has_hao = any(re.search(r"\d+\s*号楼", t) for t in title_texts)
+                if _has_hash and _has_hao:
+                    suggested_title = r"(\d+)(?:#|号楼).*(?:系统图|布线图|示意图)"
+                elif _has_hash:
+                    suggested_title = r"(\d+)#.*(?:系统图|布线图|示意图)"
+                else:
+                    suggested_title = r"(\d+)号楼.*(?:系统图|布线图|示意图)"
+
+            # 标题图层**强制并入** text_layer（2026-09-15 铁律 5，双保险）：
+            # 标题常在专用图层（如 `TEL_SYMB`），该图层不含楼层/芯数/单元等强特征关键词，
+            # 整层可能不进候选；漏掉它的症状极具迷惑性——pattern 写对、门禁 PASS，
+            # 却是「标题锚点 0 个 → 楼栋分组不可用」。故不依赖候选命中，直接并入。
+            _title_layers = [s["层"] for s in samples if is_bldg_title_text(s["内容"])]
+            if _title_layers:
+                _cur = [x for x in (suggested_text_layer or "").split(",") if x]
+                for _lay in dict.fromkeys(_title_layers):
+                    if _lay not in _cur:
+                        _cur.append(_lay)
+                        log.info("  [探查] 标题图层 %r 已并入 text_layer（标题须可采集）" % _lay)
+                suggested_text_layer = ",".join(_cur) if _cur else None
+
+            # 编号正则候选：**必须保留完整编号（含前缀）**。
+            # 2026-09-15 修正（P0）：只取尾段（如 `FX\d+`）会让跨地块/跨楼栋的同序号
+            #   串号。实测柳辛庄：图上 4 个地块各有一整套 FX01~FX28（写作 `FL01FX01`
+            #   ——前缀无分隔符），旧逻辑只认 `FL\d+-FX\d+`（**带连字符**）→ 不匹配 →
+            #   退化为 `FX\d+#?` → **84 个箱被压成 28 个编号，56 个箱静默丢失**，
+            #   且同序号箱互相覆盖归属。形态谱由「最完整」到「最简」依次尝试。
+            fx_texts = [s["内容"] for s in samples if re.search(r"FX\s*\d+|FL\s*\d+", s["内容"])]
+            suggested_fx = None
+            fx_dup_note = None
+            if fx_texts:
+                if any(re.search(r"FL\d+\s*-\s*FX\d+", t) for t in fx_texts):
+                    suggested_fx = r"FL\d+-FX\d+"
+                elif any(re.search(r"[A-Za-z]{1,4}\d+\s*[-_ ]?\s*FX\d+", t) for t in fx_texts):
+                    # 前缀无分隔（FL01FX01）：整体取，**禁止退化为 FX 尾段**
+                    suggested_fx = r"[A-Za-z]{1,4}\d+FX\d+"
+                elif any(re.search(r"FX\s*\d+\s*#?", t) for t in fx_texts):
+                    suggested_fx = r"FX\d+#?"
+                # 串号风险检测：同一 FX 尾号若对应多个前缀 → 必须用完整编号
+                _tails = {}
+                for t in fx_texts:
+                    _m = re.search(r"([A-Za-z]{1,4}\d+)?\s*FX\s*(\d+)", t)
+                    if _m and _m.group(1):
+                        _tails.setdefault(_m.group(2), set()).add(_m.group(1))
+                _dups = {k: v for k, v in _tails.items() if len(v) > 1}
+                if _dups:
+                    _ex = list(_dups.items())[0]
+                    fx_dup_note = (
+                        "**串号风险**：检出 %d 个 FX 尾号对应多个前缀（如 FX%s → %s）。"
+                        "若 fx_pattern 只取尾段（FX\\d+），这些箱会被压成同一个编号并互相"
+                        "覆盖归属，数量级静默丢失。本图已按完整编号给出建议 pattern。"
+                        % (len(_dups), _ex[0], "/".join(sorted(_ex[1]))))
+                    log.info("  [探查] " + fx_dup_note)
+
+            suggested_hu = r"(\d+)户" if any(re.fullmatch(r"\d+\s*户", s["内容"].strip()) for s in samples) else None
+            suggested_cable = r"(\d+)m\*(\d+)" if any(re.search(r"\d+\s*m\s*[*×]\s*\d+", s["内容"]) for s in samples) else None
+            suggested_unit = r"(\d+)单元" if any(re.fullmatch(r"\d+\s*单元", s["内容"].strip()) for s in samples) else None
+
+            # 楼栋标注正则候选（供 extract_fx_map / analyze_coverage 使用）：
+            # 必须覆盖『N#配套楼』『N#商业楼』以及无『楼』字的写法
+            suggested_bldg = None
+            if any(re.search(r"\d+#", s["内容"]) and ("楼" in s["内容"] or "单元" in s["内容"]) for s in samples):
+                suggested_bldg = r"(\d+)#(?:配套|商业|附属)?楼|(\d+)号楼"
+
+            # FX 编号 ↔ 楼栋/单元标注 的实测邻近距离（供 extract_fx_map --proximity-tol）：
+            # 文档要求"必须先测量实际距离，不得盲目沿用默认值"，这里直接量出来。
+            suggested_proximity = None
+            _fx_pts = [(s["x"], s["y"]) for s in samples if re.search(r"FX\s*\d+", s["内容"])]
+            _bd_pts = [(s["x"], s["y"]) for s in samples
+                       if re.search(r"\d+#.*楼|\d+号楼|\d+\s*单元", s["内容"])]
+            if _fx_pts and _bd_pts:
+                _ds = sorted(min(((x - bx) ** 2 + (y - by) ** 2) ** 0.5 for bx, by in _bd_pts)
+                             for x, y in _fx_pts)
+                _k = max(0, int(len(_ds) * 0.9) - 1)
+                suggested_proximity = int(__import__("math").ceil(_ds[_k] / 10.0) * 10) + 10
+                log.info("  [探查] FX↔楼栋标注实测距离：min=%.1f 中位=%.1f P90=%.1f → 建议 --proximity-tol %d"
+                         % (_ds[0], _ds[len(_ds) // 2], _ds[_k], suggested_proximity))
+
+            # ---------- 图签候选图层探测（2026-09-16，12坑复核·坑3）----------
+            # 「N层/M户」「N单元」类图签标注常在独立图签层（不含 FTTH 强特征），
+            # 不进 text_layer 候选 → 图签提取靠试错找层。此处按图层直接统计命中，
+            # 输出为顶层信号 titleblock_layer_candidates（供 read_titleblock_households
+            # 的 --floor-layer 参考；advisory，需人工确认）。
+            _tb_marks = {}
+            for s in samples:
+                t = s["内容"].strip()
+                _hit = []
+                if re.fullmatch(r"\d+\s*层\s*/\s*\d+\s*户", t):
+                    _hit.append("层户")
+                if re.fullmatch(r"\d+\s*F", t):
+                    _hit.append("NF")
+                if re.fullmatch(r"\d+\s*户\s*/\s*层", t):
+                    _hit.append("户/层")
+                if re.fullmatch(r"\d+\s*单元", t):
+                    _hit.append("单元")
+                if _hit:
+                    c = _tb_marks.setdefault(s["层"], _C())
+                    for k in _hit:
+                        c[k] += 1
+            titleblock_layer_candidates = None
+            if _tb_marks:
+                _tb_ranked = sorted(
+                    ((lay, c) for lay, c in _tb_marks.items()
+                     if c.get("层户") or (c.get("NF") and c.get("户/层"))),
+                    key=lambda kv: (kv[1].get("层户", 0) + kv[1].get("NF", 0),
+                                    sum(kv[1].values())),
+                    reverse=True)
+                if _tb_ranked:
+                    titleblock_layer_candidates = {
+                        "候选图层": [lay for lay, _ in _tb_ranked[:4]],
+                        "命中明细": {lay: dict(c) for lay, c in _tb_ranked[:4]},
+                        "用途": "read_titleblock_households.py --floor-layer 候选（advisory）",
+                    }
+                    log.info("  [探查] 图签候选图层: %s"
+                             % {lay: dict(c) for lay, c in _tb_ranked[:4]})
+
+            # ---------- 地块/分带标注探测（2026-09-16，12坑复核·坑1/坑2）----------
+            # 多地块混排竣工图常用短标注区分地块；**文件名不等于地块划分**——一张图
+            # 内部可含多个独立地块、楼号各自从 1 起。输出标注清单（advisory，不阻塞），
+            # 供 plan 画像与下游 --band 分带参考。
+            _PLOT_RE = re.compile(r"(\d+(?:\s*[-–]\s*\d+)?)\s*(块地|地块|块区|组团|分区)")
+            _plot_hits = []
+            for s in samples:
+                t = s["内容"].strip()
+                if len(t) > 16:
+                    continue
+                _m = _PLOT_RE.search(t)
+                if _m:
+                    _plot_hits.append({"文字": t, "层": s["层"],
+                                       "x": round(s["x"], 1), "y": round(s["y"], 1),
+                                       "编号": _m.group(1).replace(" ", "")})
+            plot_band_annotations = None
+            if _plot_hits:
+                _names = sorted({h["编号"] for h in _plot_hits})
+                _main_nums = set()
+                for _nm in _names:
+                    _mm = re.match(r"(\d+)", _nm)
+                    if _mm:
+                        _main_nums.add(int(_mm.group(1)))
+                _gaps = [i for i in range(min(_main_nums), max(_main_nums) + 1)
+                         if i not in _main_nums] if _main_nums else []
+                plot_band_annotations = {
+                    "词表": "块地|地块|块区|组团|分区（内置通用词表；本图用词不同请人工补充）",
+                    "种类": _names,
+                    "条数": len(_plot_hits),
+                    "缺号提醒": ("编号序列缺 %s——图纸可能只含部分地块或编号本就不连续，请人工确认"
+                              % _gaps) if _gaps else None,
+                    "样例": sorted({(h["编号"], h["文字"]): h for h in _plot_hits}.values(),
+                                 key=lambda h: -h["y"])[:30],
+                }
+                log.info("  [探查] 地块/分带标注 %d 条（编号 %s）%s"
+                         % (len(_plot_hits), "/".join(_names),
+                            ("，缺号 %s" % _gaps) if _gaps else ""))
+
+            # ---------- 箱位直读标注信号（2026-09-16，12坑复核·坑9）----------
+            # 「N号楼M单元K层」格式标注直接给出箱位（楼栋/单元/安装层），是最可靠的
+            # 箱位第二来源；present 时下游应做安装层交叉校验（并列证据交人裁定，不自动择一）。
+            _FXLOC_RE = re.compile(r"(\d+)\s*号楼\s*(\d+)\s*单元\s*(\d+)\s*层")
+            _fxloc_n = sum(1 for s in samples if _FXLOC_RE.search(s["内容"]))
+            fx_location_annotation = ("present(%d条)" % _fxloc_n) if _fxloc_n else "absent"
+            if _fxloc_n:
+                log.info("  [探查] 箱位直读标注「N号楼M单元K层」%d 条 → 建议做安装层交叉校验"
+                         % _fxloc_n)
+
+            return {
+                "text_layer": suggested_text_layer,
+                "text_type": ",".join(TYPES),
+                "title_pattern": suggested_title,
+                "floor_pattern": None,  # None=内置统一解析（支持 B1/WF）
+                "hu_pattern": suggested_hu,
+                "cable_pattern": suggested_cable,
+                "fx_pattern": suggested_fx,
+                "fx_pattern_note": fx_dup_note,   # 非 None 表示检出串号风险，须保留完整编号
+                "unit_pattern": suggested_unit,
+                "bldg_pattern": suggested_bldg,
+                "proximity_tol": suggested_proximity,
+                "titleblock_layer_candidates": titleblock_layer_candidates,
+                "plot_band_annotations": plot_band_annotations,
+                "fx_location_annotation": fx_location_annotation,
+            }
+
+        suggested = _guess_params(all_samples)
+
+        # ---- 分纤箱图形符号层候选（2026-09-16 新增，P0-2）----
+        # 与 plan 同源打分（ftth_common.suggest_fx_symbol_layers）。此前该项在 plan
+        # 的输出里**只有读、没有写**，恒为「探查未给出候选图层」，测量方只能猜图层名
+        # （实测猜成文字层 → 箱位回退编号文字坐标 → 竖干配对率 0% → 覆盖全空）。
+        fx_symbol_layer_candidates = []
+        try:
+            _g = extract_geom(msp)
+            _fxp = suggested.get("fx_pattern")
+            _fxr = re.compile(_fxp) if _fxp else re.compile(r"FX\d+")
+            fx_symbol_layer_candidates = suggest_fx_symbol_layers(
+                _g["polylines"], _g["texts"],
+                fx_count=len([1 for _s in all_samples if _fxr.search(_s["内容"])]))
+        except Exception as _e:                                          # noqa: BLE001
+            log.warning("  [探查] 箱符号层候选打分失败（不影响其它项）：%s" % _e)
+        if fx_symbol_layer_candidates:
+            log.info("  [探查] 分纤箱图形符号层候选（按得分降序；箱体只写编号、不画符号的图本项为空）:")
+            for _c in fx_symbol_layer_candidates:
+                log.info("    %s 得分%.2f%s（闭合四点矩形%d｜尺寸一致性%.2f｜标题区重叠%.2f｜众数尺寸%s）"
+                         % (_c["层"], _c["得分"], "【推荐】" if _c["推荐"] else "",
+                            _c["闭合四点矩形"], _c["一致性"], _c["标题区重叠"], _c["众数尺寸"]))
+        else:
+            log.info("  [探查] 分纤箱图形符号层候选：无（本图箱体可能只写编号文字、无图形符号）")
+        suggested["fx_symbol_layer_candidates"] = fx_symbol_layer_candidates or None
+        if not suggested.get("title_pattern"):
+            log.warning("  [探查] title_pattern 推断为空 —— 请按上面的「全量文字样例」人工枚举"
+                        "**图纸标题**的实际写法（含楼栋号 + 系统图/布线图/示意图）；"
+                        "**切勿用 bldg_pattern 的值顶替**（它匹配对照表楼栋行，不是标题）。")
+        # 2026-09-16（12坑复核）：画像类信号提升到 probe JSON 顶层。
+        #   它们不是任何子命令的命令行参数——留在 suggested_params 里会被
+        #   ftth.py --config 的参数校验逐个 WARN 忽略，反而淹没有效告警。
+        _profile_signals = {}
+        for _k in ("titleblock_layer_candidates", "plot_band_annotations",
+                   "fx_location_annotation", "fx_symbol_layer_candidates"):
+            if _k in suggested:
+                _profile_signals[_k] = suggested.pop(_k)
+        # 2026-09-18 整改：推荐箱符号层**同时**以子命令参数名留在 suggested_params。
+        #   上面 pop 的理由是「它们不是任何子命令的命令行参数」—— 与事实不符：
+        #   coverage 有 --fx-symbol-layer。后果是 ftth.py 经 --config 无法下传，
+        #   coverage 只能扫全图找符号层，实测某图直接 rc=3「找不到任何箱图形符号」。
+        #   顶层候选列表（供人核对）与参数值（供机器消费）两者都要，缺一不可。
+        _rec_sym = next((c.get("层") for c in (fx_symbol_layer_candidates or [])
+                         if c.get("推荐")), None)
+        if _rec_sym:
+            suggested["fx_symbol_layer"] = _rec_sym
+            log.info("  [探查] 推荐箱符号层已写入 suggested_params.fx_symbol_layer = %s"
+                     % _rec_sym)
+
+        log.info("\n== 建议参数（由文字样例推断；推断不出的为 null，需人工确认） ==")
+        for _k, _v in suggested.items():
+            log.info(f"  {_k}: {_v!r}")
+        # 2026-09-16 修复 P0-1：写盘失败必须反映到退出码。
+        #   原实现 except 只 WARNING，而末尾 sys.exit(0) 在 try/except 之外 ——
+        #   于是「探查未产出配置」对外表现为 rc=0（成功），调用方判定成功并继续/反复重试。
+        #   退出码 4 = 输出写盘失败，与 1（输入错误）/ 2（门禁中止）/ 3（不适用）区分。
+        try:
+            write_json(args.out, {"suggested_params": suggested, **_profile_signals,
+                                  "全量文字样例": all_samples}, log=log)
+            log.info(f"\n配置+全量文字样例({len(all_samples)}条)已写入: {args.out}")
+        except OSError as e:
+            log.error(f"无法写入探查结果 {args.out}: {e}")
+            log.error("探查未产出可用配置 —— 不得按成功继续；请检查路径/权限后重试。")
+            sys.exit(4)
+    sys.exit(0)
+
+# ---------- 文字收集 ----------
+texts = collect_texts(msp, LAYERS, TYPES)
+
+# ---------- INSERT/ATTRIB 收集 ----------
+insert_items = []  # [{块名, x, y, 属性: {tag: val}, layer}]
+if args.insert_blocks:
+    INSERT_BLOCK_SET = set(b.strip() for b in args.insert_blocks.split(",") if b.strip())
+    ATTRIB_TAGS = set(t.strip() for t in args.insert_attrib_tag.split(",") if t.strip())
+    ATTRIB_VAL_RE = re.compile(args.insert_attrib_val)
+    for e in msp:
+        if e.dxftype() != "INSERT":
+            continue
+        if e.dxf.name not in INSERT_BLOCK_SET:
+            continue
+        if not e.has_attrib:
+            continue
+        p = e.dxf.insert
+        attribs = {}
+        for attrib in e.attribs:
+            tag = attrib.dxf.tag
+            val = attrib.dxf.text.strip()
+            if tag in ATTRIB_TAGS:
+                attribs[tag] = val
+        # 筛选：至少一个属性值匹配 --insert-attrib-val 正则
+        if ATTRIB_VAL_RE and not any(ATTRIB_VAL_RE.search(v) for v in attribs.values()):
+            continue
+        insert_items.append({
+            "块名": e.dxf.name,
+            "x": round(p.x, 2),
+            "y": round(p.y, 2),
+            "属性": attribs,
+            "层": e.dxf.layer,
+        })
+    log.info(f"收集到 {len(insert_items)} 个匹配的 INSERT 实体")
+
+# ---------- 楼栋锚点 ----------
+# 多地块同名楼守卫：早失败（rc=3）、点名根因与同名锚点位置、零产物（--out 尚未写入）。
+try:
+    bldg_anchors = find_bldg_anchors(texts, TITLE_RE, log)
+except MultiPlotDuplicateAnchorError as _e:
+    log.error(str(_e))
+    sys.exit(3)
+
+if not bldg_anchors:
+    log.error("未匹配到楼栋标题，请检查 --title-pattern / --text-layer，或先运行 --probe")
+    sys.exit(1)
+
+anchor_xs = sorted([(k, v["x"]) for k, v in bldg_anchors.items()], key=lambda x: x[1])
+bldg_ranges = compute_bldg_ranges(anchor_xs)
+
+log.info("\n楼栋x范围:")
+for bldg, (xmin, xmax) in bldg_ranges.items():
+    log.info(f"  {bldg}: x {xmin:.1f}~{xmax:.1f}")
+
+# ---------- 楼栋区域边界重叠校验（2026-09-13 新增） ----------
+# 混合布局图纸中不同 y 行的楼栋（如住宅楼 y 行与配套楼 y 行），
+# 虽然中分法保证 x 范围不相交，但不同行楼栋 x 范围可能紧邻、间距过小，
+# 导致 HDD/皮线/楼层标注等实体按 x 归属时跨行混入邻楼。
+# 检测方式：对每对不同 y 行的楼栋，若 x 范围间距 < 同行楼栋间距中位数的一半，告警。
+anchor_y_map = {k: v.get("y", 0) for k, v in bldg_anchors.items()}
+# 按 y 聚类（同 y 行的楼栋）
+y_groups = {}
+for bldg_name, (xmin, xmax) in bldg_ranges.items():
+    y = anchor_y_map.get(bldg_name, 0)
+    matched = False
+    for yg in list(y_groups.keys()):
+        if abs(y - yg) < 100:
+            y_groups[yg].append(bldg_name)
+            matched = True
+            break
+    if not matched:
+        y_groups[y] = [bldg_name]
+
+if len(y_groups) > 1:
+    # 计算同行楼栋间距中位数
+    same_row_gaps = []
+    for yg, bldg_list in y_groups.items():
+        xs = sorted([bldg_ranges[b][0] for b in bldg_list])
+        for i in range(1, len(xs)):
+            same_row_gaps.append(xs[i] - xs[i-1])
+    if same_row_gaps:
+        import statistics
+        median_gap = statistics.median(same_row_gaps)
+        threshold = median_gap / 2
+        overlap_found = False
+        sorted_bldg_list = sorted(bldg_ranges.items(), key=lambda r: r[1][0])
+        for i in range(len(sorted_bldg_list)):
+            for j in range(i + 1, len(sorted_bldg_list)):
+                n1, (x1lo, x1hi) = sorted_bldg_list[i]
+                n2, (x2lo, x2hi) = sorted_bldg_list[j]
+                y1 = anchor_y_map.get(n1, 0)
+                y2 = anchor_y_map.get(n2, 0)
+                if abs(y1 - y2) > 100:
+                    gap = x2lo - x1hi
+                    if gap < threshold:
+                        log.warning(
+                            f"  [边界过近] {n1} [x={x1lo:.1f}~{x1hi:.1f},y={y1:.0f}] 与 "
+                            f"{n2} [x={x2lo:.1f}~{x2hi:.1f},y={y2:.0f}] 不同行但 x 间距 "
+                            f"{gap:.1f} < 阈值 {threshold:.1f}（同行间距中位数 {median_gap:.1f}）"
+                            f"——按 x 归属可能把邻楼实体混入本楼，须按 x 列 + y 带双重维度精确归属"
+                        )
+                        overlap_found = True
+        if overlap_found:
+            log.warning("  [边界过近] 检测到跨行 x 间距过小，请在自检与出表时注意按 x 列精确拆分实体归属")
+
+# ---------- 楼栋区域边界重叠校验（2026-09-13 新增） ----------
+# 混合布局图纸中不同 y 行的楼栋（如住宅楼 y 行与配套楼 y 行），
+# 虽然中分法保证 x 范围不相交，但不同行楼栋 x 范围可能紧邻、间距过小，
+# 导致 HDD/皮线/楼层标注等实体按 x 归属时跨行混入邻楼。
+# 检测方式：对每对不同 y 行的楼栋，若 x 范围间距 < 同行楼栋间距中位数的一半，告警。
+anchor_y_map = {k: v.get("y", 0) for k, v in bldg_anchors.items()}
+# 按 y 聚类（同 y 行的楼栋）
+y_groups = {}
+for bldg_name, (xmin, xmax) in bldg_ranges.items():
+    y = anchor_y_map.get(bldg_name, 0)
+    matched = False
+    for yg in list(y_groups.keys()):
+        if abs(y - yg) < 100:
+            y_groups[yg].append(bldg_name)
+            matched = True
+            break
+    if not matched:
+        y_groups[y] = [bldg_name]
+
+if len(y_groups) > 1:
+    # 计算同行楼栋间距中位数
+    same_row_gaps = []
+    for yg, bldg_list in y_groups.items():
+        xs = sorted([bldg_ranges[b][0] for b in bldg_list])
+        for i in range(1, len(xs)):
+            same_row_gaps.append(xs[i] - xs[i-1])
+    if same_row_gaps:
+        import statistics
+        median_gap = statistics.median(same_row_gaps)
+        threshold = median_gap / 2
+        overlap_found = False
+        sorted_bldg_list = sorted(bldg_ranges.items(), key=lambda r: r[1][0])
+        for i in range(len(sorted_bldg_list)):
+            for j in range(i + 1, len(sorted_bldg_list)):
+                n1, (x1lo, x1hi) = sorted_bldg_list[i]
+                n2, (x2lo, x2hi) = sorted_bldg_list[j]
+                y1 = anchor_y_map.get(n1, 0)
+                y2 = anchor_y_map.get(n2, 0)
+                if abs(y1 - y2) > 100:
+                    gap = x2lo - x1hi
+                    if gap < threshold:
+                        log.warning(
+                            f"  [边界过近] {n1} [x={x1lo:.1f}~{x1hi:.1f},y={y1:.0f}] 与 "
+                            f"{n2} [x={x2lo:.1f}~{x2hi:.1f},y={y2:.0f}] 不同行但 x 间距 "
+                            f"{gap:.1f} < 阈值 {threshold:.1f}（同行间距中位数 {median_gap:.1f}）"
+                            f"——按 x 归属可能把邻楼实体混入本楼，须按 x 列 + y 带双重维度精确归属"
+                        )
+                        overlap_found = True
+        if overlap_found:
+            log.warning("  [边界过近] 检测到跨行 x 间距过小，请在自检与出表时注意按 x 列精确拆分实体归属")
+
+# 为 INSERT 实体分配楼栋归属（须在 bldg_ranges 计算之后）
+if insert_items:
+    for ins in insert_items:
+        for bldg, (xmin, xmax) in bldg_ranges.items():
+            if xmin <= ins["x"] <= xmax:
+                ins["楼"] = bldg
+                break
+        else:
+            ins["楼"] = None
+
+# 为每栋楼分配文字
+bldg_texts = defaultdict(list)
+for t in texts:
+    for bldg, (xmin, xmax) in bldg_ranges.items():
+        if xmin <= t["x"] <= xmax:
+            bldg_texts[bldg].append(t)
+            break
+
+# ---------- 尺度锚：阈值按层高自适应（2026-09-15 通用化，须在 split_units 系列首次使用 args.* 前解析） ----------
+# 比值的历史出处：层高 30 时 unit_cluster=30 / unit_range=120 / y_tol=2（原手调默认值）。
+# 2026-09-16：install_tol 已整体废弃（比值／回退值／命令行参数／输出字段一并移除）。
+#   安装楼层一律走纯区间法，与 analyze_coverage.py 的 f_install 口径统一。
+#   原小容差闸门（1/6 倍层高）只覆盖楼层带下沿的一小段，而箱体落点不固定，
+#   实测某图分纤箱到下方层线的距离普遍大于闸门值 → 安装楼层整列落空。
+_TOL_RATIOS = {"unit_cluster": 1.0, "unit_range": 4.0,
+               "y_tol": 1.0 / 15.0}
+_TOL_FALLBACK = {"unit_cluster": DEFAULT_UNIT_CLUSTER, "unit_range": DEFAULT_UNIT_RANGE,
+                 "y_tol": DEFAULT_Y_TOL}
+_step, _basis = floor_step_from_texts(texts, _is_floor_text)
+if _step:
+    for _n, _r in _TOL_RATIOS.items():
+        if not getattr(args, _n):        # None / 0 均视为自适应（与 analyze_coverage 的 0=auto 约定一致）
+            setattr(args, _n, _r * _step)
+    log.info("尺度锚：层高 %.4g（%s）→ unit_cluster=%.4g / unit_range=%.4g / y_tol=%.4g"
+             % (_step, _basis, args.unit_cluster, args.unit_range, args.y_tol))
+else:
+    for _n, _d in _TOL_FALLBACK.items():
+        if getattr(args, _n) is None:
+            setattr(args, _n, _d)
+    log.warning("尺度锚量测失败（%s）→ 回退绝对默认值 %s", _basis,
+                {k: getattr(args, k) for k in _TOL_FALLBACK})
+
+# ---------- 分单元（优先用单元标注锚点，其次 fx 聚类） ----------
+def split_units_no_fx(bldg_text_list):
+    """无 fx 文字时，全部文字归入'全部'单元。"""
+    return {"全部": bldg_text_list}
+
+def split_units_by_marker(bldg_text_list, unit_marks, bldg_name=None):
+    """有单元标注时，以单元标注 x 为锚点中分。
+
+    2026-09-12 修正（P0-2）：
+      1. 单元名重名时报错退出，不再静默覆盖（旧实现 dict key 覆盖导致 1#楼只剩 2 个假单元）。
+      2. 若 bldg_name 提供，校验单元标注与楼栋同号（如「2#楼」只认「2#楼N单元」），
+         避免总图区的「N#楼M单元」被误归给不相关楼栋。
+    """
+    units = []
+    seen_names = set()
+    for t in sorted(unit_marks, key=lambda t: t["x"]):
+        m = UNIT_RE.search(t["内容"])
+        uname = m.group(1) + "单元" if m else t["内容"]
+        # P0-2 修正③：重名单元报错，不静默覆盖
+        if uname in seen_names:
+            log.warning(f"  [重复单元] 单元名 {uname!r} 重复出现（来自 {t['内容']!r}），"
+                        f"可能是总图区标注混入。仅保留首次出现。")
+            continue
+        seen_names.add(uname)
+        units.append({"x": t["x"], "名": uname})
+    result = {}
+    unit_anchors = [(u["名"], u["x"]) for u in units]
+    if not unit_anchors:
+        return result
+    unit_ranges = compute_bldg_ranges(unit_anchors)
+    for u in units:
+        xlo, xhi = unit_ranges[u["名"]]
+        result[u["名"]] = [t for t in bldg_text_list if xlo <= t["x"] < xhi]
+    return result
+
+def split_units_by_fx_cluster(fx_texts, bldg_text_list):
+    """无单元标注时，用 fx 聚类分单元。"""
+    fx_clusters = cluster_by_x(fx_texts, args.unit_cluster)
+    result = {}
+    for i, c in enumerate(fx_clusters):
+        cx = c["x"]
+        if i == 0:
+            xlo = cx - args.unit_range
+        else:
+            xlo = max((fx_clusters[i - 1]["x"] + cx) / 2, cx - args.unit_range)
+        if i == len(fx_clusters) - 1:
+            xhi = cx + args.unit_range
+        else:
+            xhi = min((cx + fx_clusters[i + 1]["x"]) / 2, cx + args.unit_range)
+        uname = f"单元{i+1}"
+        result[uname] = [t for t in bldg_text_list if xlo <= t["x"] < xhi]
+    return result
+
+def split_units(bldg):
+    fx_texts = [t for t in bldg_texts[bldg] if FX_RE and FX_RE.search(t["内容"])]
+    unit_marks = [t for t in bldg_texts[bldg] if UNIT_RE and UNIT_RE.search(t["内容"])]
+    if not fx_texts:
+        return split_units_no_fx(bldg_texts[bldg])
+    if unit_marks:
+        return split_units_by_marker(bldg_texts[bldg], unit_marks, bldg_name=bldg)
+    return split_units_by_fx_cluster(fx_texts, bldg_texts[bldg])
+
+# ---------- 楼层信息解析（正则全部参数化） ----------
+def parse_floor_info(unit_texts):
+    floor_marks = {}   # 楼层名(如"1F") -> y
+    fx_list = []       # {编号, x, y}
+    hu_count = {}      # y -> 户数
+    cable_info = {}    # y -> (米数, 根数)
+    cable_names = {}   # 文字 -> y
+    others = []
+    for t in unit_texts:
+        txt = clean_text(t["内容"])
+        y = t["y"]
+        if _is_floor_text(txt):
+            floor_marks[txt] = y
+            continue
+        if FX_RE is not None:
+            m = FX_RE.search(txt)
+            if m:
+                # 2026-09-16：原实现只留 y（层位）、**丢掉 x** —— 分纤箱「安装位置」因此
+                #   只剩楼层、没有平面位置，两个同层同单元的箱无法在几何上区分，也无法与
+                #   台账/总图按平面位置对照。x 与编号同源同行文字，直接取用最稳。
+                fx_list.append({"编号": m.group(0), "x": t["x"], "y": y})
+                continue
+        if HU_RE is not None:
+            m = HU_RE.fullmatch(txt)
+            if m:
+                hu_count[y] = int(m.group(1))
+                continue
+        if CABLE_RE is not None:
+            m = CABLE_RE.fullmatch(txt)
+            if m:
+                cable_info[y] = (int(m.group(1)), int(m.group(2)))
+                continue
+        if TITLE_RE.search(txt):
+            continue
+        if CABLE_KW_RE is not None and CABLE_KW_RE.search(txt):
+            # P1-14 修正：排除图框标题（含换行符或过长的文字）和已被 TITLE_RE 匹配的标题
+            if '\n' in txt or len(txt) > 40:
+                continue
+            cable_names[txt] = y
+            continue
+        others.append((txt, y))
+    return floor_marks, fx_list, hu_count, cable_info, cable_names, others
+
+result = {
+    "DXF文件": os.path.basename(DXF_PATH),
+    "DXF版本": doc.dxfversion,
+    "参数": {
+        "text_layer": LAYERS,
+        "text_type": TYPES,
+        "title_pattern": args.title_pattern,
+        "floor_pattern": args.floor_pattern or "内置统一解析（3F/17F/-1F/B1/B2/WF）",
+        "hu_pattern": args.hu_pattern or "未提供（不提取户数）",
+        "cable_pattern": args.cable_pattern or "未提供（不提取皮线）",
+        "fx_pattern": args.fx_pattern or "未提供（不提取分纤箱）",
+        "unit_pattern": args.unit_pattern or "未提供（用分纤箱x聚类分单元）",
+        "unit_cluster": args.unit_cluster,
+        "unit_range": args.unit_range,
+        "y_tol": args.y_tol,
+    },
+    "楼栋": {},
+}
+
+# ---------- --fx-map：总图对照表回填（2026-09-18 新增） ----------
+# 动机：inspect 的 C2/C3/C6 会因 parse 侧「安装楼层=null」判 FAIL，而该 null 常源于
+#   本单元图上确实无楼层线可归属（配套楼、地下室等），不是数据错误；总图对照表
+#   （extract_fx_map，独立方法）里同一编号往往有楼层可查。
+# 纪律：① 只补缺失，**绝不覆盖已测出的值**；② 重号不自行择一，登记交人工；
+#       ③ 回填留来源标记，供 inspect 与人工追溯。
+FX_MAP = {}          # 编号 -> [entry, ...]
+FXMAP_FILLED = []    # 回填留痕
+FXMAP_SKIP_DUP = []  # 重号未回填
+_fxmap_meta = None
+if args.fx_map:
+    try:
+        with open(args.fx_map, "r", encoding="utf-8") as _f:
+            _raw = json.load(_f)
+    except (IOError, json.JSONDecodeError) as e:
+        log.error("无法读取 --fx-map %s: %s" % (args.fx_map, e))
+        sys.exit(1)
+    _entries = _raw.get("FX映射表") if isinstance(_raw, dict) else _raw
+    if not isinstance(_entries, list):
+        log.error("--fx-map 格式不对：顶层应含「FX映射表」数组（确认是 extract_fx_map.py 产物）")
+        sys.exit(1)
+    for _e in _entries:
+        if isinstance(_e, dict) and _e.get("编号"):
+            FX_MAP.setdefault(str(_e["编号"]).strip(), []).append(_e)
+    _dups = sorted(k for k, v in FX_MAP.items() if len(v) > 1)
+    _fxmap_meta = {"文件": os.path.basename(args.fx_map), "条目数": len(_entries),
+                   "唯一编号": len(FX_MAP), "重号编号": _dups}
+    log.info("已载入 --fx-map：%d 条目 / %d 唯一编号%s"
+             % (len(_entries), len(FX_MAP),
+                ("（重号 %d 个不回填：%s）" % (len(_dups), "、".join(_dups[:8]))) if _dups else ""))
+
+# ---------- --bldg-map：按总图对照表定「箱的楼栋/单元归属」（2026-09-18 新增） ----------
+# 动机：SKILL.md 硬约束② 明文「楼栋/单元归属**必须以图纸自带的分纤箱总图对照表为准**，
+#   严禁用标题 x 区间硬切（系统图区常两行交错排布、纵向重叠横向错开，按标题 x 中分
+#   **必然串行**）」。但此前只有 analyze_coverage.py 接了 --bldg-map，本脚本没有 ——
+#   总图对照表形态的图纸（箱编号集中在独立图区，x 不落在任何楼栋标题区间内）逐栋 0 箱，
+#   而 rc 仍为 0（静默丢数；下游不跑 inspect 不会察觉）。
+# 纪律：① 只改「归属」，**不改「安装楼层」** —— 安装楼层仍走本脚本的区间法，与对照表的
+#          分歧由 inspect 的 C3 双源交叉 + C7 报人处理，此处不择一；
+#       ② 重号（同编号被对照表映射到多处）不自行择一，登记交人工；
+#       ③ 每条改派留痕，可回原文坐标追溯。
+BDG_MAP = {}          # 编号 -> [entry, ...]（extract_fx_map 的 FX映射表条目）
+BDGMAP_MOVED = []     # 改派留痕（跨栋才记，同栋只并入单元）
+BDGMAP_SKIP_DUP = []  # 重号未改派
+BDGMAP_NAMEMISS = []  # 对照表单元名与 parse 原单元名并存登记
+_bdgmap_meta = None
+if args.bldg_map:
+    try:
+        with open(args.bldg_map, "r", encoding="utf-8") as _f:
+            _raw2 = json.load(_f)
+    except (IOError, json.JSONDecodeError) as e:
+        log.error("无法读取 --bldg-map %s: %s" % (args.bldg_map, e))
+        sys.exit(1)
+    _entries2 = _raw2.get("FX映射表") if isinstance(_raw2, dict) else _raw2
+    if not isinstance(_entries2, list):
+        log.error("--bldg-map 格式不对：顶层应含「FX映射表」数组（确认是 extract_fx_map.py 产物）")
+        sys.exit(1)
+    for _e2 in _entries2:
+        if isinstance(_e2, dict) and _e2.get("编号"):
+            BDG_MAP.setdefault(str(_e2["编号"]).strip(), []).append(_e2)
+    _dups2 = sorted(k for k, v in BDG_MAP.items() if len(v) > 1)
+    _bdgmap_meta = {"文件": os.path.basename(args.bldg_map), "条目数": len(_entries2),
+                    "唯一编号": len(BDG_MAP), "重号编号": _dups2}
+    log.info("已载入 --bldg-map：%d 条目 / %d 唯一编号%s"
+             % (len(_entries2), len(BDG_MAP),
+                ("（重号 %d 个不改派：%s）" % (len(_dups2), "、".join(_dups2[:8]))) if _dups2 else ""))
+
+# ---------- --bldg-map 改派：把 FX 文字挂到对照表给定的楼栋/单元 ----------
+# 必须在楼栋循环之前完成。改派对象是**文字本身**：先在每栋文字里摘出有对照表映射的
+# FX 文字，再按对照表楼栋/单元重新挂入（同栋同单元的也统一走这条通道，保证单元名
+# 以对照表为准）。对照表没有的编号、重号、楼栋名不在本图锚点内的，一律**保持原
+# 标题 x 硬切结果**并留痕，不猜、不静默择一。
+def _resolve_bldg_name(name):
+    """把对照表的「楼栋」值解析为本图锚点楼栋名（bldg_ranges 的键）。
+
+    对照表由 extract_fx_map.py 产出，其「楼栋」字段取自最近楼栋标注，形态可为
+    `3#楼` 或 `3#楼2单元`；而本脚本 bldg_ranges 的键是**不含单元**的楼栋名
+    （如 `3#楼`）。不做这一步解析，含单元后缀的条目会被 `not in bldg_ranges`
+    整批丢掉（2026-09-18 实测：23 条里只有 4#配套楼 / 11#配套楼两个无后缀的通过，
+    箱数只从 0 涨到 2 而非 23）。
+
+    规则：精确命中优先；否则取「是它的前缀」的最长锚点名；都不命中返回 None（不猜）。
+    """
+    if not name:
+        return None
+    if name in bldg_ranges:
+        return name
+    best = None
+    for _b in bldg_ranges:
+        if name.startswith(_b) and (best is None or len(_b) > len(best)):
+            best = _b
+    return best
+
+
+_FX_FORCE = {}          # 楼栋名 -> {对照表单元名: [text, ...]}
+if BDG_MAP:
+    # 改派必须从**全图 texts** 出发，不能从 bldg_texts 出发 —— bldg_texts 是「已按
+    #   楼栋标题 x 区间切好」的结果，而本类图纸的箱编号恰好落在**所有楼栋区间之外**
+    #   （汇总在独立的总图对照表区），压根不在 bldg_texts 里。从它里面找等于
+    #   「在错误的地方找丢失的东西」，必然 0 命中（2026-09-18 实测踩中）。
+    _owner = {}
+    for _b0 in list(bldg_texts.keys()):
+        for _t0 in bldg_texts[_b0]:
+            _owner[id(_t0)] = _b0          # 记录原归属，用于留痕与移除
+    _moved = 0
+    _claimed = set()
+    for _t in texts:
+        _m = FX_RE.search(_t["内容"]) if FX_RE else None
+        if not _m:
+            continue
+        _no = _m.group(0).strip()
+        _cand = BDG_MAP.get(_no)
+        if not _cand:
+            continue                          # 对照表无此编号 -> 保持原归属
+        if len(_cand) > 1:
+            BDGMAP_SKIP_DUP.append(_no)       # 重号 -> 不择一，登记
+            continue
+        _tb0 = str(_cand[0].get("楼栋") or "").strip()
+        _tb = _resolve_bldg_name(_tb0)
+        if not _tb:
+            continue                          # 对照表楼栋在本图锚点里找不到 -> 不猜
+        # 单元名取对照表的「单元」字段（如 `1#楼1单元`，与 coverage 侧同源）；
+        # 缺该字段时退化为楼栋名，不自行编造单元号。
+        _tu = str(_cand[0].get("单元") or "").strip() or _tb
+        _FX_FORCE.setdefault(_tb, {}).setdefault(_tu, []).append(_t)
+        _claimed.add(id(_t))
+        _moved += 1
+        _old = _owner.get(id(_t))
+        if _old != _tb:
+            # 「(不在任何楼栋x区间)」这一情形正是本类图纸的特征，留痕备查
+            BDGMAP_MOVED.append("%s: %s -> %s/%s"
+                                % (_no, _old or "(不在任何楼栋x区间)", _tb, _tu))
+    if _claimed:                              # 从原楼栋摘除，避免重复计数
+        for _b0 in list(bldg_texts.keys()):
+            bldg_texts[_b0] = [_t0 for _t0 in bldg_texts[_b0]
+                               if id(_t0) not in _claimed]
+    log.info("--bldg-map 改派：%d 个 FX 文字按对照表归属（跨栋/跨区 %d 个）；重号未改派 %d 个"
+             % (_moved, len(BDGMAP_MOVED), len(set(BDGMAP_SKIP_DUP))))
+    _bdgmap_meta["改派条数"] = _moved
+    _bdgmap_meta["跨栋改派"] = BDGMAP_MOVED
+    _bdgmap_meta["重号未改派"] = sorted(set(BDGMAP_SKIP_DUP))
+
+for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
+    titles = [t["内容"] for t in bldg_texts[bldg] if TITLE_RE.search(t["内容"])]
+    units = split_units(bldg)
+    # --bldg-map：把对照表认领的箱注入其单元，单元名以对照表为准。
+    #   该楼对照表只有一个单元名时，parse 原划分（常是占位名「全部」）整体并入该名下
+    #   —— 否则 parsed.json 的单元名与 coverage.json（走 bldg-map）对不上、无法 join。
+    #   有多个单元名时保留 parse 原划分作**非箱文字容器**，另按要求新增单元，并登记
+    #   「名称并存」交人工，不静默合并、不丢文字。
+    _forced = _FX_FORCE.get(bldg) or {}
+    if _forced:
+        if len(_forced) == 1:
+            _only = list(_forced.keys())[0]
+            _merged = []
+            for _u0, _tl0 in units.items():
+                _merged.extend(_tl0)
+            units = {_only: _merged}
+        elif units:
+            BDGMAP_NAMEMISS.append(
+                "%s: 对照表单元 %s 与 parse 原单元 %s 并存（非箱文字仍在原单元）"
+                % (bldg, "/".join(sorted(_forced)), "/".join(sorted(units.keys()))))
+        for _u0, _tl0 in _forced.items():
+            units[_u0] = list(units.get(_u0) or []) + list(_tl0)
+    result["楼栋"][bldg] = {"标题": titles[0] if titles else "", "单元": {}}
+    for uname, unit_texts in units.items():
+        floor_marks, fx_list, hu_count, cable_info, cable_names, others = parse_floor_info(unit_texts)
+        floor_table = {}
+        # 楼层表按楼层数字排序（1F→2F→…→N F），便于阅读与后续处理
+        # 准备楼层标注列表供二分查找（替代 O(N×M) 遍历）
+        floor_items = [(fl, fy) for fl, fy in floor_marks.items()]
+        for fl, fy in sorted(floor_marks.items(), key=lambda kv: floor_num_or_zero(kv[0], args.floor_pattern, use_fullmatch=True)):
+            # 户数匹配：y 坐标最近（排序+二分，O(log N)）
+            hu = None
+            hu_items = list(hu_count.items())  # [(y, n), ...]
+            best_hu, _ = match_y_to_floor(fy, hu_items, tol=args.y_tol, y_key=lambda it: it[0])
+            if best_hu is not None:
+                hu = best_hu[1]  # (y, n) 的 n
+            # 皮线匹配：同理
+            cable = None
+            cable_items = list(cable_info.items())  # [(y, (m, count)), ...]
+            best_cable, _ = match_y_to_floor(fy, cable_items, tol=args.y_tol, y_key=lambda it: it[0])
+            if best_cable is not None:
+                cable = best_cable[1]  # (y, (m, count)) 的 (m, count)
+            floor_table[fl] = {
+                "户数": hu,
+                "布线": f"{cable[0]}m*{cable[1]}" if cable else None,
+                "fl_num": floor_num_or_zero(fl, args.floor_pattern, use_fullmatch=True),
+            }
+        for fx in fx_list:
+            # 安装楼层匹配：区间法（2026-09-12 P0-6 修正：从最近线法改为区间法）
+            # 2026-09-16 P0：此处原先传 tol=install_tol（1/6 倍层高）作距离闸门。闸门在 bisect
+            #   完成区间归属**之后**再二次否决，效果等价于「必须贴着下方层线才算」＝「最近楼层
+            #   线法」，与 SKILL.md「禁止用最近楼层线法测分纤箱安装楼层」「安装楼层必须与户数
+            #   同用区间法」两条明文冲突；且闸门只覆盖楼层带下沿一小段，实测某图分纤箱到下方
+            #   层线的距离普遍大于闸门值，安装楼层整列落空而脚本仍 rc=0。
+            #   现改 tol=None（纯区间法），与 analyze_coverage.py 的 f_install 口径统一；
+            #   dist 仍返回，用于区分口径A（图上直写）/ 口径B（区间法）。
+            fl_name, dist = assign_floor_by_interval(fx["y"], floor_items)
+            # ---- 对照表认领的箱：安装楼层取图上直写口径A，区间法结果降级为参考留痕 ----
+            # 本类图纸的箱编号写在**独立的总图对照表图区**，其 y 与楼栋系统图的楼层刻度
+            #   不是同一坐标系；拿它的 y 去套系统图楼层带，得到的层号（实测出现过 WF /
+            #   16F 等）不具物理意义。对照表给的是图纸上直写的安装楼层，属权威来源。
+            # 判据（客观、可复核，故属「有判据自判」而非「猜」）：
+            #   ① 该编号在总图对照表里有**唯一**映射；② 该映射带非空安装楼层。
+            #   两条不同时成立则一切照旧 —— 不猜、不放宽。
+            # 留证：区间法原值原样写入 区间法参考值/区间法参考误差 供审计，证据不丢；
+            #   并保留 C3 双源交叉（parse 本分支值 vs coverage 独立方法）作第二来源。
+            _bdg = BDG_MAP.get(str(fx.get("编号", "")).strip()) if BDG_MAP else None
+            if _bdg and len(_bdg) == 1 and _bdg[0].get("安装楼层"):
+                fx["区间法参考值"] = fl_name
+                fx["区间法参考误差"] = round(dist, 2)
+                fx["安装楼层"] = _bdg[0]["安装楼层"]
+                fx["安装楼层口径"] = "口径A:图上直写（总图对照表）"
+                fx["安装楼层来源"] = "fxmap对照表"
+                fx["安装楼层误差"] = 0.0
+                # ---- 结果状态契约（v3.1 L1-C8）产出方落地 ----
+                # 对照表唯一映射 + 非空安装楼层 = 客观判据 ⇒ measured + settled
+                fx["result_origin"] = "measured"
+                fx["result_confirmation"] = "settled"
+                fx["依据来源"] = "E-DXF-TEXT:总图对照表（图上直写安装楼层，编号唯一映射）"
+            else:
+                fx["安装楼层"] = fl_name
+                if fl_name is None:
+                    fx["安装楼层口径"] = "未关联到楼层"
+                elif dist <= args.y_tol:
+                    fx["安装楼层口径"] = "口径A:图上直写"
+                else:
+                    fx["安装楼层口径"] = "口径B:区间法"
+                fx["安装楼层误差"] = round(dist, 2)
+                # ---- 结果状态契约（v3.1 L1-C8）产出方落地 ----
+                # 两个正交维度，只**登记**已定值、不改变任何归属结果与数值：
+                #   origin：口径A（图上直写，dist ≤ 容差）= measured；口径B（区间法算出）= derived；
+                #           关联不到楼层 = unresolved。
+                #   confirmation：归属须有客观依据才可定案。依据 = ①对照表对该编号有**唯一**映射，
+                #           或 ②编号文字落在他所属楼栋的 x 区间内（几何归属本身可用）。
+                #           两者皆不成立 ⇒ 归属属「标题 x 区间硬切」（硬约束② 明文禁止）⇒ pending，
+                #           由 inspect C9 拦下，不得进入成品。
+                if fl_name is None:
+                    fx["result_origin"] = "unresolved"
+                elif dist <= args.y_tol:
+                    fx["result_origin"] = "measured"
+                else:
+                    fx["result_origin"] = "derived"
+                _bm_unique = bool(_bdg and len(_bdg) == 1)
+                _br = bldg_ranges.get(bldg)
+                _x_in_range = bool(_br and _br[0] <= fx.get("x", 0) <= _br[1])
+                fx["result_confirmation"] = ("settled" if (_bm_unique or _x_in_range)
+                                             else "pending")
+                fx["依据来源"] = (
+                    "E-DXF-TEXT:总图对照表（编号唯一映射，归属已定案）" if _bm_unique else
+                    ("E-DXF-GEOM:系统图内几何归属（编号文字在本栋 x 区间内）" if _x_in_range else
+                     "未对照总图、且编号文字不在本栋 x 区间内 —— 归属待裁决"))
+            # --fx-map 回填：只在 parse 侧测不出（null）时补，绝不覆盖已测值
+            if FX_MAP and fx.get("安装楼层") is None:
+                _cand = FX_MAP.get(str(fx.get("编号", "")).strip())
+                if _cand and len(_cand) == 1 and _cand[0].get("安装楼层"):
+                    fx["安装楼层"] = _cand[0]["安装楼层"]
+                    fx["安装楼层口径"] = "fx-map:总图对照表回填"
+                    fx["安装楼层来源"] = "fx-map"
+                    fx["result_origin"] = "measured"
+                    fx["result_confirmation"] = "settled"
+                    fx["依据来源"] = "E-DXF-TEXT:fx-map 总图对照表回填（编号唯一映射）"
+                    FXMAP_FILLED.append("%s@%s/%s" % (fx["编号"], bldg, uname))
+                elif _cand and len(_cand) > 1:
+                    FXMAP_SKIP_DUP.append(str(fx.get("编号")))
+        result["楼栋"][bldg]["单元"][uname] = {
+            "分纤箱": fx_list,
+            "楼层表": floor_table,
+            "光缆": list(cable_names.keys()),
+        }
+        # INSERT 实体归属当前单元（按 x 坐标判断）
+        unit_inserts = []
+        if insert_items:
+            for ins in insert_items:
+                if ins.get("楼") != bldg:
+                    continue
+                # 判断是否属于当前单元（uname 来自 units.items() 循环，必定在 units 中）
+                # 与该单元的 fx 文字 x 范围比较
+                unit_fx = [t for t in units[uname] if FX_RE and FX_RE.search(t["内容"])]
+                if unit_fx:
+                    fx_xs = [t["x"] for t in unit_fx]
+                    unit_xmin = min(fx_xs) - args.unit_range
+                    unit_xmax = max(fx_xs) + args.unit_range
+                else:
+                    # 无 fx 文字时用单元标注 x
+                    unit_anchors = [t["x"] for t in bldg_texts[bldg] if UNIT_RE and UNIT_RE.search(t["内容"])]
+                    if unit_anchors:
+                        unit_xmin = min(unit_anchors) - args.unit_range
+                        unit_xmax = max(unit_anchors) + args.unit_range
+                    else:
+                        unit_xmin, unit_xmax = NEG_INF_COORD, INF_COORD
+                if not (unit_xmin <= ins["x"] <= unit_xmax):
+                    continue
+                unit_inserts.append(ins)
+            if unit_inserts:
+                # 按区间法归属楼层
+                floor_items = [(fl, fy) for fl, fy in floor_marks.items()]
+                if floor_items:
+                    for ins in unit_inserts:
+                        fl_name, _ = assign_floor_by_interval(ins["y"], floor_items)
+                        ins["归属楼层"] = fl_name
+                        ins["归属方法"] = "区间法" if fl_name else "区间法:低于最低楼层线"
+                result["楼栋"][bldg]["单元"][uname]["INSERT"] = unit_inserts
+        if others:
+            result["楼栋"][bldg]["单元"][uname]["其它"] = others
+
+# ---------- 静默丢数闸门（2026-09-18 新增） ----------
+# parse 找不到箱时此前只把 分纤箱=[] 写出去、rc 仍为 0 —— 下游不跑 inspect 不会察觉。
+# 总图对照表形态的图纸（箱编号在独立图区）必然触发该情形，故显式告警 + 落状态字段。
+_n_fx_total = sum(len(_uv.get("分纤箱") or [])
+                  for _bv in result["楼栋"].values()
+                  for _uv in (_bv.get("单元") or {}).values())
+if _n_fx_total == 0:
+    log.warning("!! parse 侧箱数为 0 —— 箱编号可能集中在独立的总图对照表图区"
+                "（x 不落在任何楼栋标题区间内）。若图纸申报有总图对照表，"
+                "请传 --bldg-map（extract_fx_map.py 产物）按对照表定归属；"
+                "否则 inspect 的 C0/C2/C3/C4/C6 会全部 FAIL。")
+    result["分纤箱提取状态"] = "0箱｜须核：是否总图对照表形态（需 --bldg-map）"
+else:
+    result["分纤箱提取状态"] = "%d箱" % _n_fx_total
+if _bdgmap_meta:
+    _bdgmap_meta["单元名并存"] = BDGMAP_NAMEMISS
+    result["BDGMAP归属"] = _bdgmap_meta
+    log.info("--bldg-map 归属结果：跨栋改派 %d；重号未改派 %d；单元名并存 %d"
+             % (len(BDGMAP_MOVED), len(set(BDGMAP_SKIP_DUP)), len(BDGMAP_NAMEMISS)))
+
+# ---------- --fx-map 回填汇总（写入产物，供 inspect / 人工追溯） ----------
+if _fxmap_meta:
+    _fxmap_meta["回填条数"] = len(FXMAP_FILLED)
+    _fxmap_meta["回填清单"] = FXMAP_FILLED
+    _fxmap_meta["重号未回填"] = sorted(set(FXMAP_SKIP_DUP))
+    result["FXMAP回填"] = _fxmap_meta
+    log.info("--fx-map 回填安装楼层 %d 条；重号未回填 %d 条（交人工裁决）"
+             % (len(FXMAP_FILLED), len(set(FXMAP_SKIP_DUP))))
+
+try:
+    ensure_parent(OUT, log=log)
+    with open(OUT, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+except IOError as e:
+    log.error(f"无法写入输出文件: {OUT}\n{e}")
+    sys.exit(1)
+
+log.info(f"\n解析完成 → {OUT}")
