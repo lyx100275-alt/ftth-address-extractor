@@ -26,7 +26,9 @@ USER VALIDATION 原地，不算违规；一旦成品落盘，同样的 pending �
 --------------------------------
   0 = 全部禁止迁移均未发生，可继续。
   2 = **停**。命中至少一条禁止迁移 —— 不得出表 / 不得交付。
-  3 = 早失败。参数不足，或既无台账也无成品（无可核对象）。
+  3 = 早失败。参数不足 / 目录不存在，或**三本台账均不存在**（无可核对象）。
+      刻意不对「无台账」给 rc=0：那会把「根本没核」显示成「核过了」。
+      部分台账存在时按空处理并逐条标注缺哪本，仍照常核对。
 
 字段一律复用 `ledger_state.py` 的常量（SNAP_NAME / RULE_NAME / ALIAS_NAME / ST_* /
 *_SCHEMA），**本文件不得自造同义字段或副本常量** —— 否则形成第二权威口径。
@@ -57,6 +59,17 @@ def _load_json(path):
         return None
 
 
+def _entries(obj, default):
+    """台账不存在时 _load 返回 None —— 必须在此拦截。
+
+    实测教训：直接调 LS._pick_entries(None) 会 AttributeError 崩成 rc=1
+    （Traceback 而非契约退出码），且崩点远离调用处。真机冒烟测试才发现 ——
+    自测用例全部写了台账，恰好漏掉「台账从未初始化」这一最常见场景。
+    不改 ledger_state.py（其 cmd_check 先判 None 故自身无此问题），在本层防御。
+    """
+    return LS._pick_entries(obj) if obj is not None else default
+
+
 def _load_ledgers(project_dir, project):
     """按 ledger_state 的既有 schema 读取三本台账；缺失返回 None（不当错误）。"""
     p = LS._paths(project_dir)
@@ -69,11 +82,34 @@ def _load_ledgers(project_dir, project):
 
 
 def _find_product(project_dir, explicit):
-    """成品定位：显式给路径优先；否则在本目录扫 .gitignore 同口径的产物名。"""
+    """成品定位。
+
+    实测教训（真机冒烟测试发现）：产物命名有**两种形态** ——
+      `标准地址表*.xlsx`（.gitignore 采用的写法）与 `凤鸣朝阳标准地址表.xlsx`（项目名在前）。
+    只按前缀匹配会把后者判成「未出表」，进而漏掉 #2/#4/#5 的成品交叉核验
+    （假阴性 —— 比误报更危险，因为它给出绿灯）。
+
+    故：包含式匹配 + 排除模板/备份类同名物 + 多候选取最新 mtime 并**列出全部候选**，
+    选择结果打印在 facts 里供复核（不静默择一）。
+    """
     if explicit:
         return explicit if os.path.exists(explicit) else None
-    hits = sorted(glob.glob(os.path.join(project_dir, "标准地址表*.xlsx")))
-    return hits[0] if hits else None
+    EXCLUDE = ("模板", "备份", "buk", "bak", "~$", "副本", "历史产物")
+    cands = [p for p in glob.glob(os.path.join(project_dir, "*标准地址表*.xlsx"))
+             if not any(x in os.path.basename(p) for x in EXCLUDE)]
+    if not cands:
+        return None
+    return max(cands, key=os.path.getmtime)
+
+
+def _product_candidates(project_dir):
+    """供 facts 展示的候选清单（含被排除项，便于人复核排除是否合理）。"""
+    EXCLUDE = ("模板", "备份", "buk", "bak", "~$", "副本", "历史产物")
+    out = []
+    for p in sorted(glob.glob(os.path.join(project_dir, "*标准地址表*.xlsx"))):
+        n = os.path.basename(p)
+        out.append("%s%s" % (n, "（已排除：备份/模板类）" if any(x in n for x in EXCLUDE) else ""))
+    return out
 
 
 def _has_auto_marker(s):
@@ -85,16 +121,27 @@ def check(project_dir, project, product, closure_path):
     """返回 (violations, warns, facts)。violations 非空 ⇒ rc=2。"""
     viol, warns, facts = [], [], []
     led = _load_ledgers(project_dir, project)
-    se = LS._pick_entries(led["snap"]) or {}
-    re_ = LS._pick_entries(led["rule"]) or []
-    ae = LS._pick_entries(led["alias"]) or []
+    se = _entries(led["snap"], {})
+    re_ = _entries(led["rule"], [])
+    ae = _entries(led["alias"], [])
 
     product = _find_product(project_dir, product)
     closure = _load_json(closure_path) if closure_path else None
 
-    facts.append("台账目录 %s：快照 %d 项 / 裁决 %d 条 / 别名 %d 条"
-                 % (led["dir"], len(se), len(re_), len(ae)))
+    missing = [k for k in ("snap", "rule", "alias") if led[k] is None]
+    facts.append("台账目录 %s：快照 %d 项 / 裁决 %d 条 / 别名 %d 条%s"
+                 % (led["dir"], len(se), len(re_), len(ae),
+                    ("（缺 %s）" % "、".join(missing)) if missing else ""))
     facts.append("成品：%s" % (product if product else "未发现（未出表）"))
+    cands = _product_candidates(project_dir)
+    if len(cands) > 1:
+        facts.append("成品候选 %d 个：%s —— 取 mtime 最新者为成品" % (len(cands), "；".join(cands)))
+    if len(missing) == 3:
+        warns.append("三本台账均不存在 —— 无可核对象。落盘纪律见 operations_discipline.md §六。")
+        if product:
+            warns.append("且成品已存在（%s）：本次无法核对来源与确认状态，"
+                         "该成品的可追溯性未获任何机器证据支持。"
+                         % os.path.basename(product))
     if closure_path:
         if closure is None:
             warnings_only = "闭包结果读不出：%s（按未提供处理，判据 #4 跳过）" % closure_path
@@ -160,7 +207,7 @@ def check(project_dir, project, product, closure_path):
     if closure and product and closure.get("rc"):
         viol.append("#4 闭包检查 rc=%s（FAIL %d 项）而成品已生成 —— hard gate FAIL 不得 ASSEMBLE。"
                     % (closure.get("rc"), len(closure.get("fails") or [])))
-    return viol, warns, facts, product
+    return viol, warns, facts, product, (len(missing) == 3)
 
 
 def main(argv=None):
@@ -179,7 +226,7 @@ def main(argv=None):
         sys.stderr.write("[transitions] 目录不存在：%s\n" % a.project_dir)
         return 3
 
-    viol, warns, facts, product = check(a.project_dir, a.project, a.product, a.closure)
+    viol, warns, facts, product, uninitialized = check(a.project_dir, a.project, a.product, a.closure)
 
     print("[迁移门禁核对] %s" % os.path.abspath(a.project_dir))
     for f in facts:
@@ -194,6 +241,10 @@ def main(argv=None):
             print("    × %s" % v)
         print("  → rc=2：停在当前位置，按 C5 四列报人；不得出表 / 不得交付。")
         rc = 2
+    elif uninitialized:
+        print("  → rc=3：早失败。三本台账均不存在，无可核对象；不给出「通过」结论"
+              "（避免把「没核」误读成「核过了」）。")
+        rc = 3
     else:
         print("  [通过] 5 条禁止迁移均未发生。")
         rc = 0
