@@ -976,6 +976,23 @@ def main():
                              "区间语义（`1-3号楼`=1、2、3 号 还是 1、3 号）只能由人裁决，"
                              "**确认后**再开启；开启动作会透传给 parse。")
 
+    # budget: SKILL.md 体量闸门（2026-09-18 新增）
+    #   阈值从 version.json 的 budget 段读（单一权威）；脚本内只留兜底值，且会标注实际来源。
+    p_bud = sub.add_parser("budget", parents=[common],
+                           help="SKILL.md / references 体量闸门（阈值取自 version.json）")
+    p_bud.add_argument("--json-out", default=None, help="把结果写成 JSON")
+
+    # transitions: 迁移门禁核对（2026-09-18 接入主入口；核对器本体此前已存在但未接线）
+    p_tr = sub.add_parser("transitions", parents=[common],
+                          help="迁移门禁核对：核 SKILL.md「禁止迁移」5 条（与成品落盘交叉核验）")
+    p_tr.add_argument("--project-dir", required=True, help="三本台账所在目录")
+    p_tr.add_argument("--project", default=None, help="项目名（台账内字段，可选）")
+    p_tr.add_argument("--product", default=None,
+                      help="成品路径；不传则在该目录扫 标准地址表*.xlsx")
+    p_tr.add_argument("--closure", default=None,
+                      help="inspect_closure.py --json 的机读结果（可选，用于判据 #4）")
+    p_tr.add_argument("--json-out", default=None, help="机读结果输出路径（可选）")
+
     args = ap.parse_args()
 
     # 读取配置文件并填充缺失参数（H2 修复：参数默认值改为 None，config 可覆盖）
@@ -1103,8 +1120,9 @@ def main():
                     ap.error(f"无法创建输出目录 {_d}: {_e}")
 
     # H3: 校验 --dxf 参数（gen / verify-truth / inspect / assemble / apply-ruling 子命令不需要）
-    if args.cmd not in ("gen", "verify-truth", "inspect", "assemble", "apply-ruling") and not args.dxf:
-        ap.error("--dxf 是必需参数（gen / verify-truth / inspect / assemble / apply-ruling 除外）")
+    if args.cmd not in ("gen", "verify-truth", "inspect", "assemble", "apply-ruling",
+                        "budget", "transitions") and not args.dxf:
+        ap.error("--dxf 是必需参数（gen / verify-truth / inspect / assemble / apply-ruling / budget / transitions 除外）")
 
     # 分发
     if args.cmd == "probe":
@@ -1201,6 +1219,19 @@ def main():
         sys.exit(run_script("inspect_closure.py", cmd))
     elif args.cmd == "pipeline":
         sys.exit(cmd_pipeline(args))
+    elif args.cmd == "budget":
+        # 阈值一律从 version.json 读，本命令不引入第二套口径。
+        _c = []
+        if args.json_out:
+            _c += ["--json", args.json_out]
+        sys.exit(run_script("check_budget.py", _c))
+    elif args.cmd == "transitions":
+        _c = ["--project-dir", args.project_dir]
+        for _flag, _val in (("--project", args.project), ("--product", args.product),
+                            ("--closure", args.closure), ("--json", args.json_out)):
+            if _val:
+                _c += [_flag, _val]
+        sys.exit(run_script("check_transitions.py", _c))
 
 
 if __name__ == "__main__":

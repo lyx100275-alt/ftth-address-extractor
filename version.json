@@ -20,6 +20,16 @@
   },
   "runtime_note": "解释器一律经 scripts/ftth.cmd 探测后调用 —— 它以真实 `import ezdxf` 决定可用解释器（本机实测存在无 ezdxf 的解释器排在 PATH 前面），探测不到返回 rc=9；禁止按路径猜解释器，见 L1-C7 调用契约。",
 
+  "budget": {
+    "_note": "SKILL.md 与 references 单文件的体量阈值（字节）。**执行方 = scripts/check_budget.py（ftth.py budget）**，本段是阈值的唯一权威来源，脚本内只保留缺段兜底值并会显式标注实际来源。依据：SKILL.md 是每次会话首屏全量加载的唯一文件，宿主对工具输出有通用截断、实测 51,200 B 且无开关 —— 超出即静默截断（实测曾切掉体量纪律条文后半段与整张 references 索引表）。",
+    "warning_bytes": 47000,
+    "hard_limit_bytes": 49000,
+    "host_truncation_bytes": 51200,
+    "applies_to": ["SKILL.md", "references/*.md"],
+    "enforced_since": "2026-09-18",
+    "measured_at": "2026-09-18"
+  },
+
   "traceability": {
     "result_fields": "脚本产物须带 result_origin / result_confirmation 两字段（L1-C8），并由 inspect_closure.py C9 校验闭合。",
     "state_carrier": "跨阶段状态由三本台账承载（理解快照 / 裁决台账 / 别名台账），非由独立状态机文件承载；迁移门禁另由 scripts/check_transitions.py 核对。",
