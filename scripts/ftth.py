@@ -356,6 +356,88 @@ def _pipe_profile_status(profile_path, signal):
                or "").strip().lower()
 
 
+def _pipe_fxmap_gate(profile_path):
+    """judge 是否执行 fxmap（总图对照表）阶段。返回 (是否执行, 依据说明)。
+
+    2026-09-18（第 4 轮，用户裁决收紧）：**仅当画像申报存在集中总图对照表
+    （fx_overview_map = present / handoff① 状态 = present）时才产出 fxmap**。
+
+    此前（第 2/3 轮）判据是「有编号可提就跑」——把 fx_overview_map=absent
+    （编号嵌在各楼系统图楼层表内部）的图也强行产出降级对照表，其「安装楼层」
+    是拿编号文字 y 去**全图楼层刻度混排**推算出来的（不在四种测量方法内），
+    且会被 pipeline 自动回填 parse（--bldg-map / --fx-map），造成：
+      · 安装楼层出现与 V型/区间法矛盾（实测凤鸣朝阳 8 箱假矛盾 8F vs 5F）；
+      · 单元归属被对照表标题名覆盖，parse 楼层表整批丢失（实测 193→313 户）。
+    按用户裁决：分纤箱所在楼层 / 覆盖 / 每层户数，来源**只允许四种方法**
+    （图上标注直读、V型计算、区间法、竖线法）与不同图纸的多方标注互验，
+    **AI 不得自创算法参与校验**；「y 坐标关联推算」不在四法内 ⇒ 不得产出。
+
+    新判据：handoff「①分纤箱总图」状态 == present 才跑；absent / variant
+    一律跳过（rc=3 语义），不再产出降级对照表。老画像无 handoff 时回退到
+    信号 fx_overview_map == present。用户**显式 --bldg-map** 仍受尊重
+    （人工确认过总图，属「图上标注直读」来源）。
+    """
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            prof = json.load(f)
+    except Exception:                                                # noqa: BLE001
+        return False, "画像不可读"
+    ho = prof.get("handoff") or {}
+    ent = None
+    for k, v in ho.items():
+        if isinstance(v, dict) and "分纤箱总图" in str(k):
+            ent = v
+            break
+    if ent is not None:
+        st = str(ent.get("状态") or "").strip().lower()
+        if st == "present":
+            n_id = 0
+            try:
+                n_id = int(ent.get("编号数") or 0)
+            except (TypeError, ValueError):
+                n_id = 0
+            return True, "画像申报有集中总图（状态=present，编号 %d 个）→ 按对照表定归属" % n_id
+        return False, ("画像申报无集中总图（状态=%s）→ 不产出对照表："
+                       "y 坐标关联推算不在四种测量方法内（用户裁决 2026-09-18），"
+                       "安装楼层由方法池（区间法/V型/直读）测量，不做对照表回填" % (st or "?"))
+    # 老画像无 handoff ①：回退到信号
+    if _pipe_profile_status(profile_path, "fx_overview_map") == "present":
+        return True, "（老画像无 handoff①）信号 fx_overview_map=present"
+    return False, "画像未申报总图对照表（无 handoff①，且 fx_overview_map≠present）"
+
+
+_NONSTD_JSON_TOKENS = ("Infinity", "-Infinity", "NaN")
+
+
+def _reject_json_const(name):
+    """json.load 的 parse_constant 钩子：遇到非标准字面量即抛错。"""
+    raise ValueError("非标准 JSON 字面量 `%s`" % name)
+
+
+def _scan_nonstd_json(outdir):
+    """扫描产物目录下的 *.json，返回 [(文件名, 原因)] —— 只为「非标准 JSON」这种事存在。
+
+    动机（2026-09-18 实测）：Python 的 json.dump 默认把 inf/nan 写成
+    `Infinity`/`NaN`，而它们**不在 JSON 规范内** —— JS/Go 等严格解析器会拒绝
+    **整份**文件，而不是跳过那个字段。产物一旦这样出厂，下游任何非 Python 工具
+    都读不进来，而 Python 侧照样 rc=0（自己的 json.load 是宽容的）。
+    ⇒ 闸门放出口：流水线跑完扫一遍，命中即把 rc 抬到 2，不让它静默出关。
+    """
+    bad = []
+    if not os.path.isdir(outdir):
+        return bad
+    for name in sorted(os.listdir(outdir)):
+        if not name.endswith(".json"):
+            continue
+        fp = os.path.join(outdir, name)
+        try:
+            with open(fp, encoding="utf-8") as f:
+                json.load(f, parse_constant=_reject_json_const)
+        except ValueError as e:
+            bad.append((name, str(e)))
+    return bad
+
+
 def cmd_pipeline(args):
     """串跑多阶段，返回退出码。
 
@@ -400,6 +482,17 @@ def cmd_pipeline(args):
         print("[pipeline] %-9s rc=%-2s %7.2fs" % (stage, rc, el), flush=True)
         return rc
 
+    def _std_json_gate(rc):
+        """产物 JSON 标准性闸门（2026-09-18）：非标准字面量 ⇒ rc 抬到 2，不得静默出关。"""
+        bad = _scan_nonstd_json(outdir)
+        if bad:
+            for name, why in bad:
+                print("[pipeline] ! 产物非标准 JSON：%s（%s）—— 严格解析器会拒绝整份文件，"
+                      "须由产出脚本在 dump 前清洗为 null" % (name, why), flush=True)
+            ledger.append({"阶段": "json标准性", "rc": 2, "秒": 0.0})
+            return 2 if rc in (0, 3) else rc
+        return rc
+
     def _dump(rc):
         total = time.time() - t_all
         path = os.path.join(outdir, "pipeline_timing.json")
@@ -427,14 +520,14 @@ def cmd_pipeline(args):
     else:
         rc = _run("geom", ["--dxf", dxf], script="dump_geom.py")
         if rc:
-            return _dump(rc)
+            return _dump(_std_json_gate(rc))
     if stop_idx < 1:
         return _dump(0)
 
     # ---- ② probe ----
     rc = _run("probe", ["probe", "--dxf", dxf, "--out", cfg])
     if rc:
-        return _dump(rc)
+        return _dump(_std_json_gate(rc))
     if stop_idx < 2:
         return _dump(0)
 
@@ -444,7 +537,7 @@ def cmd_pipeline(args):
         plan_argv += ["--project-dir", args.project_dir]
     rc = _run("plan", plan_argv)
     if rc:
-        return _dump(rc)
+        return _dump(_std_json_gate(rc))
     if stop_idx < 3:
         return _dump(0)
 
@@ -455,31 +548,47 @@ def cmd_pipeline(args):
     # 2026-09-18 整改②（第 2 轮）：顺序再修正 —— 对照表必须在 **parse 之前**产出，
     #   依据 SKILL.md 硬约束②：楼栋/单元归属必须以对照表为准，parse 自身同样受此约束。
     fxmap = os.path.join(outdir, "fxmap.json")
-    if _pipe_profile_status(prof, "fx_overview_map") == "present":
+    # 2026-09-18（第 3 轮）：判据从「画像申报有集中总图」改为「**有 FX 编号可提**」。
+    #   原 gate 把 7/8 个分带整段跳过（这些图的箱编号嵌在各楼系统图箱表内，
+    #   fx_overview_map=absent，但 handoff① 明写编号可读/编号数），后果是 parse 侧
+    #   箱归属全空、rc 仍 0 —— 静默丢数。详见 _pipe_fxmap_gate 的说明。
+    _fx_run, _fx_note = _pipe_fxmap_gate(prof)
+    if _fx_run:
+        print("[pipeline] fxmap 依据：%s" % _fx_note, flush=True)
         _rc_fx = _run("fxmap", [dxf, fxmap, "--config", cfg], script="extract_fx_map.py")
         if _rc_fx and not os.path.isfile(fxmap):
             print("[pipeline] ! fxmap 阶段失败(rc=%d) —— parse/coverage 无总图对照表，"
                   "楼栋归属回退『标题 x 中分』（仅供线索）" % _rc_fx, flush=True)
     else:
         ledger.append({"阶段": "fxmap", "rc": 3, "秒": 0.0})
-        print("[pipeline] %-9s rc=3      0.00s  (画像未申报总图对照表，跳过)" % "fxmap",
+        print("[pipeline] %-9s rc=3      0.00s  (%s，跳过)" % ("fxmap", _fx_note),
               flush=True)
-    # 用户显式 --bldg-map 优先；否则用本阶段落盘的 fxmap.json（同一份总图对照表）。
-    # 该变量在下游 parse/coverage 两处复用 —— 一份对照表、两处同源，避免各取各的。
-    _bmap = args.bldg_map or (fxmap if os.path.isfile(fxmap) else None)
+    # 用户显式 --bldg-map 优先（人工确认过总图对照表，属「图上标注直读」来源）；
+    # 否则仅当 fxmap 阶段**因 present 实际产出**时才用（_fx_run 控制产出）。
+    # 2026-09-18（第 4 轮，用户裁决）：absent 图不再产出 fxmap —— gate 未跑则文件
+    # 不存在，_bmap 自然为 None；不自动把「旧残留/降级产物」当作对照表回填。
+    _bmap = args.bldg_map or (fxmap if (_fx_run and os.path.isfile(fxmap)) else None)
     if stop_idx < 4:
         return _dump(0)
 
     # ---- ⑤ parse ----
     parse_argv = ["parse", "--dxf", dxf, "--config", cfg,
                   "--profile", prof, "--out", parsed]
+    # 2026-09-18（第 3 轮）：区间楼号语义（`1-3号楼` = 1、2、3 号还是 1、3 号）
+    #   只能由人裁决 —— parse/count 早有 --expand-bldg-ranges 开关，但**流水线不接续**，
+    #   用户确认语义后无法在 pipeline 里启用（实测某图因此丢一栋楼的全部箱）。
+    #   此处只做透传，不在代码里替用户决定。
+    if getattr(args, "expand_bldg_ranges", False):
+        parse_argv += ["--expand-bldg-ranges"]
+        print("[pipeline] 已按 --expand-bldg-ranges 展开区间楼号（`N-M号楼` → N..M 全部）",
+              flush=True)
     if _bmap:
         # 硬约束② 的落地：有总图对照表时，箱的楼栋/单元归属以它为准（不再按标题 x 中分）。
         # --fx-map 仍只做「缺失安装楼层回填」，不覆盖 parse 实测值。
         parse_argv += ["--bldg-map", _bmap, "--fx-map", _bmap]
     rc = _run("parse", parse_argv)
     if rc:
-        return _dump(rc)
+        return _dump(_std_json_gate(rc))
     if stop_idx < 5:
         return _dump(0)
 
@@ -499,7 +608,16 @@ def cmd_pipeline(args):
             cov_argv += ["--fx-symbol-layer", args.fx_symbol_layer or _lay["fx_symbol_layer"]]
         # _bmap 已在 fxmap 阶段解析（用户显式 --bldg-map 优先，否则用落盘的 fxmap.json）
         if _bmap:
-            cov_argv += ["--bldg-map", _bmap]
+            # 2026-09-18（第 3 轮）：--bldg-map 只有 analyze_coverage.py（coverage 子命令）接。
+            #   analyze_coverage_vshape.py 的楼栋归属由**标题窗口几何**决定，对照表不参与，
+            #   传它被判 unrecognized arguments 直接 rc=2 —— 实测凡产出 fxmap 的分带全中
+            #   （先前被误当成「覆盖无判据」）。此处按子命令分派，不再一律传。
+            if cov_cmd == "coverage":
+                cov_argv += ["--bldg-map", _bmap]
+            else:
+                print("[pipeline] 注意：本轮选法 %s **不消费**总图对照表（其楼栋/单元归属"
+                      "由标题窗口几何决定），故不传 --bldg-map；该来源的归属未经对照表"
+                      "交叉验证，结论须照此标注" % cov_cmd, flush=True)
         if _lay:
             print("[pipeline] 自画像下传图层(%s)：%s"
                   % (_lay_src, ", ".join("%s=%s" % (k, v) for k, v in _lay.items())),
@@ -514,7 +632,7 @@ def cmd_pipeline(args):
         if rc == 3:
             print("[pipeline] coverage rc=3 = 本图不适用（申报制），按降级路径继续", flush=True)
         elif rc:
-            return _dump(rc)
+            return _dump(_std_json_gate(rc))
     if stop_idx < 6:
         return _dump(0)
 
@@ -853,6 +971,10 @@ def main():
                         help="分纤箱图形符号所在图层；留空=自画像 effective_layers 取")
     p_pipe.add_argument("--bldg-map", default=None,
                         help="总图 FX 对照表 JSON；留空=自动用 <outdir>/fxmap.json（若存在）")
+    p_pipe.add_argument("--expand-bldg-ranges", action="store_true", default=None,
+                        help="把标题里的区间楼号 `N-M号楼` 展开为 N..M 全部楼栋（默认关闭）。"
+                             "区间语义（`1-3号楼`=1、2、3 号 还是 1、3 号）只能由人裁决，"
+                             "**确认后**再开启；开启动作会透传给 parse。")
 
     args = ap.parse_args()
 

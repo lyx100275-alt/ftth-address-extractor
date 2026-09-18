@@ -45,7 +45,8 @@ from ftth_common import (load_dxf, collect_texts, parse_bldg_nums_ex,
                           is_floor_text, setup_logger,
                           cluster_values_by_gap, measure_column_step,
                           home_box_kw, home_box_hit,
-                          extract_geom, suggest_fx_symbol_layers)
+                          extract_geom, suggest_fx_symbol_layers,
+                          filter_titleblock_units)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -77,6 +78,13 @@ RE_FIBER_LEN_FORMS = [
 RE_COVER_ROW = re.compile(r"至\s*\d*\s*[#号]?\s*箱")             # 覆盖表行「…至NN#箱」
 RE_LEVEL_HH = re.compile(r"\d+\s*层\s*/\s*\d+\s*户")             # 图签「N层/M户」
 RE_UNIT = re.compile(r"\d+\s*单元")                              # 图签「N单元」
+# 图签**分离标注**形态「NF」+「M户/层」（两个独立文字实体，同行相邻）。
+# 生产脚本 read_titleblock_households.py 早有该 fallback（配对合成 N层/M户），
+# 画像侧长期未同步 ⇒ 该类图纸的 titleblock_annotation 恒判 variant、图签这条
+# **独立第二来源**永不启用（「镜像铁律」②：两侧写法兼容表必须一致）。
+RE_HU_PER_FLOOR = re.compile(r"\d+\s*户\s*/\s*层")               # 图签「M户/层」
+RE_FLOOR_COUNT = re.compile(r"\d+\s*[Ff]")                       # 图签「NF」层数
+RE_BLDG_ONLY = re.compile(r"\d+\s*[#号]\s*楼")                    # 图签「N#楼」纯楼名（不含「…示意图」标题）
 # 楼层刻度（floor_scale）：楼层标注须**全匹配**。实测宽松 search 会把光缆型号
 # `GYTS-96B1` 里的 `B1` 当楼层；MTEXT 经 plain_text() 后仍保留分组花括号（如 `{-1F}`），
 # 故判定前先剥花括号（见 _strip_group_braces）。
@@ -1011,17 +1019,69 @@ def judge_fx_overview_map(st):
                            "是否构成总图须人工复核")
 
 
+def _synth_level_hh_by_pairing(texts, y_tol=2.0):
+    """把「NF」+「M户/层」分离标注按同行邻近配对，合成层户标注。
+
+    与 read_titleblock_households.py 的 variant fallback **同一判据**（以 M户/层 为锚、
+    每个只配 x 最近且未用过的 NF、y 容差 2.0），保证画像结论与生产脚本口径一致。
+    返回合成条目列表（每项 = 该条 M户/层 的 text dict）。
+    """
+    hu = [t for t in texts if RE_HU_PER_FLOOR.fullmatch(t.get("内容", ""))]
+    fl = [t for t in texts if RE_FLOOR_COUNT.fullmatch(t.get("内容", ""))]
+    if not (hu and fl):
+        return []
+    used, out = set(), []
+    for ht in hu:
+        cands = [(ft, abs(ft.get("x", 0.0) - ht.get("x", 0.0)) + abs(ft.get("y", 0.0) - ht.get("y", 0.0)))
+                 for ft in fl if id(ft) not in used
+                 and abs(ft.get("y", 0.0) - ht.get("y", 0.0)) <= y_tol]
+        if cands:
+            cands.sort(key=lambda c: c[1])
+            used.add(id(cands[0][0]))
+            out.append(ht)
+    return out
+
+
 def judge_titleblock_annotation(texts):
-    """图签（标题栏）层直写每栋入户规模：楼名 + 'N层/M户' + 'N单元'。"""
+    """图签（标题栏）层直写每栋入户规模：楼名 + 层户标注 + 'N单元'。
+
+    层户标注兼容两种写法（写法兼容表与 read_titleblock_households.py 同步）：
+      ① 合并形态「N层/M户」；
+      ② 分离形态「NF」+「M户/层」同行 —— 配对后可合成「N层/M户」，故同样视为 present。
+
+    `N单元` 计数只算**图签块内**的：系统图楼层列顶部也写 `N单元`（同图层同写法），
+    混算会让「图签单元标注条数」虚高（实测 24 条里只有 12 条属图签），
+    且与容差量测/配对侧的口径不一致 —— 两侧共用 ftth_common.filter_titleblock_units。
+    """
     lv = [t for t in texts if RE_LEVEL_HH.search(t.get("内容", ""))]
-    un = [t for t in texts if RE_UNIT.search(t.get("内容", ""))]
-    if lv and un:
-        return PRESENT, (f"命中『N层/M户』{len(lv)} 条、『N单元』{len(un)} 条"
+    form = "『N层/M户』"
+    if not lv:
+        synth = _synth_level_hh_by_pairing(texts)
+        if synth:
+            lv, form = synth, "分离标注『NF』+『M户/层』（同行配对合成层户标注）"
+    un_all = [t for t in texts if RE_UNIT.search(t.get("内容", ""))]
+    bl = [t for t in texts if RE_BLDG_ONLY.fullmatch(t.get("内容", ""))]
+    un_blk = un_all
+    n_drop = 0
+    if un_all and lv:
+        _keep, _drop = filter_titleblock_units(
+            [(t.get("x", 0.0), t.get("y", 0.0), t.get("内容", "")) for t in un_all],
+            [(t.get("x", 0.0), t.get("y", 0.0), t.get("内容", "")) for t in bl],
+            [(t.get("x", 0.0), t.get("y", 0.0), t.get("内容", "")) for t in lv])
+        n_drop = len(_drop)
+        _keys = {(round(x, 1), round(y, 1), s) for x, y, s in _keep}
+        un_blk = [t for t in un_all
+                  if (round(t.get("x", 0.0), 1), round(t.get("y", 0.0), 1), t.get("内容", "")) in _keys]
+    _un_note = (f"、『N单元』{len(un_blk)} 条（图签块内；另有 {n_drop} 条同名标注离楼名/层户过远，"
+                f"属系统图内的单元列头，已剔除）" if n_drop
+                else f"、『N单元』{len(un_blk)} 条")
+    if lv and un_blk:
+        return PRESENT, (f"命中{form}{len(lv)} 条{_un_note}"
                          f"→ 图签直写入户规模成立；几何偏移须由 `read_titleblock_households.py --probe` 量测")
-    if lv or un:
-        return VARIANT, (f"仅命中部分要素：『N层/M户』{len(lv)} 条、『N单元』{len(un)} 条"
+    if lv or un_all:
+        return VARIANT, (f"仅命中部分要素：{form}{len(lv)} 条{_un_note}"
                          f"→ 是否构成成对标注须人工确认")
-    return ABSENT, "图签层无『N层/M户』『N单元』成对标注"
+    return ABSENT, "图签层无『N层/M户』（含『NF』+『M户/层』分离形态）『N单元』成对标注"
 
 
 def judge_dedicated_wire_layer(line_cnt, wire_kw_re, top_n=12):
@@ -1148,7 +1208,11 @@ def judge_vertical_bus_traceable(segs, fx_positions, sig_wire_status,
 
 
 def judge_intake_table(project_dir):
-    """项目另附《楼宇信息采集表》（xls）：不在 DXF 内，须显式提供项目目录。"""
+    """项目另附《楼宇信息采集表》（xls）：不在 DXF 内，须显式提供项目目录。
+
+    排除规则（见下方常量）：本技能**自己的产物与归档副本**绝不算甲方采集表 ——
+    采集表是随图纸提供的输入，本链路输出反过来当输入构成论证闭环。
+    """
     if not project_dir:
         return UNKNOWN, ("未提供 --project-dir，无法检查项目是否附《楼宇信息采集表》；"
                          "若项目附有该表，请补充该参数后重跑本脚本")
@@ -1159,15 +1223,28 @@ def judge_intake_table(project_dir):
     # 把旧跑输出的表格（如 *_标准地址表.xlsx）误判成「项目另附的采集表」（variant 假阳性）。
     # 采集表是甲方随图纸提供的输入，只应存在于项目根目录（或明确的资料子目录），
     # 产物目录一律跳过；同时排除本技能已知输出文件名前缀，双保险。
+    #
+    # 2026-09-18 补（实测某项目）：原规则只跳过 `run_`/`_diag` 与写死的 `g_标准地址表` 前缀，
+    #   而项目自带的归档目录（如 `_历史产物_归档\`）与项目名式产物（如 `<项目>标准地址表.xlsx`）
+    #   都漏过 ⇒ 本技能**自己的产物**被当成「甲方采集表」列进 evidence。危害不止是假阳性：
+    #   下游一旦真去读它，等于**用本链路的输出反过来当本链路的证据**（论证闭环、不可复现）。
+    #   故改为按「归档/备份目录特征」+「本技能产物命名特征」判定，与项目名解耦。
     _SKIP_DIRS = ("run_", "_diag", ".workbuddy", "__pycache__", "backup", "_backup")
+    _SKIP_DIR_KWS = ("归档", "备份", "历史产物", "archive", "bak", "_temp", ".temp", "out_", "_out")
     _SKIP_PREFIXES = ("g_标准地址表", "fx_map", "cov_full")
+    _SKIP_NAME_KWS = ("标准地址表", "地址树", "地址簿", "batch_overview", "pipeline_timing")
     def _is_intake_candidate(f):
         if not f.is_file() or f.suffix.lower() not in (".xls", ".xlsx", ".csv"):
             return False
         parts = {seg.lower() for seg in f.relative_to(p).parts[:-1]}
         if any(d.startswith(_SKIP_DIRS) or d == _SKIP_DIRS for d in parts):
             return False
-        if any(f.name.lower().startswith(pre) for pre in _SKIP_PREFIXES):
+        if any(kw in d for d in parts for kw in _SKIP_DIR_KWS):
+            return False
+        n = f.name.lower()
+        if any(n.startswith(pre) for pre in _SKIP_PREFIXES):
+            return False
+        if any(kw in f.stem for kw in _SKIP_NAME_KWS):
             return False
         return True
     sheets = [f for f in p.rglob("*") if _is_intake_candidate(f)]

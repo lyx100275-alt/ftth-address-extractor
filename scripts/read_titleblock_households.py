@@ -51,7 +51,8 @@ import os
 import re
 import sys
 
-from ftth_common import ToleranceEstimateError, estimate_titleblock_tolerances
+from ftth_common import (ToleranceEstimateError, estimate_titleblock_tolerances,
+                         filter_titleblock_units)
 
 
 def _load_dxf_texts(path, layer):
@@ -205,6 +206,19 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
                 if synth_lvf:
                     lvf = synth_lvf
                     print('[variant] 图签为分离标注形式（NF + M户/层），已自动配对合成 %d 条层户标注' % len(lvf))
+    # 2026-09-18（P0）：把「图签块内的单元标注」从全图同名标注里分出来。
+    #   `N单元` 在**系统图里也出现**（每栋系统图楼层列顶部的单元列头），与图签同图层同写法。
+    #   旧实现把两者一起配对 ⇒ 单元被配到错误楼栋：实测某图 7 栋里 5 栋单元数错、
+    #   一栋收到 `1单元×6 / 2单元×5` 重复标签，而脚本只打 ⚠、退出码仍为 0。
+    #   判据与容差量测共用同一处实现（ftth_common.filter_titleblock_units），两侧不得各写一份。
+    if lvu:
+        _lvu_all = len(lvu)
+        lvu, _lvu_drop = filter_titleblock_units(lvu, bl, lvf)
+        if _lvu_drop:
+            print('[图签块] 单元标注 %d 个 → 保留 %d 个、剔除 %d 个'
+                  '（离任何楼名/层户都远 ⇒ 属系统图内的单元列头，非图签数据）：%s'
+                  % (_lvu_all, len(lvu), len(_lvu_drop),
+                     '、'.join('%s@[%.1f,%.1f]' % (d[2], d[0], d[1]) for d in _lvu_drop[:8])))
     if not bl or not lvf:
         # 2026-09-16（12坑复核·坑3）：报错时列出「含楼名/层户标注的图层」候选——
         #   图签标注常在独立图签层（与 FTTH 强特征层不同），此前只能靠试错找层。

@@ -1424,6 +1424,40 @@ if not result.get("楼栋"):
               len(bldg_jobs))
     sys.exit(2)
 
+# ---------- 9c. 结果状态契约（L1-C8）产出方落地（2026-09-18）----------
+# 两个维度正交，只**登记**、不改动任何数值与归属：
+#   origin：安装层与覆盖层均由竖干断口 + 区间法对位**推算** ⇒ derived；
+#           覆盖为空 / 无安装层 ⇒ unresolved。
+#   confirmation：本单元出现在「需人工裁决」中 ⇒ pending（待裁决，禁止进成品，
+#           由 inspect C9 拦下）；否则 settled。与 parse 侧「有客观依据即可定案」一致。
+# 此前本脚本从不产出这两字段 ⇒ C9 对本来源恒判「已提供但零字段」，这一半产物没核。
+_pend_objs = [str(_x.get("对象", "")) for _x in (result.get("需人工裁决") or [])]
+_st_settled = _st_pending = 0
+for _bk, _bv in (result.get("楼栋") or {}).items():
+    for _uk, _uv in ((_bv or {}).get("单元") or {}).items():
+        _unit_pend = any((_bk in _o and _uk in _o) for _o in _pend_objs)
+        for _bx in (_uv.get("分纤箱") or []):
+            _cov = (_bx.get("覆盖范围线索") or {}).get("覆盖楼层") or []
+            _bx["result_origin"] = "derived" if (_cov and _bx.get("安装楼层")) else "unresolved"
+            _bx["result_confirmation"] = ("pending"
+                                          if (_unit_pend or _bx["result_origin"] == "unresolved")
+                                          else "settled")
+            _src = str(_bx.get("依据来源") or "")
+            if not _src.startswith("E-DXF-"):
+                _bx["依据来源"] = "E-DXF-GEOM:" + _src
+            if _bx["result_confirmation"] == "settled":
+                _st_settled += 1
+            else:
+                _st_pending += 1
+result["结果状态说明"] = {
+    # 键名刻意**不复用** result_origin / result_confirmation：inspect 的 C9 闸门按
+    # 「键存在即结果项」机械扫描，说明性文字挂在同名键上会被当成一条已定案结果。
+    "origin 取值含义": "measured=图上直读/几何测量；derived=按规则算出（竖干断口+区间法对位）；unresolved=无解",
+    "confirmation 取值含义": "settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）",
+    "统计": {"settled": _st_settled, "pending": _st_pending},
+    "判 pending 的条件": "本单元出现在「需人工裁决」中",
+}
+
 try:
     os.makedirs(os.path.dirname(os.path.abspath(OUT)) or ".", exist_ok=True)
     with open(OUT, "w", encoding="utf-8") as f:

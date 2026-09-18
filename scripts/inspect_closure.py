@@ -24,7 +24,8 @@
                          即标出（WARN，不下结论——商铺层/架空层/跃层都可能是图纸事实）
     C9 结果状态闭合      逐条扫描产物里的 result_origin / result_confirmation：
                          confirmation=pending 或 origin=unresolved 即 FAIL
-                         （未裁决的值不得进入成品）；产物未携带本字段则 SKIP
+                         （未裁决的值不得进入成品）；字段值**不在契约枚举内**同样 FAIL
+                         （防止说明性文字冒充结果项）；产物未携带本字段则 SKIP
 
 用法：
     python inspect_closure.py --parse parse_result.json [--coverage 覆盖.json] [--geom 图纸.geom.json]
@@ -302,7 +303,24 @@ def main():
                     cmap.setdefault(fx.get("编号"), []).append(
                         (blk, un, fx.get("安装楼层"), (fx.get("覆盖范围线索") or {}).get("覆盖楼层")))
         n_ok = n_bad = n_miss = 0
+        # 2026-09-18 修复：coverage 提供了 JSON，但其**箱级记录为 0** 时，原实现会把
+        #   parse 侧每个箱都判「coverage 无记录」= FAIL —— 把「第二来源结构上无常」
+        #   当成了「逐箱矛盾」。实测某图 66 个箱被逐一 FAIL，闸门失去分辨力（那种
+        #   图例：编号锚全部超出米数列邻域，coverage 侧本就不产出箱级安装楼层）。
+        #   正确处置 = 按「不可核」报出并**明示仍是单一来源**，不得读作已核；
+        #   绝不改判 PASS（空集合不得判 PASS）。
+        if not cmap and boxes:
+            R.check("C3", "安装楼层双源交叉", "SKIP",
+                    "coverage 提供了 JSON 但其箱级记录为 0（本图箱号锚不可归属，"
+                    "该来源本图不产出箱级安装楼层）—— 双源交叉**不可核**；"
+                    "parse 侧 %d 个箱的安装楼层仅**单一来源**，未经第二来源交叉验证"
+                    % len(boxes))
+            R.warn("C3", "coverage 未提供箱级安装楼层（本图箱号锚不可归属）——"
+                   "parse 侧 %d 个箱的安装楼层仅单一来源、未交叉验证，不得读作已核"
+                   % len(boxes))
         for blk, un, fid, fl, caliber, err, y in boxes:
+            if not cmap:
+                break
             recs = cmap.get(fid)
             if not recs:
                 R.emit("  ✗ %s（%s/%s）coverage 中无记录" % (fid, blk, un))
@@ -322,6 +340,8 @@ def main():
         if _nobox:
             R.check("C3", "安装楼层双源交叉", "FAIL",
                     "parse 侧 0 箱，双源无交集可核（空集合不得判 PASS）")
+        elif not cmap:
+            pass          # 已按「不可核」报出（见上），此处不得再判 PASS 覆盖
         else:
             st = "PASS" if (n_bad == 0 and n_miss == 0) else "FAIL"
             R.check("C3", "安装楼层双源交叉", st,
@@ -340,6 +360,17 @@ def main():
             for m in rx.finditer(text):
                 geom_ids.setdefault(m.group(0), []).append((x, y, layer))
         parse_ids = {fid for _, _, fid, *_ in boxes}
+        # 2026-09-18 修复：parse 的「未归属分纤箱」也是**已收录**的编号文字（只是归属
+        #   无客观判据、未定案）。必须计入 parse 侧 —— 否则 C4 会把「已收录但待裁决」
+        #   误报成「漏收录」。两者严重程度不同，混为一谈会让闸门失去意义：
+        #     漏收录 = 静默丢数（图上确有文字、产物里没有）⇒ FAIL；
+        #     未归属 = 已收录、标 pending、不进成品、须人工裁决 ⇒ WARN。
+        unassigned_ids = []
+        for _u in ((P.get("未归属分纤箱") or []) if isinstance(P, dict) else []):
+            _fid_u = str((_u or {}).get("编号") or "").strip()
+            if _fid_u:
+                unassigned_ids.append(_fid_u)
+        parse_ids = set(parse_ids) | set(unassigned_ids)
         miss_in_geom = sorted(parse_ids - set(geom_ids))
         miss_in_parse = sorted(set(geom_ids) - parse_ids)
         for fid in miss_in_geom:
@@ -353,15 +384,26 @@ def main():
             if len(geom_ids[fid]) > 1:
                 R.emit("  · %s 出现 %d 处：%s" % (fid, len(geom_ids[fid]),
                        " ".join("(%.1f,%.1f,%s)" % p for p in geom_ids[fid])))
+        if unassigned_ids:
+            R.emit("  ! %d 个编号未归属（对照表无法定楼栋/单元）：%s"
+                   % (len(set(unassigned_ids)), "、".join(sorted(set(unassigned_ids))[:12])))
+            R.emit("    已收录、标 pending、**不进成品** —— 须人工裁决（明细见 parsed.json 的"
+                   "「未归属分纤箱」与「需人工裁决」）")
+            R.warn("C4", "%d 个编号未归属（%s）—— 已收录标 pending、不进成品，须人工裁决"
+                   % (len(set(unassigned_ids)), "、".join(sorted(set(unassigned_ids))[:12])))
         # 2026-09-16 修复 P0-4：parse 侧 0 编号时双向差集必为空，原判据给出 PASS。
         if not parse_ids:
             R.check("C4", "FX 编号坐标归属", "FAIL",
                     "parse 侧 0 箱，无编号可核（空集合不得判 PASS）")
-        else:
-            st = "PASS" if (not miss_in_geom and not miss_in_parse) else "FAIL"
-            R.check("C4", "FX 编号坐标归属", st,
+        elif miss_in_geom or miss_in_parse:
+            R.check("C4", "FX 编号坐标归属", "FAIL",
                     "geom 中编号 %d 个 / parse 收录 %d 个；双向差集 %d+%d" % (
                         len(geom_ids), len(parse_ids), len(miss_in_geom), len(miss_in_parse)))
+        else:
+            R.check("C4", "FX 编号坐标归属", "PASS",
+                    "geom 中编号 %d 个 / parse 收录 %d 个（其中未归属 %d 个，已标 pending）"
+                    "；双向差集 0+0" % (len(geom_ids), len(parse_ids),
+                                       len(set(unassigned_ids))))
 
     # ---------- C5 楼层表直读清单 ----------
     R.emit()
@@ -575,17 +617,32 @@ def main():
                 "产物未携带 result_origin / result_confirmation 字段"
                 "（老产物按缺字段处理，不因此判 FAIL）；" + _rs_scope)
     else:
-        _rs_bad = [(p, o, c) for p, o, c in _rs_items
-                   if c == "pending" or o == "unresolved"]
-        for _p, _o, _c in _rs_bad[:20]:
+        # 2026-09-18 补（P0）：**枚举校验**。原实现只判存在性（c=='pending' or o=='unresolved'），
+        #   任何字符串都能过 —— 实测在 coverage 产物里加一段「取值含义说明」（键名恰好叫
+        #   result_origin/result_confirmation）后，说明文字被当成一条结果项、C9 计数从 34 变 35,
+        #   且因为说明文字以 'settled' 开头而**判 PASS**。这正是本闸门自己要防的
+        #   「看着绿、实则没核」。故改为：字段值必须落在契约枚举内，否则按未定案拦下。
+        _V_ORIGIN = ("measured", "derived", "unresolved")
+        _V_CONFIRM = ("settled", "pending")
+        _rs_bad = []
+        for _p, _o, _c in _rs_items:
+            if _c == "pending" or _o == "unresolved":
+                _rs_bad.append((_p, _o, _c, "结果未定案（origin=%s / confirmation=%s）—— 不得进入成品"
+                                % (_o, _c)))
+            elif _o not in _V_ORIGIN or _c not in _V_CONFIRM:
+                _rs_bad.append((_p, _o, _c,
+                                "字段值不在契约枚举内（origin∈%s；confirmation∈%s）—— "
+                                "疑似说明性文字被当成结果项，或产出方写入了非法值，"
+                                "一律按未定案拦下（判定依据见 L1-C8）"
+                                % ("/".join(_V_ORIGIN), "/".join(_V_CONFIRM))))
+        for _p, _o, _c, _why in _rs_bad[:20]:
             R.emit("  x %s  origin=%s  confirmation=%s" % (_p, _o, _c))
-            R.fail("C9", "%s 结果未定案（origin=%s / confirmation=%s）—— 不得进入成品"
-                   % (_p, _o, _c))
+            R.fail("C9", "%s %s" % (_p, _why))
         if len(_rs_bad) > 20:
             R.emit("  ... 另有 %d 项未列出" % (len(_rs_bad) - 20))
         if _rs_bad:
             R.check("C9", "结果状态闭合", "FAIL",
-                    "%d/%d 项结果未定案（pending 或 unresolved）；%s"
+                    "%d/%d 项结果未定案或字段值非法；%s"
                     % (len(_rs_bad), len(_rs_items), _rs_scope))
         elif _rs_src_empty:
             R.warn("C9", "来源 %s 已提供但零字段 —— 未被结果状态闸门覆盖，不得视为已核"

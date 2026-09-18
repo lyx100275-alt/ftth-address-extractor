@@ -67,9 +67,43 @@ def write_text(path, text, encoding="utf-8", log=None):
     return path
 
 
+def sanitize_nonfinite(obj, _path="", _hits=None):
+    """就地把非有限浮点（`inf` / `-inf` / `nan`）清洗为 `None`，返回 (obj, 命中路径表)。
+
+    为什么必须做（2026-09-18 实测）：Python 的 `json.dump` 默认把非有限浮点写成
+    `Infinity` / `NaN` / `-Infinity` —— 这三个字面量**不在 JSON 规范内**，严格解析器
+    （JS / Go / 多数工具的默认实现）会因此**拒绝整份文件**，而不是跳过那个字段。
+    且 `inf` 本身是「未测得」的占位值，写成它等于让垃圾值冒充测量结果。
+
+    语义约定：清洗后的 `None` 表示「本图未测得该量」，**与 0 不同**，消费方不得当 0 用。
+    调用方应把命中的 `_hits` 登记进产物（如「非有限值清洗」字段），不得静默丢弃。
+    """
+    if _hits is None:
+        _hits = []
+    if isinstance(obj, dict):
+        for k in list(obj.keys()):
+            obj[k] = sanitize_nonfinite(obj[k], "%s.%s" % (_path, k), _hits)
+    elif isinstance(obj, list):
+        for i in range(len(obj)):
+            obj[i] = sanitize_nonfinite(obj[i], "%s[%d]" % (_path, i), _hits)
+    elif isinstance(obj, float) and not math.isfinite(obj):
+        _hits.append(_path)
+        return None
+    return obj
+
+
 def write_json(path, obj, encoding="utf-8", log=None, indent=2, ensure_ascii=False):
-    """安全写 JSON：先建父目录再 dump；**失败抛出、不吞**（由调用方决定退出码）。"""
+    """安全写 JSON：先建父目录再 dump；**失败抛出、不吞**（由调用方决定退出码）。
+
+    dump 前强制清洗非有限浮点为 `null`（见 `sanitize_nonfinite`）——
+    保证产物是**标准 JSON**，任何语言的严格解析器都读得进来。
+    """
     import json
+    _hits = []
+    obj = sanitize_nonfinite(obj, _hits=_hits)
+    if _hits and log is not None:
+        log.warning("产物含非有限浮点 %d 处，已清洗为 null：%s"
+                    % (len(_hits), "、".join(_hits[:8])))
     ensure_parent(path, log=log)
     with open(path, "w", encoding=encoding) as f:
         json.dump(obj, f, ensure_ascii=ensure_ascii, indent=indent)
@@ -1464,6 +1498,43 @@ class ToleranceEstimateError(ValueError):
     pass
 
 
+def filter_titleblock_units(lvu, bl, lvf, gap_ratio=3.0):
+    """把「图签块内的单元标注」从全图同名标注里分出来（2026-09-18，P0）。
+
+    为什么需要：`N单元` 这个写法在图签里有，在**系统图里也有**（每栋系统图楼层列
+    顶部的单元列头），两者同图层、同写法。若不区分，单元标注会被配到错误楼栋 ——
+    实测某图图签 12 个 + 系统图 11 个混在一起配对，7 栋里 5 栋单元数错，
+    其中一栋收到 `1单元×6 / 2单元×5` 的重复标签，而脚本只打 ⚠、退出码仍为 0
+    （下游按成功消费即得错的单元数）。
+
+    判据（属**测量**：对图上已有距离做量化切分，不是对图纸含义的推断）：
+    单元到「最近的楼名或层户」的 2D 距离 `|dx| + |dy|` 在图上常呈**明显两簇** ——
+    图签块内的单元紧邻其楼名行（实测 10~30），系统图里的单元离任何楼名都有半个
+    图幅远（实测 440+）。取排序后相邻距离的最大比值处切开，比值 < gap_ratio 视为
+    无断层、原样返回（不切、不猜）。
+
+    返回 (保留项, 剔除项)。**调用方必须把剔除量写进证据**，不得静默丢弃。
+    """
+    anchors = list(bl) + list(lvf)
+    if not anchors or not lvu:
+        return list(lvu), []
+    dists = [min(abs(a[0] - u[0]) + abs(a[1] - u[1]) for a in anchors) for u in lvu]
+    order = sorted(range(len(lvu)), key=lambda i: dists[i])
+    best_i, best_ratio = None, 0.0
+    for k in range(len(order) - 1):
+        a, b = dists[order[k]], dists[order[k + 1]]
+        if a <= 0:
+            continue
+        if b / a > best_ratio:
+            best_ratio, best_i = b / a, k
+    if best_i is None or best_ratio < gap_ratio:
+        return list(lvu), []
+    keep_i = set(order[:best_i + 1])
+    keep = [u for i, u in enumerate(lvu) if i in keep_i]
+    drop = [u for i, u in enumerate(lvu) if i not in keep_i]
+    return keep, drop
+
+
 def estimate_titleblock_tolerances(texts, bldg_re, lev_re, unit_re, safety=1.25):
     """按图纸自身的图签行结构，推定 6 个几何容差（读取标注·图签形态专用）。
 
@@ -1551,46 +1622,49 @@ def estimate_titleblock_tolerances(texts, bldg_re, lev_re, unit_re, safety=1.25)
         #        · 「x 最近」在地块A 判反——错的候选 dx=26219 < 对的 31900，但其 dy 差 3 倍；
         #        · 「y 最近」在地块B 判反——错的候选 dy=33860 < 对的 43443，但其 dx 差 20 倍。
         #      等权相加（dx、dy 同量纲，无需归一化）在同一批点上**全部选对**。
-        udy_all, _noup = [], 0
-        for ux, uy, _ in lvu:
-            _up = [v for v in lvf if v[1] > uy]
-            if _up:
-                v0 = min(_up, key=lambda v: abs(v[0] - ux) + (v[1] - uy))
-                udy_all.append(v0[1] - uy)
-            else:
-                _noup += 1
-        if _noup > 0.5 * len(lvu):
-            raise ToleranceEstimateError(
-                '图签层内 %d/%d 个单元标注的**上方**没有层户标注，无法按「单元在层户下方」'
-                '量测——本图排版方向可能与默认相反。请显式传入 --unit-dy-lo/--unit-dy-hi'
-                '（负区间），或确认 --band / --floor-layer 是否选错。' % (_noup, len(lvu)))
-        ev['无上方层户的单元数'] = _noup
-        # 主簇（严阈值）取中心，再在中心 ±20%/25% 的带内取全部样本当窗口：
-        # 同一图纸不同地块的图签排版可有差异（实测 43443 与 47971 并存），必须一并覆盖；
-        # 但直接放宽聚类阈值会把 33860 这类跨块噪声也纳进来，故用「中心带」而非「宽阈值」。
-        udy_main = _dominant_cluster(udy_all, rel_tol=TOL_CLUSTER_REL_TOL)
-        if udy_main:
-            _c = _median(udy_main)
-            udy_sel = [d for d in udy_all if TOL_CORE_LO * _c <= d <= TOL_CORE_HI * _c] or udy_main
+        # 2026-09-18 重写（P0，实测某图）——旧实现有两处缺陷，会让单元归属**整体串楼**：
+        #   ① 硬方向约束 `v[1] > uy`（＝假设单元恒在层户**下方**）。同一张图的图签表里方向
+        #      可以不一致：实测某图左右两栏并列楼栋，左栏单元在楼名行下方、右栏在上方。
+        #      方向约束把右栏样本全部排除后，只能退取「上一层楼」的层户行，量出 43~50 的
+        #      跨行偏移（真实值 ±4.4），窗口因此**系统性地把每个单元判给它上一层的那栋楼**。
+        #   ② `N单元` 在系统图里也出现（每栋系统图楼层列顶部的单元列头），与图签同图层同写法，
+        #      一起量容差/配对 ⇒ 单元配到错误楼栋，出现 `1单元×6 / 2单元×5` 重复标签。
+        #   实测后果：7 栋里 5 栋单元数错，脚本只打 ⚠、退出码仍为 0（下游按成功消费即得错值）。
+        # 现改为：① 先把单元限定在图签块内（同一判据的共享实现，与生产脚本共用一处）；
+        #   ② **以楼名行为锚**量偏移（楼名行有「楼号 + 两 x 栏」双重区分度，比层户行稳），
+        #      方向无关 —— 窗口跨零是方向混排时的**正确**结果。
+        _blk, _blk_out = filter_titleblock_units(lvu, bl, lvf)
+        if _blk_out:
+            ev['剔除非图签块单元'] = {
+                '剔除数': len(_blk_out), '保留数': len(_blk),
+                '剔除样例': ['%s@[%.1f,%.1f]' % (d[2], d[0], d[1]) for d in _blk_out[:8]]}
+        udy_all = []
+        for ux, uy, _ in _blk:
+            b0 = min(bl, key=lambda t: abs(t[0] - ux) + abs(t[1] - uy))
+            v0 = min(lvf, key=lambda t: abs(t[0] - b0[0]) + abs(t[1] - b0[1]))
+            udy_all.append(v0[1] - uy)
+        # 已限定在图签块内 ⇒ 样本本身就是块内偏移，无需再聚类剔噪；窗口取样本极差外扩。
+        if udy_all:
+            udy_sel = udy_all
             udy_med = _median(udy_sel)
-            uw = max(1.0, TOL_BAND_REL * abs(udy_med))
+            _span = max(udy_sel) - min(udy_sel)
+            udy_pad = max(_span, TOL_PAD_REL * max(abs(udy_med), _span))
+            _wlo = min(udy_sel) - udy_pad * 0.5
+            _whi = max(udy_sel) + udy_pad * 0.5
             uxs = []
-            for u in lvu:
-                # 与解析窗口严格同向：`unit_dy_lo <= 层户y-单元y <= unit_dy_hi` 且 lo>0，
-                # 故候选一律排除下方样本，避免 udy_med 偏小时窗口跨到 0 以下。
-                cand = [v for v in lvf if v[1] > u[1]
-                        and abs((v[1] - u[1]) - udy_med) <= uw]
+            for u in _blk:
+                cand = [v for v in lvf if _wlo <= (v[1] - u[1]) <= _whi]
                 if not cand:
                     continue
                 uxs.append(abs(min(cand, key=lambda t: abs(t[0] - u[0]))[0] - u[0]))
             if uxs:
                 p90 = _quant(uxs, 0.9)
-                udy_pad = max(max(udy_sel) - min(udy_sel), TOL_PAD_REL * abs(udy_med))
                 out["unit_dx"] = round(p90 * safety, 1)
-                out["unit_dy_lo"] = round(min(udy_sel) - udy_pad * 0.5, 1)
-                out["unit_dy_hi"] = round(max(udy_sel) + udy_pad * 0.5, 1)
+                out["unit_dy_lo"] = round(_wlo, 1)
+                out["unit_dy_hi"] = round(_whi, 1)
                 ev["层户<->单元"] = {"配对样本": len(uxs), "单元总数": len(lvu),
-                                 "dy主簇": [round(min(udy_sel), 3), round(max(udy_sel), 3)],
+                                 "图签块内单元数": len(_blk),
+                                 "dy窗口样本": [round(min(udy_sel), 3), round(max(udy_sel), 3)],
                                  "dy分位": [round(_quant(udy_all, q), 3) for q in (0.05, 0.5, 0.95)],
                                  "dxP90": round(p90, 3), "dx最大": round(max(uxs), 3)}
 
@@ -1607,6 +1681,10 @@ def estimate_titleblock_tolerances(texts, bldg_re, lev_re, unit_re, safety=1.25)
     # 2026-09-15 效率优化：同排布局例外——分离标注 variant 中楼名与层户在同一 y，
     # dy 偏移≈0，窗口合法地跨零。当两侧边界都在小范围（|lo|,|hi| ≤ 2.0）内时跳过
     # 跨零校验，仅对「真正有方向性但配对方向搞反」的情况报错。
+    # 2026-09-18：跨零校验**只保留给「楼名<->层户」**。「层户<->单元」不再按跨零拦截 ——
+    #   该窗口自本次起由**楼名锚定**量出（见上方 ② 的注释），样本本身就是图签块内偏移；
+    #   同一张图签表左右两栏方向相反时，跨零是**正确**结果，旧规则会把这类图误判成
+    #   「配对方向搞反」而整体中止，反而堵死唯一的量测路径。
     _SAME_LINE_TOL = 2.0
     for _lo_k, _hi_k, _lab in (('dy_lo', 'dy_hi', '楼名<->层户'),
                                ('unit_dy_lo', 'unit_dy_hi', '层户<->单元')):
@@ -1617,9 +1695,10 @@ def estimate_titleblock_tolerances(texts, bldg_re, lev_re, unit_re, safety=1.25)
             raise ToleranceEstimateError(
                 '%s 量出的窗口非法：%s=%.1f >= %s=%.1f。请显式传入容差后复核。'
                 % (_lab, _lo_k, _lo, _hi_k, _hi))
-        if _lo <= 0 <= _hi and not (abs(_lo) <= _SAME_LINE_TOL and abs(_hi) <= _SAME_LINE_TOL):
+        if (_lab == '楼名<->层户' and _lo <= 0 <= _hi
+                and not (abs(_lo) <= _SAME_LINE_TOL and abs(_hi) <= _SAME_LINE_TOL)):
             raise ToleranceEstimateError(
-                '%s 量出的窗口跨越 0（%s=%.1f, %s=%.1f）：正常排版下单元/楼名应稳定落在'
+                '%s 量出的窗口跨越 0（%s=%.1f, %s=%.1f）：正常排版下楼名应稳定落在'
                 '层户标注的同一侧，跨零说明配对方向相反或配错，请显式传入容差后复核。'
                 % (_lab, _lo_k, _lo, _hi_k, _hi))
 
