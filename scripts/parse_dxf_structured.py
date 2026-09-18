@@ -944,6 +944,49 @@ elif _BIZ_ORPHAN:
              "（判据：距边界 >= 本栋区间宽的 1/4）→ 判为独立图区（总图/平面图/别带），已排除"
              % len(_BIZ_ORPHAN))
 
+# ---------- 贴边同列收回（2026-09-18 新增） ----------
+# 病灶（实测、坐标级）：带端楼栋的外沿会把该栋的**第二根楼层轴**切在区间外 ——
+#   实测：某带最左楼只拿到 1F..9F，被切出的同 x 列（10F..15F）与区间内那列**同 y 步长
+#   且首尾相接**（区间内最高层与区间外最低层的 y 差恰 == 层高），是同一张系统图的同一栋，
+#   却整列丢失 —— 表现为该栋层数只有邻栋的一半。
+# 判据（三条全满足才收，缺一不收 —— 宁可漏收，不误收）：
+#   ① 业务实体（楼层刻度 / 箱号 / 每层户数 / 皮线米数）；
+#   ② 距最近楼栋区间边界 < τ（τ = 0.25×该楼栋区间宽，与上方「落空_可疑」同一口径）；
+#   ③ 同 x（精确同值）在落空集合中 **>= 2 条** —— 单点是图例或零散文字，不构成「轴」。
+# 只把整列**补挂**到该楼栋的文字集，**不改区间**（区间由锚点派生，改它会牵动邻栋）。
+_TB_BY_COL = {}
+for _o in _BIZ_ORPHAN_SUSPECT:
+    _TB_BY_COL.setdefault((round(_o["x"], 6), _o["最近楼栋"]), []).append(_o)
+_TB_COLS = {_k: _v for _k, _v in _TB_BY_COL.items() if len(_v) >= 2}
+_tb_done = set()
+for _lst in bldg_texts.values():
+    for _t in _lst:
+        _tb_done.add(id(_t))
+_TB_INDEX = {}
+for _t in texts:
+    _TB_INDEX.setdefault((round(_t.get("x"), 6), round(_t.get("y"), 6),
+                          str(_t.get("内容"))), []).append(_t)
+_TB_ROWS = []
+for (_x6, _b), _os in sorted(_TB_COLS.items(), key=lambda _kv: _kv[0][0]):
+    _got = 0
+    for _o in _os:
+        for _t in _TB_INDEX.get((round(_o["x"], 6), round(_o["y"], 6),
+                                 str(_o["内容"])), []):
+            if id(_t) not in _tb_done:
+                bldg_texts[_b].append(_t)
+                _tb_done.add(id(_t))
+                _got += 1
+    _TB_ROWS.append({"楼栋": _b, "x": round(_x6, 2), "条数": len(_os),
+                     "补挂": _got, "内容": [str(_o["内容"]) for _o in _os]})
+    log.warning("  [贴边同列收回] %s 的 x=%.2f 列 %d 条落在区间外 %.1f（τ=%.1f）"
+                "且同列成轴 → 整列补挂回该栋（不改区间）：%s"
+                % (_b, _x6, len(_os), _os[0]["距边界"],
+                   0.25 * _wmap.get(_b, 0.0),
+                   "、".join(str(_o["内容"]) for _o in _os[:8])))
+if _TB_ROWS:
+    log.warning("  [贴边同列收回] 合计 %d 条 / %d 列（判据：业务实体 + 距边界<τ + 同列>=2 条）"
+                % (sum(r["条数"] for r in _TB_ROWS), len(_TB_ROWS)))
+
 # ---------- 孤儿分类账（2026-09-18 新增） ----------
 # 「未命中」常占全图文字 40%~60%（实测三项目 175~393 条/图），此前只有一个总数 ——
 # 既看不出是「独立图区（图例/材料表/图框）」还是「被边界切出」，也无法核对与复现。
@@ -1165,6 +1208,8 @@ result = {
         "区间过窄": {"总数": len(_NARROW), "展示": _NARROW[:100]},
         "业务实体落空": {"总数": len(_BIZ_ORPHAN), "展示": _BIZ_ORPHAN[:100]},
         "业务实体落空_可疑": {"总数": len(_BIZ_ORPHAN_SUSPECT), "展示": _BIZ_ORPHAN_SUSPECT[:100]},
+        "贴边同列收回": {"条数": sum(r["条数"] for r in _TB_ROWS),
+                    "列数": len(_TB_ROWS), "明细": _TB_ROWS[:50]},
         "孤儿总数": len(_RANGE_DIAG["孤儿"]),
         "孤儿分类账": dict(sorted(_ORPHAN_CLS.items())),
         "孤儿分类样本": {k: v for k, v in sorted(_ORPHAN_SAMPLE.items())},
