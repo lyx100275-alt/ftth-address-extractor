@@ -976,6 +976,50 @@ DUP_ANCHOR_X_TOL = 10.0
 class MultiPlotDuplicateAnchorError(ValueError):
     """多地块同名楼检测：同名锚点出现在显著不同位置（全图解析会静默串号）。"""
 
+# ---------- 区间标题「N-M号楼」：按图上独立证据自动展开（2026-09-19） ----------
+# 背景：区间语义（并列 vs 区间）文字本身无法判定，此前一律按字面取端点并告警，
+#   中间楼栋**整栋丢失**（实测柳辛庄 band1 丢 2#楼、band3 丢 5#楼；图上另有
+#   `2#楼` / `5#楼` 独立标题与 `5号楼1单元2层` 箱位标注为证）。
+# 纪律：禁止替用户**猜**语义；但「图上另有该编号的独立实体」属**客观判据**
+#   （可测量、可核对），据此展开属自判留证，不是猜测。无证据者维持不展开并继续告警。
+BLDG_RANGE_EXPANDED = []   # 展开留痕，供产物记录与人工追溯
+
+_RANGE_TITLE_RE = re.compile(r"(\d+)\s*[-~\u2014\u2013]\s*(\d+)\s*[#\uff03]?\s*\u53f7?\s*\u697c")
+
+
+def bldg_range_evidence(texts, lo, hi, skip_text=None):
+    """区间写法 N-M 号楼：返回中间编号里「图上有独立实体证据」的编号列表。
+
+    判据（客观、可核对）：存在**另一条**文字含 `K#楼` / `K号楼` / `K楼`
+    （含 `K号楼X单元Y层` 这类箱位标注），且该文字本身不是区间标题
+    （不含 `数字-数字号楼` 写法）—— 区间的端点不得自证中间编号。
+
+    返回 [(编号, 证据文字前40字, x, y), ...]
+    """
+    out = []
+    if lo is None or hi is None:
+        return out
+    try:
+        lo, hi = int(lo), int(hi)
+    except (TypeError, ValueError):
+        return out
+    if hi - lo < 2:
+        return out
+    skip_id = id(skip_text) if skip_text is not None else None
+    for k in range(lo + 1, hi):
+        pat = re.compile(r"(?<![0-9])%d\s*[#\uff03]?\s*\u53f7?\s*\u697c" % k)
+        for t in (texts or []):
+            if not isinstance(t, dict) or id(t) == skip_id:
+                continue
+            s = str(t.get("内容") or "")
+            if not s or _RANGE_TITLE_RE.search(s):
+                continue
+            if pat.search(s):
+                out.append((k, s[:40], t.get("x"), t.get("y")))
+                break
+    return out
+
+
 
 def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
     """
@@ -1041,14 +1085,40 @@ def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
                 _log.info("  [楼栋区间展开] %r：区间 %s 按区间语义展开 → %s"
                           % (t["内容"][:40], _rng, nums))
             else:
-                _log.warning(
-                    "  [楼栋区间待裁决] 标题 %r 命中连字符写法「%s号楼」，"
-                    "语义存疑（并列 %s 栋 vs 区间 %s 至 %s 共 %d 栋）；"
-                    "当前按**字面**取到 %s —— 若实为区间，将静默少解中间楼栋。"
-                    "请向用户确认后加 --expand-bldg-ranges 重跑。",
-                    t["内容"][:40], _rng, len(nums), _rng.split("-")[0], _rng.split("-")[-1],
-                    (int(_rng.split("-")[-1]) - int(_rng.split("-")[0]) + 1)
-                    if "-" in _rng else len(nums), nums)
+                # 2026-09-19：区间语义不再一律挂起 —— 若中间编号在图上**另有独立实体**
+                # （`K#楼` / `K号楼` / `K号楼X单元Y层`，且不是这条区间标题自身），属客观
+                # 判据，按区间展开并留痕；无证据者维持字面取法并继续告警待人工。
+                _lo2 = _hi2 = None
+                if _cm:
+                    try:
+                        _lo2, _hi2 = int(_cm.group(1)), int(_cm.group(2))
+                    except (TypeError, ValueError):
+                        _lo2 = _hi2 = None
+                _ev = bldg_range_evidence(texts, _lo2, _hi2, t)
+                if _ev:
+                    for _k, _s, _ex, _ey in _ev:
+                        if str(_k) not in nums:
+                            nums.append(str(_k))
+                    nums.sort(key=lambda s: int(s) if str(s).isdigit() else 0)
+                    BLDG_RANGE_EXPANDED.append({
+                        "标题": str(t.get("内容"))[:60], "区间": _rng,
+                        "补入楼栋": [str(e[0]) for e in _ev],
+                        "证据": [{"编号": str(e[0]), "文字": e[1], "x": e[2], "y": e[3]}
+                                 for e in _ev],
+                    })
+                    _log.info("  [楼栋区间按证据展开] %r：区间 %s 的中间编号 %s 在图上有独立实体"
+                              "证据（%s）→ 按区间语义补入；其余无证据编号仍按字面取。"
+                              % (str(t.get("内容"))[:40], _rng, [e[0] for e in _ev],
+                                 "、".join("%s\u2190%r" % (e[0], e[1][:18]) for e in _ev)))
+                else:
+                    _log.warning(
+                        "  [楼栋区间待裁决] 标题 %r 命中连字符写法「%s号楼」，"
+                        "语义存疑（并列 %s 栋 vs 区间 %s 至 %s 共 %d 栋）；"
+                        "当前按**字面**取到 %s —— 若实为区间，将静默少解中间楼栋。"
+                        "请向用户确认后加 --expand-bldg-ranges 重跑。",
+                        t["内容"][:40], _rng, len(nums), _rng.split("-")[0], _rng.split("-")[-1],
+                        (int(_rng.split("-")[-1]) - int(_rng.split("-")[0]) + 1)
+                        if "-" in _rng else len(nums), nums)
         # 标题正则自带捕获组：若给出 parse 未覆盖的楼号（自定义写法），一并并入。
         # 用 first_group 安全取组——正则可能是 `\d+号楼` 这种**无捕获组**写法。
         for m in matches:
