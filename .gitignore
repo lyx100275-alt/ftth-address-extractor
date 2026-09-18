@@ -29,5 +29,7 @@ __pycache__/
 !references/**
 !scripts/
 !scripts/**
+!tests/
+!tests/**
 !SKILL.md
 !SKILL_CHANGELOG.md
