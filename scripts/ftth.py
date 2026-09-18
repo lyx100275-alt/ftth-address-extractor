@@ -1465,6 +1465,26 @@ def main():
             if _val:
                 _c += [_flag, _val]
         sys.exit(run_script("check_transitions.py", _c))
+    elif args.cmd == "apply-ruling":
+        # 2026-09-18 修复（P0）：本子命令此前**只注册了参数、文档登记了入口，分发段却无
+        #   对应分支** —— 走完 main() 自然返回，rc=0、零输出、**什么都没做**（静默空转）。
+        #   它是「人工裁决批量落数」入口：照文档跑会以为裁决已落数，而产物根本没改
+        #   —— 「登记了入口 != 接得上」的典型，故补齐。
+        # 注意 --set：apply_ruling.py 是 `for s in args.set` 逐条解析「楼栋/单元/楼层=户数」，
+        #   而 build_cmd 走 fmt_val 会把列表**拼成单参逗号串** → 楼栋名含逗号、解析失败。
+        #   故此处显式逐条转发，**不复用 build_cmd**。
+        _c = ["--json", args.json]
+        if args.ruling:
+            _c += ["--ruling", args.ruling]
+        for _s in (getattr(args, "set", None) or []):
+            _c += ["--set", _s]
+        if args.out:
+            _c += ["--out", args.out]
+        if args.force:
+            _c += ["--force"]
+        if args.dry_run:
+            _c += ["--dry-run"]
+        sys.exit(run_script("apply_ruling.py", _c))
 
 
 if __name__ == "__main__":

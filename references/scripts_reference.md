@@ -13,7 +13,7 @@ AIGC:
 
 > 全部脚本均支持 `--help`；本表为主要参数速查。SKILL.md 只留脚本名+一句话职责。
 
-探查确定参数后，用ezdxf提取全部FTTH信息。**本 skill 附带 27 个脚本文件**（位于 `scripts/`：26 个 `.py` + 1 个 `.cmd` 启动器；含统一入口 `ftth.py`、公共模块 `ftth_common.py`、转发层 `_launch.py`、批量编排 `ftth_batch.py`）——**数量按 `ls scripts/ | wc -l` 实测填写，改文件后同步更新**：
+探查确定参数后，用ezdxf提取全部FTTH信息。**本 skill 附带 31 个脚本文件**（位于 `scripts/`：30 个 `.py` + 1 个 `.cmd` 启动器；含统一入口 `ftth.py`、公共模块 `ftth_common.py`、转发层 `_launch.py`、批量编排 `ftth_batch.py`）——**数量按 `ls scripts/ | wc -l` 实测填写，改文件后同步更新**：
 
 | 脚本 | 作用 | 主要参数 |
 |------|------|---------|
@@ -480,7 +480,7 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
 
 **`ftth.py` 统一入口与 `--config` 机制**：
 
-`ftth.py` 是统一调度入口，支持 `probe/plan/parse/split-band/coverage/coverage-vshape/inspect/verify-truth/assemble/count/count-box/count-hdd/gen` 十三个子命令。各子命令参数默认值为 `None`（不硬编码），通过以下优先级填充：
+`ftth.py` 是统一调度入口，支持 `probe/plan/parse/split-band/coverage/coverage-vshape/inspect/verify-truth/assemble/apply-ruling/count/count-box/count-hdd/gen/pipeline/budget/transitions` 十六个子命令。各子命令参数默认值为 `None`（不硬编码），通过以下优先级填充：
 
 1. **命令行显式指定**：最高优先级，直接使用
 2. **`--config` 自动填充**：传入 `probe` 子命令输出的 `suggested_params` JSON，自动填充未在命令行指定的参数
@@ -499,9 +499,10 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
 > - **不要用 `pip` 补装依赖**：镜像不可达时报错会**伪装成「包不存在」**（`from versions: none`）
 > - 启动器候选清单 / `exit /b 9` 语义 / 探测细节 / 镜像陷阱见 [references/scripts_reference.md](references/scripts_reference.md) §解释器契约
 >
-> **注意**：`ftth.py` 当前调度 **14 个子命令**（`probe` / `plan` / `parse` / `split-band` / `coverage` / `coverage-vshape` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box`（别名 `count-hdd`）/ `gen` / `verify-truth` / `pipeline`，其中 `probe` 与 `parse` 共用 `parse_dxf_structured.py`）。
+> **注意**：`ftth.py` 当前调度 **16 个子命令**（`probe` / `plan` / `parse` / `split-band` / `coverage` / `coverage-vshape` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box`（别名 `count-hdd`）/ `gen` / `verify-truth` / `pipeline` / `budget` / `transitions`，其中 `probe` 与 `parse` 共用 `parse_dxf_structured.py`）。
+> **注册面 = 分发面**（2026-09-18 立）：`add_parser` 注册的每个子命令，`main()` 分发段必须有分支，**差集须为 ∅** —— 曾漏 `apply-ruling`，表现为 rc=0、零输出、静默空转（照文档跑会以为已落数）。交付前自查：`add_parser` 名字集合 vs `args.cmd ==` 分支集合对账（`count-hdd` 是别名，不计缺口）。
 > `count` = 皮线计数法（`count_households.py`）；`count-box` = 家居配线箱图标法（`count_box_icons.py`），旧名 `count-hdd` 保留为别名（方法名不绑死图内文字写法）。两者是**同属区间法的两种户数口径**（锚点分别取箱图标 / 皮线标注）；**图上存在家居配线箱图标时优先 `count-box`，不再跑 `count`**（2026-09-16 用户裁决），图标不可用时才回落到 `count`。
-> `extract_fx_map.py`、`extract_fx_locations.py`、`merge_json.py`、`split_units.py`、`read_titleblock_households.py`、`gen_9level_addressbook.py`、`probe_titleblock_tolerances.py` 共 7 个脚本需**直接调用**，不通过 `ftth.py` 入口（参数速查见 [references/scripts_reference.md](references/scripts_reference.md)）。
+> 需**直接调用**（未接统一入口）的脚本 6 个：`gen_9level_addressbook.py`、`ledger_elements.py`、`ledger_state.py`、`merge_json.py`、`probe_titleblock_tolerances.py`、`split_units.py`；`extract_fx_map.py` / `extract_fx_locations.py` / `read_titleblock_households.py` 已并入 `pipeline` 阶段（**仍保留直调入口**）。参数速查见本文件 §统一入口外的直调脚本。
 
 ## 脚本清单与职责（外移自 SKILL.md，2026-09-17 第三次瘦身）
 
