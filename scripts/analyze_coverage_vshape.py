@@ -1123,6 +1123,46 @@ def main():
               % (_xchk['比对总数'], _xchk['一致'], _xchk['不一致'],
                  _xchk['无标注可校验'], _xchk['共享组跳过']))
 
+    # ============================================================
+    # 结果状态契约（L1-C8）产出方落地 —— 两个维度正交，只登记、不改动任何数值与归属
+    # ============================================================
+    # 此前本脚本**只被契约要求、自身从不产出**这两个字段 ⇒ inspect 的 C9 闸门对本来源
+    # 恒判「已提供但零字段」（WARN 点名），闸门看着绿、实则这一半产物根本没核。
+    #   origin：安装层与覆盖层都是**推算**（V 形谷底 + 区间法对位）⇒ derived；
+    #           配对不上 / 无谷底 / 覆盖为空 ⇒ unresolved。
+    #   confirmation：本单元在「需人工裁决」中有条目、或偏差门禁判「不可信」⇒ pending
+    #           （待裁决，禁止进成品，由 C9 拦下）；否则 settled。
+    #           口径与 parse 侧一致：有客观依据（自检通过、几何归属成立）即可定案。
+    _dg_concl = (result.get('自检_偏差门禁') or {}).get('结论')
+    _dg_ok = (_dg_concl == '可信')
+    _pend_objs = [str(_x.get('对象', '')) for _x in (result.get('需人工裁决') or [])]
+    _st_settled = _st_pending = 0
+    for _bk, _bv in (result.get('楼栋') or {}).items():
+        for _uk, _uv in (_bv.get('单元') or {}).items():
+            _unit_pend = (not _dg_ok) or any((_bk in _o and _uk in _o) for _o in _pend_objs)
+            for _bx in (_uv.get('分纤箱') or []):
+                _cov = (_bx.get('覆盖范围线索') or {}).get('覆盖楼层') or []
+                _bx['result_origin'] = 'derived' if (_cov and _bx.get('安装楼层')) else 'unresolved'
+                _bx['result_confirmation'] = ('pending'
+                                              if (_unit_pend or _bx['result_origin'] == 'unresolved')
+                                              else 'settled')
+                _src = str(_bx.get('依据来源') or '')
+                if not _src.startswith('E-DXF-'):
+                    _bx['依据来源'] = 'E-DXF-TEXT:' + _src
+                if _bx['result_confirmation'] == 'settled':
+                    _st_settled += 1
+                else:
+                    _st_pending += 1
+    result['结果状态说明'] = {
+        # 键名刻意**不复用** result_origin / result_confirmation：inspect 的 C9 闸门按
+        # 「键存在即结果项」机械扫描，说明性文字若挂在同名键上会被当成一条已定案结果
+        # （实测：加本说明后 C9 计数由 34 变 35，多出来的正是这条说明）。
+        'origin 取值含义': 'measured=图上直读/几何测量；derived=按规则算出（V型谷底+区间法对位）；unresolved=无解',
+        'confirmation 取值含义': 'settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）',
+        '统计': {'settled': _st_settled, 'pending': _st_pending},
+        '判 pending 的条件': '本单元出现在「需人工裁决」中，或自检_偏差门禁结论非「可信」',
+    }
+
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as fp:
         json.dump(result, fp, ensure_ascii=False, indent=1)

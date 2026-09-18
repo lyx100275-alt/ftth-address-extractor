@@ -100,6 +100,13 @@ FLOOR_RE = re.compile(args.floor_pattern) if args.floor_pattern else None
 # 箱表描述内直写的安装层（「N号楼M单元K层」的 K 层）。与系统图区的 F 标注是两个来源，
 # 前者更权威——它就在箱号旁边，后者要跨区按 y 关联（见下 P0-11）。
 DESC_FLOOR_RE = re.compile(r"(\d+)\s*层")
+# 箱表描述的**完整拆分**（2026-09-18）：同一句里同时给出 楼栋号/单元号/安装层。
+#   动机：旧实现把整句原文直接写进「楼栋」字段，下游按楼栋锚点做前缀匹配必然落空
+#   （实测某图锚点为 `1#楼`、对照表值却是 `1号楼1单元2层`，楼号写法 `号`/`#` 不同
+#   + 尾部多了「M单元K层」，22 条对照表**一条都挂不上**，箱归属整段静默为空）。
+#   故此处把描述拆成规范字段，「原始描述」另存留证，不丢原文。
+#   写法容错：`号楼` 与 `#楼` 两种楼号写法都收；单元号可缺省（单单元楼栋）。
+DESC_POS_RE = re.compile(r"(\d+)\s*(?:号楼|#\s*楼)\s*(?:(\d+)\s*单元)?\s*(\d+)\s*层")
 LAYERS = [x.strip() for x in (args.text_layer or "").split(",") if x.strip()]
 TYPES = [x.strip().upper() for x in args.text_type.split(",") if x.strip()]
 TOL = args.proximity_tol
@@ -223,6 +230,7 @@ if args.probe:
 #   改法：按**标注实例**逐条收录；同编号多实例时，键加 `#序号` 区分并**原样保留**，
 #   同时在结果里登记「重号编号」，交人工裁决（遵循原则二：不自行择一）。
 _by_id = defaultdict(list)
+_split_note = []     # 箱表描述拆分留痕（原文 -> 规范 楼栋/单元）
 
 for fx in fx_items:
     fx_id = FX_RE.search(fx["内容"]).group(0)
@@ -296,10 +304,25 @@ for fx in fx_items:
     #   旧逻辑一律取系统图 F → 安装楼层整体错位（实测描述写 2 层、输出 14F）。
     #   优先级：描述内直写（口径A′） > 图上 F 标注（口径A/B）。
     _desc_floor = None
+    _dp = None
     if entry["楼栋"]:
-        _dm = DESC_FLOOR_RE.search(entry["楼栋"])
-        if _dm:
-            _desc_floor = int(_dm.group(1))
+        _dp = DESC_POS_RE.search(entry["楼栋"])
+        if _dp is not None:
+            _desc_floor = int(_dp.group(3))
+        else:
+            _dm = DESC_FLOOR_RE.search(entry["楼栋"])
+            if _dm:
+                _desc_floor = int(_dm.group(1))
+    if _dp is not None:
+        # 描述自带完整箱位 → 把 楼栋/单元 拆成规范字段（原文存入「箱表描述」留证）。
+        # 不拆则下游拿到「1号楼1单元2层」当楼栋名，与楼栋锚点前缀匹配不上 → 整条静默丢弃。
+        _bno, _uno = _dp.group(1), _dp.group(2)
+        entry["箱表描述"] = entry["楼栋"]
+        entry["楼栋"] = "%s号楼" % _bno
+        entry["单元"] = ("%s号楼%s单元" % (_bno, _uno)) if _uno else entry["楼栋"]
+        entry["单元来源"] = ("箱表描述内直写（含单元号）" if _uno
+                             else "箱表描述内直写（描述未给单元号）")
+        _split_note.append("%s -> %s/%s" % (fx_id, entry["楼栋"], entry["单元"]))
     if _desc_floor is not None:
         entry["安装楼层"] = "%dF" % _desc_floor
         entry["安装楼层口径"] = "口径A′:箱表描述内直写（『N号楼M单元K层』的 K 层）"
@@ -313,7 +336,49 @@ for fx in fx_items:
     entry["原始编号"] = fx_id
     _by_id[fx_id].append(entry)
 
-# 展开为映射表（同编号多实例 → 键加 #序号，全部保留）
+# ---------- 同编号多实例的「真伪重号」判别（2026-09-18）----------
+# P0-10 的「不静默覆盖」针对的是**真冲突**（同编号的两处指向不同楼栋/层）。
+#   实测另一形态：同一编号在**多个图幅各画一次**（平面布线图 + 系统图箱表），
+#   于是每个编号都出现 2~3 次 —— 其中只有箱表那处带「N号楼M单元K层」直写归属，
+#   其余实例的归属为空（口径B 未关联上）。此时收敛不该算重号，但旧实现一律按
+#   「编号#序号」展开，下游按「编号唯一映射」才敢用的纪律于是**全数拒绝**：
+#   实测某图 84 条目 / 28 唯一编号 → 28 个编号全部判重号 → 箱归属整段为空、rc 仍 0。
+# 判据（客观、可复核，故属「有判据自判」而非「猜」）：
+#   ① 该编号存在**图上直写**实例（安装楼层口径以「口径A」开头）；
+#   ② 这些直写实例的 (楼栋, 安装楼层) 归一化后**唯一** —— 即全部指向同一个箱位。
+#   两条同时成立 → 收敛为该直写实例；否则（无直写，或直写互相冲突）**维持原行为**，
+#   全部保留并按「编号#序号」收录，登记重号交人工。不猜、不放宽。
+def _norm_key(e):
+    _b = re.sub(r"\s+", "", str(e.get("楼栋") or ""))
+    _b = _b.replace("#", "号")
+    return (_b, str(e.get("安装楼层") or ""))
+
+
+_collapsed = {}      # 编号 -> 收敛说明
+for _fid, _lst in list(_by_id.items()):
+    if len(_lst) <= 1:
+        continue
+    _direct = [e for e in _lst
+               if str(e.get("安装楼层口径") or "").startswith("口径A")]
+    _direct_ok = [e for e in _direct if e.get("楼栋") and e.get("安装楼层")]
+    if not _direct_ok:
+        continue
+    if len({_norm_key(e) for e in _direct_ok}) != 1:
+        continue                      # 直写实例互相冲突 → 真重号，保持原样
+    _keep = _direct_ok[0]
+    _dropped = [e for e in _lst if e is not _keep]
+    for _e in _dropped:
+        _e["同编号重复实例"] = True
+        _e["重复实例原因"] = ("同编号在其它图幅另有一处标注（非箱表直写），"
+                            "已按直写实例收敛，本实例不入映射表")
+    _by_id[_fid] = [_keep]
+    _collapsed[_fid] = {
+        "保留": {"楼栋": _keep.get("楼栋"), "安装楼层": _keep.get("安装楼层"),
+                 "口径": _keep.get("安装楼层口径")},
+        "合并实例数": len(_dropped),
+    }
+
+# 展开为映射表（真重号 → 键加 #序号，全部保留；已收敛的单实例直接入表）
 fx_map = {}
 _dup_ids = {k: v for k, v in _by_id.items() if len(v) > 1}
 for _fid, _lst in _by_id.items():
@@ -333,6 +398,14 @@ result = {
     "标注实例数": len(fx_items),
     "唯一编号数": len(_by_id),
     "重号编号": {k: len(v) for k, v in sorted(_dup_ids.items())},
+    # 2026-09-18：把「同一编号多实例但直写箱位唯一」的收敛单独登记 ——
+    #   它**不是**重号（下游可安全按唯一映射使用），但要留痕可审计。
+    "同编号收敛": _collapsed,
+    # 2026-09-18：箱表描述被拆成规范字段的留痕（原文保留在条目的「箱表描述」里）。
+    "箱表描述拆分": _split_note,
+    "同编号收敛说明": (("同一编号在图上出现多处，但**箱表直写**的 (楼栋, 安装楼层) 唯一 → "
+                    "已收敛为该实例，其余实例不入映射表（留痕见 同编号收敛）")
+                   if _collapsed else ""),
     "重号说明": (("同一编号在图上出现多处的，各实例均按『编号#序号』收录、未自动择一；"
                   "其归属请人工裁决（实测某图 8 个编号各出现 2 次，且两次指向不同楼栋）")
                  if _dup_ids else ""),
@@ -347,6 +420,19 @@ log.info("\n===== FX 映射表摘要 =====")
 log.info("（提示：以下映射需人工目视核对原图确认）")
 for entry in sorted(fx_map.values(), key=lambda e: e["编号"]):
     log.info(f"  {entry['编号']}: {entry['楼栋']} {entry['单元']} {entry['安装楼层']} ({entry['安装楼层口径']})")
+if _collapsed:
+    log.info("  [同编号收敛] %d 个编号在图上出现多处，但箱表直写箱位唯一 → 已收敛为单实例：%s"
+             % (len(_collapsed), "、".join(sorted(_collapsed)[:8])
+                + (" 等" if len(_collapsed) > 8 else "")))
+if _split_note:
+    log.info("  [箱表描述拆分] %d 条的「楼栋/单元」由箱表描述拆出（原文存「箱表描述」），"
+             "避免下游按楼栋锚点前缀匹配失败而整条丢弃：%s"
+             % (len(_split_note), "；".join(_split_note[:3])
+                + (" 等" if len(_split_note) > 3 else "")))
+if _dup_ids:
+    log.info("  [真重号] %d 个编号存在互相冲突的映射，各实例均保留，须人工裁决：%s"
+             % (len(_dup_ids), "、".join(sorted(_dup_ids)[:8])
+                + (" 等" if len(_dup_ids) > 8 else "")))
 
 try:
     os.makedirs(os.path.dirname(os.path.abspath(OUT)) or ".", exist_ok=True)

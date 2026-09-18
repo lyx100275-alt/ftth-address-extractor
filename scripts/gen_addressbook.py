@@ -575,7 +575,13 @@ if template_headers:
     field_map = []  # headers[i] -> 内部字段名或None
     for h in template_headers:
         h_clean, field = normalize_header(h)
-        headers.append(h_clean)
+        # 输出表头**原样**用模板写法（含"(必填)"后缀）——addressbook_template.md：
+        #   「格式严格跟模板：列结构、列顺序、**表头名称**…全部以模板为准」。
+        # normalize_header 只服务**字段映射**（去掉后缀才能撞上 HEADER_ALIASES 的简称键），
+        #   不得改写输出表头：实测用 h_clean 写表头时，模板的 5 个必填列
+        #   「分公司(必填)/一级(必填)/二级(必填)/三级(必填)/四级(必填)」会被写成
+        #   「分公司/一级/二级/三级/四级」，与模板逐列不一致（回读 C6-1 FAIL）。
+        headers.append(h if (h is not None and str(h).strip() != "") else h_clean)
         field_map.append(field)
 else:
     headers = ["分公司", "省", "市", "区", "街道", "小区", "楼栋", "单元", "楼层", "户号", "分纤箱编号"]
@@ -593,6 +599,7 @@ for row in all_rows:
 #   故此处按「首列标识前缀」去重，同一前缀只保留第一条，并显式告知跳过了几条。
 _seen_tail = set()
 _dup_tail = 0
+_tail_written = 0          # 实际写入的尾行数（去重后），供出口行数恒等式使用
 for _tr in template_tail_rows:
     _sig = (str(_tr[0]).split(":")[0].strip() if _tr and _tr[0] is not None else "") or "__blank__"
     if _sig in _seen_tail:
@@ -601,6 +608,7 @@ for _tr in template_tail_rows:
         continue
     _seen_tail.add(_sig)
     ws.append(_tr)
+    _tail_written += 1
 if _dup_tail:
     log.warning("本次共跳过 %d 条重复模板尾行（通常源于『以已有产物为模板再次出表』）" % _dup_tail)
 
@@ -642,12 +650,48 @@ except IOError as e:
     sys.exit(1)
 log.info(f"已保存: {args.out}")
 
-# 回读校验
+# 回读校验（L1-C6：出表后复核，不通过即视为未交付）
+# 为什么断言要放在「读完产物」而不是「写之前」：写之前的校验只能证明**内存变量**自洽，
+#   证明不了**磁盘上的文件**是对的。实测教训 —— 表头在写入时被 normalize 改写、
+#   生成侧毫无察觉，直到对产物做回读才暴露（C6-1 FAIL）。闸门必须卡在出口。
+_rb_fail = []
 try:
     wb_check = load_workbook(args.out)
     ws_check = wb_check[args.sheet_name]
     log.info(f"校验: {ws_check.max_row}行 x {ws_check.max_column}列")
     if ws_check.max_row >= 2:
         log.info(f"第2行: {[ws_check.cell(2, c).value for c in range(1, min(10, len(headers)+1))]}")
+
+    # ① 表头逐列与模板一致（原样抄模板，含"(必填)"后缀）
+    #    期望值必须取 **template_headers（模板原文）**，不能取 headers（内存里那份）——
+    #    内存值若在写入前就被改写（本仓实测过：normalize 掉"(必填)"后缀），
+    #    拿它当真源比对等于自证清白，产物错也照样绿。闸门只认真源。
+    if template_headers:
+        _nt = len(template_headers)
+        _rt = [ws_check.cell(1, c).value for c in range(1, _nt + 1)]
+        _diff = [(i + 1, str(template_headers[i] or "").strip(), _rt[i])
+                 for i in range(_nt)
+                 if str(template_headers[i] or "").strip()
+                 != ("" if _rt[i] is None else str(_rt[i]).strip())]
+        if _diff:
+            log.error(f"[回读校验不通过] 表头与模板不一致 {len(_diff)} 处"
+                      f"（列号, 模板, 产物）: {_diff[:8]}")
+            _rb_fail.append("表头")
+        else:
+            log.info(f"回读: 表头 {_nt} 列与模板逐列一致")
+
+    # ② 行数恒等式：1(表头) + 数据行 + 模板尾行(去重后)
+    _want = 1 + len(all_rows) + _tail_written
+    if ws_check.max_row != _want:
+        log.error(f"[回读校验不通过] 行数恒等式：产物实际 {ws_check.max_row} 行"
+                  f" ≠ 期望 {_want} 行（1 表头 + {len(all_rows)} 数据行 + {_tail_written} 尾行）")
+        _rb_fail.append("行数")
+    else:
+        log.info(f"回读: 行数恒等式成立（1 + {len(all_rows)} + {_tail_written} = {_want}）")
+    wb_check.close()
 except Exception as e:
     log.warning(f"回读校验失败（不影响输出）: {e}")
+
+if _rb_fail:
+    log.error(f"回读校验不通过（{'、'.join(_rb_fail)}）—— L1-C6：不通过即视为未交付。")
+    sys.exit(3)
