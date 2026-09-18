@@ -43,7 +43,7 @@ from ftth_common import (
     setup_logger, bldg_num, floor_num_or_zero, parse_floor_label,
     load_dxf, collect_texts, find_bldg_anchors, cluster_by_x, compute_bldg_ranges, match_y_to_floor,
     compute_bldg_ranges_banded, assign_by_xy, bldg_range_diagnostics, group_shared_ranges,
-    column_consensus_y,
+    column_consensus_y, BLDG_RANGE_EXPANDED,
     MultiPlotDuplicateAnchorError,
     assign_floor_by_interval, clean_text, is_floor_text, require_params,
     floor_step_from_texts, set_expand_bldg_ranges,
@@ -1202,6 +1202,8 @@ result = {
                        "列x": [{"x": _k, "条数": _v}
                                for _k, _v in sorted(_COL_USED.items())[:50]]},
         "单锚点带": _SINGLE_ANCHOR_BANDS,
+        # 区间标题（N-M号楼）按图上独立证据自动展开的留痕，供人工追溯
+        "区间展开": BLDG_RANGE_EXPANDED,
         # 2026-09-18：**截断必须带总数** —— 旧实现只存前 100 条且不记总数，下游看到 100 会
         #   当成全部（实测两处真值均 >=100，属「没核不得输出成通过」同族缺陷）。
         "待裁决归属": {"总数": len(_PENDING_ASSIGN), "展示": _PENDING_ASSIGN[:100]},
