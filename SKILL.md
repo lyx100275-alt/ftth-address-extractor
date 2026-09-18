@@ -195,7 +195,7 @@ Step 1a 向解析阶段传递画像，**至少**回答两项：**① 编号↔�
 
 ### C9 证据来源等级（2026-09-18 立）
 
-来源冲突按等级取信。**三个要点**：① `E-DXF-TEXT`（文字直读）与 `E-DXF-GEOM`（几何 / INSERT 属性）**无全序** —— 谁优先由场景规则定（箱位即图形符号 > 编号文字）；② `E-IMG`（视觉 OCR）**只能用于发现疑点，不得覆盖 `E-DXF-*`**；③ **「人工」必须拆成 `E-HUMAN-RULING`（用户本会话裁定＝I5-A，最高）与 `E-HUMAN-GUESS`（肉眼推测，最低）**，笼统把人工定为最低会与 I5-A 直接打架。完整表见 [operations_discipline.md §5.7](references/operations_discipline.md)。
+来源冲突按等级取信。**三个要点**：① `E-DXF-TEXT`（文字直读）与 `E-DXF-GEOM`（几何 / INSERT 属性）**无全序** —— 谁优先由场景规则定（箱位即图形符号 > 编号文字）；② `E-IMG`（视觉 OCR）**只能用于发现疑点，不得覆盖 `E-DXF-*`**；③ **「人工」必须拆成 `E-HUMAN-RULING`（用户本会话裁定＝I5-A，最高）与 `E-HUMAN-GUESS`（肉眼推测，最低）**，笼统把人工定为最低会与 I5-A 直接打架。完整表（含 A′/B′ 分档）见 [operations_discipline.md §五·补](references/operations_discipline.md)。
 
 ## Agent 状态机（迁移门禁）
 
