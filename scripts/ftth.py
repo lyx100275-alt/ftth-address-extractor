@@ -285,7 +285,11 @@ class _CliParser(argparse.ArgumentParser):
 #   「楼栋/单元归属必须以图纸自带的分纤箱总图对照表为准」，parse 自身也按标题 x 中分
 #   归属文字，故它同样需要对照表。此前 fxmap 排 parse 之后 = 先用被明文禁止的方法切完、
 #   再拿正确数据去补 coverage → parse 侧永远 0 箱。
-_PIPE_STAGES = ("geom", "probe", "plan", "fxmap", "parse", "coverage", "inspect")
+_PIPE_STAGES = ("geom", "probe", "plan", "titleblock", "fxmap", "fx_locations",
+                "unit_gaps", "parse", "coverage", "inspect")
+# 2026-09-18（用户裁定）新增 `unit_gaps`：探查期「单元 × 箱清单」交叉清点，位置在
+#   parse **之前** —— 骨架(titleblock)与箱清单(fxmap/fx_locations)两样证据在 parse 前
+#   就已落盘，故「某单元没分纤箱」可提前暴露，不必等 Step 2 覆盖门禁（那时返工面大）。
 
 # 画像里申报的覆盖判定脚本 -> 本入口的子命令名
 _COV_SCRIPT_TO_CMD = {
@@ -356,6 +360,28 @@ def _pipe_profile_status(profile_path, signal):
                or "").strip().lower()
 
 
+def _pipe_fxloc_state(profile_path, cfg_path):
+    """读「箱位直读标注」信号 fx_location_annotation 的状态（小写，可能是 present(N条)）。
+
+    2026-09-18：该信号**不在 profile.signals 里** —— 它是**探查信号**，由 probe 产出、
+    plan 原样透传进 ``profile.probe_signals``；老画像可能只在 config.json 顶层有。
+    两处都读、取先命中者，避免「换了个画像版本就读不到 ⇒ 阶段静默跳过」。
+    调用方按 **前缀** 判定 present（值形如 ``present(84条)``）。
+    """
+    for path, pick in ((profile_path, lambda d: (d.get("probe_signals") or {})
+                        .get("fx_location_annotation")),
+                       (cfg_path, lambda d: d.get("fx_location_annotation"))):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                v = pick(json.load(f))
+        except Exception:                                            # noqa: BLE001
+            continue
+        s = str(v or "").strip().lower()
+        if s:
+            return s
+    return ""
+
+
 def _pipe_fxmap_gate(profile_path):
     """judge 是否执行 fxmap（总图对照表）阶段。返回 (是否执行, 依据说明)。
 
@@ -404,6 +430,28 @@ def _pipe_fxmap_gate(profile_path):
     if _pipe_profile_status(profile_path, "fx_overview_map") == "present":
         return True, "（老画像无 handoff①）信号 fx_overview_map=present"
     return False, "画像未申报总图对照表（无 handoff①，且 fx_overview_map≠present）"
+
+
+def _pipe_gap_verdict(path):
+    """读探查期预检产物 unit_box_gaps.json，返回 (结论, 说明) 供流水线打印。
+
+    三种结论语义**必须区分**（混淆即产生假绿灯或假失败）：
+      · ``pending``    —— 两侧来源齐备且差集非空，**有疑点要报人**；
+      · ``settled``    —— 两侧齐备且一致；
+      · ``unresolved`` —— **某侧来源未就绪，本次未判定**。它不是「通过」，
+                          覆盖阶段门禁仍会兜底（不得据此跳过后续检查）。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:                                                # noqa: BLE001
+        return None
+    if not isinstance(d, dict):
+        return None
+    v = d.get("预检结论")
+    if not v:
+        return None
+    return str(v), str(d.get("预检说明") or "")
 
 
 _NONSTD_JSON_TOKENS = ("Infinity", "-Infinity", "NaN")
@@ -493,7 +541,15 @@ def cmd_pipeline(args):
             return 2 if rc in (0, 3) else rc
         return rc
 
-    def _dump(rc):
+    def _dump(rc, stopped=None):
+        """收尾台账。stopped=阶段名 表示流水线在该阶段**提前中止**（末阶段失败也算）。
+
+        2026-09-18（实跑修复，P0）：此前 rc=3 一律打印「本图不适用（非错误），按画像
+          降级路径继续」—— 但 `_dump(rc!=0)` 的调用点**全部**是提前 return，即链路
+          已经终止。实测某图 parse 因多地块同名楼守门 rc=3，日志却写着"继续"，
+          人据此以为已降级跑完，而 parsed/coverage/inspect 根本没产出。
+          退出码语义必须与「是否真的继续」一致：说继续就得真继续。
+        """
         total = time.time() - t_all
         path = os.path.join(outdir, "pipeline_timing.json")
         with open(path, "w", encoding="utf-8", newline="\n") as f:
@@ -507,8 +563,14 @@ def cmd_pipeline(args):
         print("[pipeline] 耗时台账: %s" % path)
         if rc == 0:
             print("[pipeline] 下一步：人工裁决待确认项后再出表（gen 不在流水线内，见本函数文档）")
-        elif rc == 3:
-            print("[pipeline] 有阶段 rc=3 = 本图不适用（非错误），按画像降级路径继续")
+        elif stopped:
+            print("[pipeline] ⛔ 已在「%s」阶段中止（rc=%d）—— **后续阶段未执行**，"
+                  "本次没有产出更下游的产物。" % (stopped, rc))
+            print("[pipeline]    处置：按该阶段打印的提示处理后重跑；"
+                  "**不要**把本次产物当作完整链路结果。")
+        else:
+            print("[pipeline] 有阶段 rc=%d，但流水线已跑完（该阶段为「本图不适用」，"
+                  "非错误），下游按画像降级路径执行" % rc)
         print("-" * 68)
         return rc
 
@@ -520,14 +582,14 @@ def cmd_pipeline(args):
     else:
         rc = _run("geom", ["--dxf", dxf], script="dump_geom.py")
         if rc:
-            return _dump(_std_json_gate(rc))
+            return _dump(_std_json_gate(rc), "geom")
     if stop_idx < 1:
         return _dump(0)
 
     # ---- ② probe ----
     rc = _run("probe", ["probe", "--dxf", dxf, "--out", cfg])
     if rc:
-        return _dump(_std_json_gate(rc))
+        return _dump(_std_json_gate(rc), "probe")
     if stop_idx < 2:
         return _dump(0)
 
@@ -537,8 +599,66 @@ def cmd_pipeline(args):
         plan_argv += ["--project-dir", args.project_dir]
     rc = _run("plan", plan_argv)
     if rc:
-        return _dump(_std_json_gate(rc))
+        return _dump(_std_json_gate(rc), "plan")
     if stop_idx < 3:
+        return _dump(0)
+
+    # ---- ③b titleblock（图签第二来源；仅画像申报 present / variant 时跑）----
+    # 2026-09-18（实跑修复，P1）：画像把 titleblock_annotation 判为 present 并明确写出
+    #   「后果与处置：图签可直读栋级入户规模 → 与采集表构成『三来源协议』的第二来源」，
+    #   但流水线的阶段列表里**根本没有它** —— 规则写在文档里、没有代码执行，
+    #   第二来源永不参与，实测某图 7 栋的图签读数与系统图逐栋一致却从未被比对过。
+    #   本阶段只**读取并落盘**（<outdir>/titleblock.json），比对交给 inspect 的 C10。
+    #   非 0 退出**不中止主链路**（它是校验来源，不是主数据来源），但必须显式打印，
+    #   并让 C10 判 SKIP —— 「没核」不得呈现成「通过」。
+    tb = os.path.join(outdir, "titleblock.json")
+    _tb_state = _pipe_profile_status(prof, "titleblock_annotation")
+    if _tb_state not in ("present", "variant"):
+        ledger.append({"阶段": "titleblock", "rc": 3, "秒": 0.0})
+        print("[pipeline] %-9s rc=3      0.00s  (画像申报 titleblock_annotation=%s，跳过)"
+              % ("titleblock", _tb_state or "未知"), flush=True)
+    else:
+        # 图层取值三级：① probe 专为该脚本产出的 titleblock_layer_candidates（最准，
+        #   config.json 明写「用途：read_titleblock_households.py --floor-layer 候选」）→
+        #   ② 通用文字图层 suggested_params.text_layer → ③ 取不到就**不猜**，跳过并说明。
+        #   （2026-09-18 实跑踩坑：只读顶层 text_layer 取不到 —— 实际它嵌在 suggested_params
+        #   里，于是本阶段静默跳过、C10 白 SKIP，属"修了但没生效"。）
+        _tbl = ""
+        try:
+            with open(cfg, "r", encoding="utf-8") as _cf2:
+                _c = json.load(_cf2) or {}
+            _cand = ((_c.get("titleblock_layer_candidates") or {}).get("候选图层") or [])
+            if _cand:
+                _tbl = str(_cand[0]).strip()
+            if not _tbl:
+                _sp = _c.get("suggested_params") or {}
+                _tl = _sp.get("text_layer")
+                if isinstance(_tl, list) and _tl:
+                    _tbl = str(_tl[0]).strip()
+                elif isinstance(_tl, str):
+                    _tbl = _tl.split(",")[0].strip()
+        except (IOError, json.JSONDecodeError, OSError):             # noqa: BLE001
+            _tbl = ""
+        if not _tbl:
+            ledger.append({"阶段": "titleblock", "rc": 3, "秒": 0.0})
+            print("[pipeline] titleblock 跳过：配置里既无 titleblock_layer_candidates 也无 "
+                  "suggested_params.text_layer，不猜图层；C10 将判 SKIP 并注明本次未做交叉校验",
+                  flush=True)
+        else:
+            _rc_tb = _run("titleblock",
+                          ["--dxf", dxf, "--floor-layer", _tbl, "--out", tb],
+                          script="read_titleblock_households.py")
+            if _rc_tb == 3:
+                # 2026-09-18（实跑修复）：rc=3 = 本图未提供图签形态（申报制语义），
+                #   不是脚本故障。此前一律按 `!` 告警打印，把「图上没有」写成
+                #   「第二来源未取得」，且掩盖了它与真失败的区别。
+                print("[pipeline] titleblock rc=3 = 本图未提供图签形态的成对标注"
+                      "（申报制），第二来源本次不参与；C10 将判 SKIP 并注明「本次未做」",
+                      flush=True)
+            elif _rc_tb:
+                print("[pipeline] ! titleblock 阶段 rc=%d —— 第二来源本次**未取得**，"
+                      "inspect 的 C10 将判 SKIP（本次未做图签交叉校验）" % _rc_tb, flush=True)
+    if stop_idx < 4:
         return _dump(0)
 
     # ---- ④ fxmap（总图对照表；仅画像申报存在总图时跑，失败不中止）----
@@ -568,7 +688,62 @@ def cmd_pipeline(args):
     # 2026-09-18（第 4 轮，用户裁决）：absent 图不再产出 fxmap —— gate 未跑则文件
     # 不存在，_bmap 自然为 None；不自动把「旧残留/降级产物」当作对照表回填。
     _bmap = args.bldg_map or (fxmap if (_fx_run and os.path.isfile(fxmap)) else None)
-    if stop_idx < 4:
+    if stop_idx < 5:
+        return _dump(0)
+
+    # ---- ④b fx_locations（箱位直读标注；仅探查申报 present 时跑）----
+    # 2026-09-18（实跑修复，P0）：probe 把 fx_location_annotation 判为 "present(N条)"、
+    #   plan 原样透传并只在日志里 log 一句「建议 extract_fx_locations.py 提取后给
+    #   coverage-vshape 传 --fx-locations 做交叉校验」——**流水线里既没有这个阶段、
+    #   也不给 coverage-vshape 传参**，与 ③b titleblock 属同一形态的
+    #   「规则写在文档里、没有代码执行」。
+    #   后果（实测某图）：图上 22 条「N号楼M单元K层」直读标注是**安装层最可靠的独立
+    #   第二来源**，全部未被使用；coverage-vshape 的交叉校验恒为「比对 0 项」，
+    #   箱位锚只剩编号文字那一路，18 项待裁决里大半本可由本来源消解。
+    #   本阶段只**提取并落盘**（<outdir>/fx_locations.json），消费点见 ⑥ coverage；
+    #   非 0 退出**不中止主链路**（它是校验来源，不是主数据来源），但必须显式打印。
+    fxl = os.path.join(outdir, "fx_locations.json")
+    _fxl_state = _pipe_fxloc_state(prof, cfg)
+    if not _fxl_state.startswith("present"):
+        ledger.append({"阶段": "fx_locations", "rc": 3, "秒": 0.0})
+        print("[pipeline] %-9s rc=3      0.00s  (探查申报 fx_location_annotation=%s，跳过)"
+              % ("fx_locations", _fxl_state or "未知"), flush=True)
+    else:
+        _rc_fxl = _run("fx_locations", ["--dxf", dxf, "--out", fxl],
+                       script="extract_fx_locations.py")
+        if _rc_fxl and not os.path.isfile(fxl):
+            print("[pipeline] ! fx_locations 阶段失败(rc=%d) —— 箱位直读标注本次**未取得**，"
+                  "coverage-vshape 将无安装层第二来源，结论须照此标注"
+                  % _rc_fxl, flush=True)
+    if stop_idx < 6:
+        return _dump(0)
+
+    # ---- ④c unit_gaps（探查期「单元 × 箱清单」交叉清点；提前暴露「某单元没分纤箱」）----
+    # 2026-09-18（用户裁定）：此前「某单元一个箱都没有」只在 **Step 2 自检**（覆盖完整性
+    #   门禁）阶段才暴露 —— 那时 parse/coverage 已跑完，返工面大。而图面证据其实在 parse
+    #   **之前**就齐了：骨架 = titleblock.json（栋级层户 + 单元标注），箱清单 = fxmap.json
+    #   （对照表）与/或 fx_locations.json（箱位直读标注）。故本检查提前到此处。
+    #   定位：**预检告警，不是待裁决项的权威载体** —— 后者仍以 coverage/inspect 为准。
+    #   铁律：**两侧来源任缺即判 unresolved、不产生 pending** —— 「没核过」不得输出成
+    #   「全部单元无箱」（假失败）或「通过」（假绿灯）；脚本原理见 check_unit_box_gaps.py。
+    #   非 0 退出不中止主链路（它是预检，不是主数据来源），但必须显式打印。
+    ug = os.path.join(outdir, "unit_box_gaps.json")
+    ug_argv = ["--out", ug]
+    for _uflag, _upath in (("--titleblock", tb), ("--fx-locations", fxl), ("--fx-map", fxmap)):
+        if os.path.isfile(_upath):
+            ug_argv += [_uflag, _upath]
+    _rc_ug = _run("unit_gaps", ug_argv, script="check_unit_box_gaps.py")
+    if _rc_ug and not os.path.isfile(ug):
+        print("[pipeline] ! unit_gaps 阶段失败(rc=%d) —— 探查期「单元×箱」预检本次**未取得**，"
+              "「某单元无分纤箱」只能等覆盖阶段门禁暴露" % _rc_ug, flush=True)
+    else:
+        _v = _pipe_gap_verdict(ug)
+        if _v:
+            print("[pipeline] 预检「单元×箱」%s：%s" % _v, flush=True)
+            if _v[0] == "unresolved":
+                print("[pipeline]   （unresolved = 本次**未判定**，不是通过；"
+                      "覆盖阶段门禁仍会兜底）", flush=True)
+    if stop_idx < 7:
         return _dump(0)
 
     # ---- ⑤ parse ----
@@ -588,8 +763,8 @@ def cmd_pipeline(args):
         parse_argv += ["--bldg-map", _bmap, "--fx-map", _bmap]
     rc = _run("parse", parse_argv)
     if rc:
-        return _dump(_std_json_gate(rc))
-    if stop_idx < 5:
+        return _dump(_std_json_gate(rc), "parse")
+    if stop_idx < 8:
         return _dump(0)
 
     # ---- ⑥ coverage（方法由画像决定，不在此处二次推断）----
@@ -601,11 +776,46 @@ def cmd_pipeline(args):
     else:
         cov_argv = [cov_cmd, "--dxf", dxf, "--config", cfg,
                     "--profile", prof, "--out", cov]
+        # 2026-09-18（实跑修复，P0）：把 ④b 产出的箱位直读标注喂给 V 型法做安装层交叉校验。
+        #   此前该参数只出现在 `ftth.py coverage-vshape` 的手工命令里，走流水线就永远不接
+        #   —— 「信号申报了、产物提了、却没人核」。
+        #   只有 coverage-vshape 消费它（analyze_coverage.py 无此参数，传了 rc=2），
+        #   故按子命令分派，与下方图层/对照表参数同一处理。
+        if cov_cmd == "coverage-vshape" and os.path.isfile(fxl):
+            cov_argv += ["--fx-locations", fxl]
+            print("[pipeline] 箱位直读标注已接入 V 型法交叉校验: %s" % fxl, flush=True)
+        elif cov_cmd == "coverage-vshape":
+            print("[pipeline] 提示：本次无箱位直读标注(<outdir>/fx_locations.json)，"
+                  "V 型法安装层缺独立第二来源，结论须照此标注", flush=True)
         _lay, _lay_src = _pipe_effective_layers(prof)
-        if args.wire_layer or _lay.get("wire_layer"):
-            cov_argv += ["--wire-layer", args.wire_layer or _lay["wire_layer"]]
-        if args.fx_symbol_layer or _lay.get("fx_symbol_layer"):
-            cov_argv += ["--fx-symbol-layer", args.fx_symbol_layer or _lay["fx_symbol_layer"]]
+        # 2026-09-18（实跑修复，P1）：**图层参数按子命令分派**。analyze_coverage_vshape.py
+        #   （V 型法）只吃文字标注与米数列，**完全不消费 --wire-layer / --fx-symbol-layer**
+        #   —— 传它一律 `unrecognized arguments` 直接 rc=2（实测：给 coverage-vshape 加
+        #   `--wire-layer BZ` 立即报参数错误并列出全部可用参数）。原代码无条件追加，只因
+        #   本图画像两个图层均为 null 才侥幸未触发；换一张 dedicated_wire_layer=present
+        #   的图即挂。与下方 --bldg-map 属同一类缺陷 —— 那处已分派、这两处此前漏修。
+        _want_wl = args.wire_layer or _lay.get("wire_layer")
+        _want_fx = args.fx_symbol_layer or _lay.get("fx_symbol_layer")
+        if cov_cmd == "coverage":
+            if _want_wl:
+                cov_argv += ["--wire-layer", _want_wl]
+            if _want_fx:
+                cov_argv += ["--fx-symbol-layer", _want_fx]
+            if _lay:
+                print("[pipeline] 自画像下传图层(%s)：%s"
+                      % (_lay_src, ", ".join("%s=%s" % (k, v) for k, v in _lay.items())),
+                      flush=True)
+            elif not (_want_wl or _want_fx):
+                print("[pipeline] ! 画像未给出可用图层候选 —— coverage 将扫描全图所有图层，"
+                      "结果仅供线索（用 --wire-layer/--fx-symbol-layer 显式指定可消除）", flush=True)
+        else:
+            _ign = [n for n, v in (("--wire-layer", _want_wl),
+                                   ("--fx-symbol-layer", _want_fx)) if v]
+            print("[pipeline] 本轮选法 %s **不消费**连线/符号图层参数%s —— 其覆盖与归属均由"
+                  "文字标注（米数列 / 标题窗口几何）决定，故不下传（传了会被判"
+                  "unrecognized arguments 直接 rc=2）"
+                  % (cov_cmd, ("（画像/命令行给出的 " + "、".join(_ign) + " 已按此忽略）")
+                     if _ign else ""), flush=True)
         # _bmap 已在 fxmap 阶段解析（用户显式 --bldg-map 优先，否则用落盘的 fxmap.json）
         if _bmap:
             # 2026-09-18（第 3 轮）：--bldg-map 只有 analyze_coverage.py（coverage 子命令）接。
@@ -618,22 +828,16 @@ def cmd_pipeline(args):
                 print("[pipeline] 注意：本轮选法 %s **不消费**总图对照表（其楼栋/单元归属"
                       "由标题窗口几何决定），故不传 --bldg-map；该来源的归属未经对照表"
                       "交叉验证，结论须照此标注" % cov_cmd, flush=True)
-        if _lay:
-            print("[pipeline] 自画像下传图层(%s)：%s"
-                  % (_lay_src, ", ".join("%s=%s" % (k, v) for k, v in _lay.items())),
-                  flush=True)
-        elif not (args.wire_layer or args.fx_symbol_layer):
-            print("[pipeline] ! 画像未给出可用图层候选 —— coverage 将扫描全图所有图层，"
-                  "结果仅供线索（用 --wire-layer/--fx-symbol-layer 显式指定可消除）", flush=True)
         if not _bmap:
-            print("[pipeline] 提示：无总图对照表(<outdir>/fxmap.json)，"
-                  "coverage 楼栋归属将回退『标题 x 中分』", flush=True)
+            print("[pipeline] 提示：无总图对照表(<outdir>/fxmap.json)；%s"
+                  % ("coverage 楼栋归属将回退『标题 x 中分』" if cov_cmd == "coverage"
+                     else "本选法楼栋归属由标题窗口几何决定，不读对照表"), flush=True)
         rc = _run("coverage", cov_argv)
         if rc == 3:
             print("[pipeline] coverage rc=3 = 本图不适用（申报制），按降级路径继续", flush=True)
         elif rc:
-            return _dump(_std_json_gate(rc))
-    if stop_idx < 6:
+            return _dump(_std_json_gate(rc), "coverage")
+    if stop_idx < 9:
         return _dump(0)
 
     # ---- ⑦ inspect ----
@@ -651,7 +855,19 @@ def cmd_pipeline(args):
         _fxp = ""
     if _fxp and not any(w in _fxp for w in ("未提供", "不提取", "留空")):
         insp_argv += ["--fx-pattern", _fxp]
-    return _dump(_run("inspect", insp_argv))
+    # 2026-09-18（实跑修复，P1）：把 ③b 产出的图签读数喂给 C10 做逐栋互证。
+    #   文件不存在（本图无图签 / 阶段跳过）时不传 ⇒ C10 判 SKIP 并写明「本次未做」。
+    if os.path.isfile(tb):
+        insp_argv += ["--titleblock", tb]
+    # 2026-09-18（实跑修复，P1）：户数（图标法）产物若已落在 outdir，自动喂给 inspect。
+    #   此前本阶段不接该产物 ⇒ C5/C8 恒判 SKIP；即便使用者随后单独跑了 count-box，
+    #   只要不手工重拼 inspect 命令就**永远看不出来** —— 「跑了但没核」会被读成
+    #   「核过且通过」，是本技能最忌讳的假绿灯形态。自动纳入可消除这一手工接续点。
+    _cb_path = os.path.join(outdir, "count_box.json")
+    if os.path.isfile(_cb_path):
+        insp_argv += ["--count-box", _cb_path]
+    _rc_insp = _run("inspect", insp_argv)
+    return _dump(_rc_insp, "inspect" if _rc_insp else None)
 
 
 def main():
@@ -824,6 +1040,11 @@ def main():
     p_insp.add_argument("--count-box", dest="count_box_json", default=None,
                         help="count_box_icons.py 的输出 JSON（可选）；parse 侧无箱时作为替代口径")
     p_insp.add_argument("--fx-pattern", default=r"FL\d+-FX\d+", help="分纤箱编号正则")
+    # 2026-09-18（实跑修复，P1）：C10「图签第二来源逐栋比对」的输入。此前 inspect_closure.py
+    #   单独调用能收到该参数，但经本入口时 argparse 直接判 unrecognized arguments →
+    #   inspect 根本没跑、rc=2 而**没有任何检查项输出**（实测，冒烟测试只测本体测不到）。
+    p_insp.add_argument("--titleblock", dest="titleblock_json", default=None,
+                        help="read_titleblock_households.py 输出的图签读数 JSON（可选，供 C10）")
     p_insp.add_argument("--json", dest="json_out", default=None, help="机读结果输出路径（可选）")
 
     # count: 户数统计（皮线计数）
@@ -941,15 +1162,24 @@ def main():
     # split-band: 多地块图纸按 y 带切出子 DXF（同名楼分带解析的前置步骤）
     p_sb = sub.add_parser("split-band", parents=[common],
                           help="多地块图纸按 y 带裁剪出各地块子 DXF（供 parse/coverage 分带运行）")
-    p_sb.add_argument("--out-dir", required=True, help="子 DXF 输出目录（自动创建）")
-    p_sb.add_argument("--band", action="append", required=True,
+    p_sb.add_argument("--out-dir", help="子 DXF 输出目录（自动创建；--auto 出方案时可省）")
+    p_sb.add_argument("--band", action="append",
                       help='分带参数 "名称:ymin:ymax"，可重复传；单值内也可用逗号分隔多条。'
-                           'y 带口径：上界取上邻带标题 y、下界维持中点（防切本带/吞邻带）')
+                           '边界须取实测锚点 y（有「N块地」类锚点时用 --auto）；'
+                           '无锚点、只能按楼栋标题定界时，上界取上邻带标题 y、'
+                           '**不得取相邻标题中点**。与 --auto 互斥。')
+    p_sb.add_argument("--auto", action="store_true",
+                      help="由图上实测的「N块地」类锚点自动算分带窗口（探针与分带共用同一"
+                           "实现）。默认只出方案不写文件，核对后加 --yes 执行")
+    p_sb.add_argument("--yes", action="store_true",
+                      help="--auto 下确认执行（不加则只打印分带方案）")
+    p_sb.add_argument("--text-layer", help="文字图层（逗号分隔）；缺省读 --config 的建议值")
+    p_sb.add_argument("--title-pattern", help="楼栋标题正则；缺省读 --config 的建议值")
 
     # pipeline: 一条命令串跑多阶段（2026-09-17 新增，见 cmd_pipeline 文档字符串）
     p_pipe = sub.add_parser("pipeline", parents=[common],
-                            help="一键串跑 geom->probe->plan->parse->coverage->inspect"
-                                 "（只解析、不出表；各阶段产物落 --outdir）")
+                            help="一键串跑 geom->probe->plan->titleblock->fxmap->parse->"
+                                 "coverage->inspect（只解析、不出表；各阶段产物落 --outdir）")
     p_pipe.add_argument("--outdir", required=True,
                         help="产物目录；各阶段产物用固定文件名（config/profile/parsed/coverage/inspect）落在此处")
     p_pipe.add_argument("--project-dir", default=None,
@@ -1200,9 +1430,10 @@ def main():
         cmd += build_cmd(args, ("cmd", "xlsx", "covjson", "config", "dxf"))
         sys.exit(run_script("verify_coverage_truth.py", cmd))
     elif args.cmd == "split-band":
-        # --band 是列表：build_cmd 会把列表逗号拼接为单个 --band 值，split_bands.py 两种形态都收
+        # --band 是列表：build_cmd 会把列表逗号拼接为单个 --band 值，split_bands.py 两种形态都收。
+        # --config 需透传（--auto 要从其中读 text_layer / title_pattern 建议值）。
         cmd = [args.dxf]
-        cmd += build_cmd(args, ("cmd", "dxf", "config"))
+        cmd += build_cmd(args, ("cmd", "dxf"))
         sys.exit(run_script("split_bands.py", cmd))
     elif args.cmd == "inspect":
         cmd = ["--parse", args.parse_json]
@@ -1214,6 +1445,8 @@ def main():
             cmd += ["--count-box", args.count_box_json]
         if args.fx_pattern:
             cmd += ["--fx-pattern", args.fx_pattern]
+        if getattr(args, "titleblock_json", None):
+            cmd += ["--titleblock", args.titleblock_json]
         if args.json_out:
             cmd += ["--json", args.json_out]
         sys.exit(run_script("inspect_closure.py", cmd))

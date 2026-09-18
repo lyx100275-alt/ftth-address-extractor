@@ -1,7 +1,7 @@
 {
   "skill": "ftth-address-extractor",
-  "skill_version": "0.65.0",
-  "skill_version_basis": "minor 位 = SKILL_CHANGELOG 修订序号（本条基线时为「六十五」＝65）；patch 位对应同一修订序号内的「·补」条目（如「五十三·补」）；major 位固定 0，待对外发布时由人工提升。不采用未经验证的语义化版本号，避免出现无据可查的版本事实。",
+  "skill_version": "0.73.0",
+  "skill_version_basis": "minor 位 = SKILL_CHANGELOG 修订序号（本条基线时为「七十三」＝73）；patch 位对应同一修订序号内的「·补」条目（如「五十三·补」）；major 位固定 0，待对外发布时由人工提升。不采用未经验证的语义化版本号，避免出现无据可查的版本事实。",
   "versioning_since": "2026-09-18",
   "versioning_purpose": "使技能包输出可复现、可回滚、可 diff。此前追溯只能靠 SKILL_CHANGELOG 的中文修订序号，且真源不在任何版本控制下。",
 

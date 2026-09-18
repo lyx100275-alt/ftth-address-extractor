@@ -26,6 +26,7 @@
 """
 import argparse
 import json
+import os
 import re
 import sys
 from collections import OrderedDict
@@ -36,25 +37,12 @@ except ImportError:
     print("缺少 openpyxl：请先 pip install openpyxl")
     sys.exit(1)
 
-CN = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
-      "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
-      "十三": 13, "十四": 14, "十五": 15, "十六": 16, "十七": 17,
-      "十八": 18, "十九": 19, "二十": 20, "二十一": 21, "二十二": 22}
-
-
-def cn2num(s):
-    """中文数字 → 整数（支持 一/十/十一/二十/二十一 …）"""
-    s = s.strip()
-    if not s:
-        return None
-    if s in CN:
-        return CN[s]
-    m = re.fullmatch(r"([一二三四五六七八九])?十([一二三四五六七八九])?", s)
-    if m:
-        return (CN[m.group(1)] if m.group(1) else 1) * 10 + (CN[m.group(2)] if m.group(2) else 0)
-    if re.fullmatch(r"\d+", s):
-        return int(s)
-    return None
+# 中文数字换算（`cn2num`）已上提为**共享实现**（2026-09-18）：全技能只保留
+# `ftth_common.cn2num` 一份，此处保留同名绑定，调用点（norm_floor 等）无需改动。
+# 上提理由：该逻辑原先仅存在于本脚本，任何新脚本要用就只能再抄一份 ——
+# 「同一逻辑多份实现必然漂移，且漂移后没有任何东西会报错」是本技能反复踩过的坑。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ftth_common import cn2num  # noqa: E402
 
 
 def norm_floor(name):
