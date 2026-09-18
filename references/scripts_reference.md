@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: '822f8db2-6ad9-48a4-b5e8-af0bfa5573e5'
+  PropagateID: '822f8db2-6ad9-48a4-b5e8-af0bfa5573e5'
+  ReservedCode1: 'd8a39163-faa1-4dde-ba3f-0509f90aa61f'
+  ReservedCode2: 'd8a39163-faa1-4dde-ba3f-0509f90aa61f'
+---
+
 # 脚本参数参考（外移自 SKILL.md，2026-09-16 瘦身）
 
 > 全部脚本均支持 `--help`；本表为主要参数速查。SKILL.md 只留脚本名+一句话职责。
@@ -62,7 +73,7 @@
 | `gen` | gen_addressbook | — | 可选 | — | — | **必需** | 可选 | — | — | — | — |
 | `verify-truth` | verify_coverage_truth | — | 可选 | — | — | — | — | — | — | — | `xlsx` `covjson` |
 | `split-band` | split_bands | **必需** | — | — | — | — | — | — | — | — | — |
-| `pipeline` | 串跑 6 个子命令 | **必需** | — | — | — | — | — | — | — | — | 见下方专节 |
+| `pipeline` | 串跑 8 个阶段 | **必需** | — | — | — | — | — | — | — | — | 见下方专节 |
 
 **同义参数（2026-09-16 统一；两种写法等价，推荐左侧）**
 
@@ -83,6 +94,7 @@
   可用 `--set "楼栋/单元/楼层=户数"` 简写代替清单文件。见下方专节。
 - `--profile` 的含义分两档：`parse` / `coverage` / `coverage-vshape` 上是**门禁**（`unknown` 信号 ⇒ rc=2 中止）；
   `count` / `count-box` 上**仅接受不报错**，不做门禁。
+- `gen --addr` 留空（前5级地址不填）时，**PowerShell 会丢弃空字符串参数**：`--addr ""` 传给原生 exe 后 argparse 报 `expected one argument`，无论经 `ftth.cmd` 启动器还是直调 `python.exe` 均如此（PowerShell 对 native 调用的已知行为，非脚本缺陷）。**变通**：传 `--addr ",,,,,,"`（逗号分隔的空值串），脚本内部 `split` 后得空列表，效果等同留空。
 
 ### 各子命令可直接抄的完整示例
 
@@ -119,6 +131,8 @@ $T  = "C:\...\.temp\<项目>"
 
 # 8) inspect —— 出表前一体化闭合核查（豁免 --dxf，只吃上游 JSON）
 & $PY "$SK\scripts\ftth.py" inspect --parse "$T\parse.json" --coverage "$T\coverage.json" --geom "$D.geom.json" --json "$T\inspect.json"
+#    有图签读数时追加 --titleblock "$T\titleblock.json"，C10 才做「图签 vs 系统图」逐栋互证；
+#    不传则 C10 判 SKIP 并写明「本次未做交叉校验」（SKIP ≠ 通过）
 
 # 9) assemble —— 出表输入 JSON 组装（count-box 路线；豁免 --dxf；独有必填 --count/--col-map）
 & $PY "$SK\scripts\ftth.py" assemble --count "$T\count_box.json" --col-map "0=1#楼/1单元;1=2#楼/1单元,2#楼/2单元" --coverage "$T\coverage.json" --out "$T\assembly.json"
@@ -166,7 +180,7 @@ $T  = "C:\...\.temp\<项目>"
 | `read_titleblock_households.py` | 图签形态栋级入户规模读取（`N层/M户`+`N单元` 成对标注）。退出码 0 正常；1 参数/信号缺失；2 比对不一致；**3 提取不完整（有楼名零层户数据，禁止当完整结果用，`--allow-partial` 可放行）** |
 | `gen_9level_addressbook.py` | 九级地址树出表 |
 | `probe_titleblock_tolerances.py` | 图签几何容差量测（缺省自适应，推定值写入结果 JSON） |
-| `inspect_closure.py` | 出表前一体化闭合核查 C1~C7（`ftth.py inspect` 可调度；只读 JSON，豁免 `--dxf`） |
+| `inspect_closure.py` | 出表前一体化闭合核查 C1~C10（`ftth.py inspect` 可调度；只读 JSON，豁免 `--dxf`） |
 | `ftth_batch.py` | **多图批量编排**（probe→parse→coverage→合并→总览；契约见下 §批量编排） |
 | `ledger_state.py` | **状态台账（会话侧）**：理解快照 / 裁决台账 / 别名台账三本台账的读写载体（子命令 `init`/`snapshot-set`/`snapshot-get`/`ruling-add`/`alias-add`/`pending`/`check`）。退出码：0 正常；**2 有未裁决项或别名归属冲突**；3 未初始化 / 台账损坏 / 参数错误。口径见 [operations_discipline.md](operations_discipline.md) §六~§九 |
 
@@ -421,7 +435,7 @@ ODA 转换由用户完成。
 
 ## 流水线 `pipeline`（2026-09-17 新增）
 
-一条命令串跑 `geom → probe → plan → parse → coverage → inspect`。各阶段以子进程直调 `ftth.py`，
+一条命令串跑 `geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → inspect`（以 `ftth.py` 的 `_PIPE_STAGES` 为准）。各阶段以子进程直调 `ftth.py`，
 **不再经 `ftth.cmd` / `_launch.py`**，固定启动开销只付一次。
 
 ```bat
@@ -436,12 +450,18 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
 | 参数 | 必需 | 含义 |
 |---|---|---|
 | `--dxf` | **必需** | 输入 DXF |
-| `--outdir` | **必需** | 产物目录；各阶段用固定文件名落在此处（`config.json` / `profile.json` / `parsed.json` / `coverage.json` / `inspect.json`），**之后仍可单条命令接着跑，或重跑其中一段** |
+| `--outdir` | **必需** | 产物目录；各阶段用固定文件名落在此处（`config.json` / `profile.json` / `titleblock.json` / `fxmap.json` / `fx_locations.json` / `unit_box_gaps.json` / `parsed.json` / `coverage.json` / `inspect.json`），**之后仍可单条命令接着跑，或重跑其中一段** |
 | `--project-dir` | 建议 | 透传给 `plan`，用于检测《楼宇信息采集表》。**不传会让 `intake_table` 留 `unknown`** |
 | `--profile` | 可选 | 复用指定画像；默认 `<outdir>/profile.json` |
-| `--stop-at` | 可选 | 跑到该阶段为止（`geom` / `probe` / `plan` / `parse` / `coverage` / `inspect`，默认 `inspect`）；分阶段调试用 |
+| `--stop-at` | 可选 | 跑到该阶段为止（`geom` / `probe` / `plan` / `titleblock` / `fxmap` / `fx_locations` / `unit_gaps` / `parse` / `coverage` / `inspect`，默认 `inspect`）；分阶段调试用 |
 | `--reuse-geom` | 可选 | 几何缓存比 DXF 新时直接复用，不重跑 `dump_geom` |
 | `--quiet` | 可选 | 各阶段输出写 `<outdir>/logs/<阶段>.log`，不刷屏 |
+
+> **`titleblock` 阶段 + 图层参数按子命令分派**（2026-09-18 实跑新增/修复）——
+> 前者产出 C10 的输入（`read_titleblock_households.py` → `<outdir>/titleblock.json`），
+> **非 0 退出不中止主链路**但 C10 随之判 SKIP；后者说明 `--wire-layer` / `--fx-symbol-layer` /
+> `--bldg-map` **只有 `coverage` 消费**，传给 `coverage-vshape` 一律 `unrecognized arguments`
+> **直接 rc=2**。细则见 [pipeline_details.md §17](pipeline_details.md)。
 
 **语义边界（刻意约束，勿放宽）**
 
@@ -496,13 +516,14 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
 | `count_box_icons.py` | **户数统计（家居配线箱图标法）**：图标贴皮线末端判据，平面图同名图标自动分离 |
 | `analyze_coverage.py` | 覆盖范围判定（竖干连续体 + 物理断口，输出线索非结论） |
 | `analyze_coverage_vshape.py` | 覆盖范围判定（皮线米数 V 形：谷底=安装层，只读文字） |
-| `inspect_closure.py` | **出表前一体化闭合核查（Step 2 首步）**：C1~C7 一次跑完 |
+| `inspect_closure.py` | **出表前一体化闭合核查（Step 2 首步）**：C1~C10 一次跑完。C5 登记「有刻度但无户数」的层行；C10 用 `--titleblock` 做图签第二来源逐栋比对（2026-09-18 新增） |
 | `verify_coverage_truth.py` | 用已定稿地址表反查覆盖线索（回归验收门禁） |
 | `gen_addressbook.py` | 解析JSON+用户裁决 → 每户一行xlsx（覆盖 JSON 双形兼容、格式自动检测） |
 | `merge_json.py` | 多楼栋解析JSON合并 |
 | `ftth_batch.py` | **多图批量编排**：多DXF → 逐图 probe→parse→coverage（自动 --config 串联）→ 合并 → 总览 |
 | `extract_fx_map.py` | 分纤箱总图FX映射提取（`--probe` 自带推荐） |
 | `extract_fx_locations.py` | 箱位直读标注提取（安装层独立第二来源） |
+| `check_unit_box_gaps.py` | **探查期「单元 × 箱清单」交叉清点**（`unit_gaps` 阶段）：骨架与箱清单双向差集，提前暴露「某单元没分纤箱」；**任一侧来源缺席即判 `unresolved`、不产生 pending**；产物 `unit_box_gaps.json` |
 | `split_units.py` | 多单元楼层户数拆分 |
 | `split_bands.py` | **多地块按 y 带裁剪子 DXF（split-band）**：同名楼分带解析前置，空带/带重叠守卫 |
 | `count_hdd_icons.py` | **兼容 shim（勿删）**：`runpy` 转发到 `count_box_icons.py`，保留旧脚本名调用；`count-hdd` 子命令别名同理 |

@@ -769,6 +769,190 @@ def parse_bldg_nums(text, expand_ranges=False):
     return parse_bldg_nums_ex(text, expand_ranges=expand_ranges)[0]
 
 
+def pending_items_from_rulings(rulings):
+    """「需人工裁决」清单 → [(对象列表, 是否阻塞)]，供 judge_pending_scope 消费。
+
+    `阻塞` 语义（2026-09-18 立）：脚本**已自行处置完毕**的提示（显式 ``阻塞=False``，
+    或事项名里写明「已排除」）只作可见性登记，**不构成「结论待裁决」**，不得据以判
+    ``result_confirmation=pending``。
+    """
+    out = []
+    for _x in (rulings or []):
+        _obj = _x.get("对象")
+        _objs = _obj if isinstance(_obj, (list, tuple)) else [_obj]
+        _blk = _x.get("阻塞")
+        if _blk is None:
+            _blk = "已排除" not in str(_x.get("事项") or "")
+        out.append(([str(_o) for _o in _objs], bool(_blk)))
+    return out
+
+
+# ---------- 裁决项对象串的「分段」与「作用范围」（全技能唯一实现，2026-09-18） ----------
+_UNIT_SEG_RE = re.compile(r'^[0-9一二三四五六七八九十]+单元$')
+_UNIT_TAIL_RE = re.compile(r'([0-9一二三四五六七八九十]+单元)\s*$')
+_BOX_SEG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9#\-_.]*$')
+_BLDG_SEG_RE = re.compile(r'[楼图]')
+
+
+def _is_box_seg(seg):
+    """段是否形如分纤箱编号：纯字母/数字/`#-_.`，不含中文 ⇒ `4#楼` 这类楼栋段不算。"""
+    return bool(_BOX_SEG_RE.match(str(seg or '').strip()))
+
+
+def _is_bldg_seg(seg):
+    """段是否形如楼栋：含 `楼`/`图` 特征字，且不是 `N单元`（`7#楼1单元` 归单元段）。"""
+    s = str(seg or '').strip()
+    return bool(s) and not _UNIT_SEG_RE.match(s) and bool(_BLDG_SEG_RE.search(s))
+
+
+def _unit_seg_of(name):
+    """从名称里抽出**单元段**：`7#楼1单元`→`1单元`；`1单元`→`1单元`；`4#配套楼`→``。
+
+    竖线法的单元名会把楼号一并带上（`7#楼1单元`），V 型法只有单元段（`1单元`）；
+    两侧都归一到单元段再比，同一对象串才能对上两种命名习惯。
+    """
+    m = _UNIT_TAIL_RE.search(str(name or '').strip())
+    return m.group(1) if m else ''
+
+
+def parse_unit_key(text, expand_ranges=False):
+    """「楼栋[单元]」串 → 归属键 ``(楼栋号, 单元号)``（**全技能唯一实现**，2026-09-18）。
+
+    用途：把不同来源的楼栋/单元写法归一到**同一个可比键**，供跨来源清点使用
+    （探查期「单元 × 箱清单」交叉清点即第一个消费者）。两侧命名习惯实测并存：
+      · 箱位直读标注 ``N号楼M单元K层``（extract_fx_locations，楼号/单元号已分开存字段）；
+      · 对照表 ``N#楼M单元``（extract_fx_map 的 `单元` 字段，楼号与单元号**紧贴无分隔**）；
+      · 图签证据坐标 ``M单元``（只有单元段，楼栋由所在键给出）。
+
+    实现**必须复用**既有解析器，不得另写正则（本技能已因「同一逻辑多份实现」漂移过多次）：
+      · 楼号走 :func:`parse_bldg_nums_ex`（覆盖 `N#楼` / `N号楼` / `N#配套楼` / 共享标题）；
+      · 单元号取串尾 `N单元`（``_UNIT_TAIL_RE``），中文数字走 :func:`cn2num`。
+
+    返回 ``(楼栋号, 单元号)``；**无法判定的一位返回 None，不得用 0 冒充** ——
+    0 会与真实楼号/单元号 0 混淆，把「没解析出来」伪装成「解析成 0 号」。
+
+    注意：多楼号共享标题（``[共享]1-3号楼…``）只取**首个**楼号，其 ``ambiguous``
+    由调用方按 :func:`parse_bldg_nums_ex` 自行登记待裁决 —— 不得静默取首值。
+    """
+    s = str(text or '').strip()
+    if not s:
+        return None, None
+    nums, _amb = parse_bldg_nums_ex(s, expand_ranges=expand_ranges)
+    m = _UNIT_TAIL_RE.search(s)
+    u = cn2num(m.group(1)[:-2]) if m else None      # 去掉尾部「单元」二字
+    return (nums[0] if nums else None), u
+
+
+def split_ruling_object(text):
+    """裁决项对象串 → 分段列表（**楼栋段 / 单元段 / 编号段**，后两段可缺）。
+
+    兼容两种实测写法（2026-09-18 统一）：
+      · 斜杠式 `楼栋[/单元][/编号]` —— 竖线法产出，如 `4#配套楼/FX22#`、`7#楼1单元/FX17#`；
+      · 空格式 `楼栋[ 单元][ 编号]` —— V 型法产出，如 `[共享]1-3号楼综合布线系统图 1单元`。
+
+    实现要点（都踩过）：**不能按 `/` 或空格无条件全拆** —— 楼栋名自身就含这两种分隔符
+    （`3/6号楼综合布线系统图` 是共享标题的常见写法，楼栋名也可能含空格）。故一律
+    **从尾部**最多剥两段，且只剥「`N单元`」「纯编号」两种已确认形态，剩下的一整段
+    才是楼栋名。只认斜杠式会让空格式对象**永远关联不上** ⇒ 裁决项静默放行、结果判
+    settled —— 属「未裁决却进成品」的假绿灯，比假 FAIL 更危险。
+    """
+    s = str(text or '').strip()
+    if not s:
+        return []
+    segs, rest = [], s
+    for _ in range(2):
+        m = re.match(r'^(.*?)[\s/]+(\S+)$', rest)
+        if not m:
+            break
+        tail = m.group(2)
+        if not (_UNIT_SEG_RE.match(tail) or _is_box_seg(tail)):
+            break
+        segs.insert(0, tail)
+        rest = m.group(1).strip()
+    segs.insert(0, rest)
+    return segs
+
+
+def parse_ruling_scope(text):
+    """对象串 → `(楼栋段, 单元段, 编号段)`，缺的段给空串。
+
+    与 :func:`split_ruling_object` 的分工：后者只做**切分**，本函数负责**归段** ——
+    把「楼栋与单元写在一段」的 `7#楼1单元` 拆成 `('7#楼', '1单元', '')`，
+    把只有楼栋的 `4#楼` 归成 `('4#楼', '', '')`。
+    """
+    parts = split_ruling_object(text)
+    if not parts:
+        return '', '', ''
+    box = ''
+    if len(parts) >= 2 and _is_box_seg(parts[-1]):
+        box = parts[-1]
+        parts = parts[:-1]
+    unit = ''
+    if parts and _UNIT_SEG_RE.match(parts[-1]):
+        unit = parts[-1]
+        parts = parts[:-1]
+    if not unit and parts:
+        m = _UNIT_TAIL_RE.search(parts[-1])
+        if m and len(parts[-1]) > len(m.group(1)):
+            unit = m.group(1)
+            parts[-1] = parts[-1][:len(parts[-1]) - len(unit)].strip()
+            if not parts[-1]:
+                parts = parts[:-1]
+    return ' '.join(p for p in parts if p), unit, box
+
+
+def judge_pending_scope(objs, unit_name, box_id=None, bldg_key=None):
+    """裁决项是否作用于「本单元全部箱」（第 1 位）/「本箱」（第 2 位）。
+
+    **这是覆盖类脚本判 ``result_confirmation`` 的唯一定义**（2026-09-18 统一）。
+    两个覆盖脚本（竖线法 / V 型法）此前各写一份，漂移后 V 型法那份落后为**子串包含**
+    且**只认斜杠式**对象串，两处都会错：
+      · 楼栋名形态不同即失配 —— ``"4#楼" in "4#配套楼/FX22#"`` 为 False
+        ⇒ 裁决项**关联不上、被静默放行**；
+      · 子串会跨号误伤 —— ``7#楼`` 是 ``17#楼`` 的子串 ⇒ 邻栋的问题算到本栋头上。
+
+    作用范围按对象串里**实际写了几段**定三级：
+
+      · 只有楼栋段（`4#楼`、`4#楼[图幅1]`）⇒ **楼栋级**：该楼栋全部单元全部箱置 pending
+        —— 整栋的几何前提存疑时，单元级结论连带不可信；
+      · 楼栋段 + 单元段（`4#楼 1单元`、`7#楼1单元`）⇒ **单元级**：该单元全部箱；
+      · 再带编号段（`4#楼 1单元 FX9#`、`7#楼1单元/FX17#`）⇒ **箱级**：只作用于该箱，
+        不扩散到同单元其它箱。
+
+    ``bldg_key`` 是本单元所属楼栋的键（调用方应传）：用于**跨楼栋不误伤** ——
+    字符串相同，或**楼号相同**（该口径是本技能既有约定，见
+    ``analyze_coverage.judge_object_name``）。不传时退化为「只认对象首段与本单元名
+    完全相同」，即**不猜楼栋**（保守，不会误伤别栋）。
+
+    返回 ``(是否单元级命中, 是否箱级命中)``。
+    """
+    u = str(unit_name or '').strip()
+    uk = str(bldg_key or '').strip()
+    u_unit = _unit_seg_of(u)
+    u_bnum = bldg_num(uk or u)
+    for _o in objs:
+        _b, _un, _bx = parse_ruling_scope(_o)
+        if not (_b or _un or _bx):
+            continue
+        # ① 楼栋段校验：字符串相同，或楼号相同（后者是既有口径）
+        if _b:
+            _same = (_b == uk) if uk else (_b == u)
+            if not _same and u_bnum and bldg_num(_b) == u_bnum:
+                _same = True
+            if not _same:
+                continue
+        # ② 单元段：空 = 楼栋级（作用于本楼栋全部单元）；非空 = 必须命中本单元段
+        if _un and (not u_unit or _un != u_unit):
+            continue
+        # ③ 编号段：有则只作用于该箱
+        if _bx:
+            if box_id is not None and _bx == str(box_id):
+                return False, True
+            continue
+        return True, True
+    return False, False
+
+
 def first_group(m):
     """安全取匹配对象的捕获组 1：正则**无捕获组**时返回 None，不抛 IndexError。
 
@@ -964,15 +1148,285 @@ def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
                               % (_n, " / ".join("%.0f" % _x for _x in sorted(_xs)), len(_xs)))
             _lines.append("锚点池按楼名去重，同名楼会互相覆盖（保留先出现者，其余同名楼整栋静默丢失），"
                           "全图解析的楼栋归属不可信。")
-            _lines.append("处理：这是多地块图纸 —— 用 split-band 子命令按 y 带切出各地块子 DXF "
-                          "（ftth.py split-band --dxf <全图> --out-dir <目录> --band 「名称:ymin:ymax」），"
+            _lines.append("处理：这是多地块图纸 —— 用 split-band 子命令按 y 带切出各地块子 DXF，"
                           "再对每个子图分别跑 parse / coverage 等下游子命令。")
+            _lines.append("  · 图上有「N块地」类标注（已实测）时："
+                          "`ftth.py split-band --auto --config <config.json> --dxf <全图> "
+                          "--out-dir <目录>` —— 由实测锚点自动算分带窗口，先出方案（含每个"
+                          "锚点的原文与坐标），核对后再加 --yes 执行；")
+            _lines.append("  · 图上无该类标注时：人工量出各带图名 y 后 "
+                          "`--band 「名称:ymin:ymax」`（上界取上邻带标题 y、下界取本带标题 y，"
+                          "**不得取相邻标题中点**）。")
             raise MultiPlotDuplicateAnchorError("\n".join(_lines))
     if log and anchors:
         log.info("识别到的楼栋锚点:")
         for k, v in sorted(anchors.items(), key=lambda x: x[1]["x"], reverse=True):
             log.info(f'  {k}: ({v["x"]}, {v["y"]})')
     return anchors
+
+
+# ---------- 多地块分带锚点（2026-09-18 立，唯一权威） ----------
+# 背景（实测）：一张 DXF 含多个独立地块、各块楼号从 1 起（同名楼）时，全图 parse 会串号，
+#   find_bldg_anchors 的 MultiPlotDuplicateAnchorError 守卫会拦下，既定补救是
+#   `ftth.py split-band` 按 y 带切子图。**但 --band 只能人工给 y**：图上早已实测到的
+#   「N块地」标注（probe 的 plot_band_annotations）此前**没有任何下游消费** ——
+#   规则写了（铁律⑦）、尺寸量了（probe）、执行环节零接线，人被迫手搓 8 条 band spec。
+#   本模块把「锚点提取 + 带窗口计算」收成唯一实现，供 probe 与 split_bands.py 共用，
+#   禁止任何一方另写一套判据（副本漂移是历次矛盾的根源）。
+#
+# 锚点判据（客观、可复现、与项目名解耦）：文字去除首尾空白后**恰好等于**「编号 + 地块词」。
+#   据此自动排除两类图上真实存在的干扰项：
+#     ① 「N块地弱电机房」—— 带附加字的场所标注（x 常落在住宅图内，非图幅锚点）；
+#     ② 「5块地、8块地、9块地」—— 跨地块合并标注（编号不止一个）。
+#
+# 锚点与本带内容的位置关系**不预设**：铁律⑦ 的模型是「本带内容画在标题上方」，
+#   但实测存在相反形态（锚点在本带内容之上）。故逐条实测取向（最近楼栋标题在本锚点的
+#   下方还是上方），**全部一致才采纳**；取向不一致即报人（rc=2），不猜、不静默择一。
+PLOT_BAND_WORDS = ("块地", "地块", "块区", "组团", "分区")
+_PLOT_BAND_RE = re.compile(
+    r"^\s*(\d+(?:\s*[-–]\s*\d+)?)\s*(%s)\s*$" % "|".join(PLOT_BAND_WORDS))
+# 同编号锚点判为「同一处」的 y 容差（绝对，不随图幅缩放）
+_PLOT_ANCHOR_SAME_Y_TOL = 10.0
+
+
+def _txt_fields(t):
+    """兼容两种文字实体形态：collect_texts() 的 dict 与 dump_geom 的 [层,x,y,文] 四元组。"""
+    if isinstance(t, (list, tuple)):
+        if len(t) >= 4:
+            return str(t[0]), float(t[1]), float(t[2]), str(t[3])
+        return None, None, None, None
+    if isinstance(t, dict):
+        return (t.get("层"), t.get("x"), t.get("y"),
+                str(t.get("内容") if t.get("内容") is not None else t.get("text") or ""))
+    return None, None, None, None
+
+
+def find_plot_band_anchors(texts, max_len=16):
+    """提取多地块分带锚点（客观判据，见上方注释）。
+
+    返回 (anchors, excluded, hits)：
+      anchors  —— [{"编号","文字","x","y","层"}]，按 y 降序；**同编号只保留一条**
+      excluded —— [{"文字","x","y","层","原因"}]，被排除者逐条给原因（不得静默丢）
+      hits     —— 全部「含地块词」的命中（含被排除者），供人工核对
+
+    排除规则（写死为客观判据，不含项目特有判断）：
+      · 文字含附加字（不严格等于「编号+地块词」）→ 原因「带附加字，非图幅级锚点」
+      · 一段文字里出现多个地块编号 → 原因「跨地块合并标注，编号非唯一」
+      · 同编号出现在多个 y（间距 > 容差）→ 原因「同编号多位置，锚点不唯一」
+      · 文字过长（> max_len）→ 不入 hits（与探针原口径一致）
+    """
+    hits, anchors_by_num, excluded = [], {}, []
+    for t in texts:
+        lay, x, y, s = _txt_fields(t)
+        if s is None:
+            continue
+        s = s.strip()
+        if not s or len(s) > max_len:
+            continue
+        if not any(w in s for w in PLOT_BAND_WORDS):
+            continue
+        item = {"文字": s, "x": round(x, 1), "y": round(y, 1), "层": lay}
+        m = _PLOT_BAND_RE.match(s)
+        if not m:
+            # 含地块词但不严格等于「编号+地块词」：带附加字 / 组合标注
+            nums = re.findall(r"\d+(?:\s*[-–]\s*\d+)?", s)
+            why = ("跨地块合并标注，编号非唯一（%s）" % "/".join(n.replace(" ", "") for n in nums)
+                   if len(nums) > 1 else "带附加字，非图幅级锚点")
+            excluded.append(dict(item, 原因=why))
+            hits.append(item)
+            continue
+        num = m.group(1).replace(" ", "")
+        item["编号"] = num
+        hits.append(item)
+        prev = anchors_by_num.get(num)
+        if prev is None:
+            anchors_by_num[num] = item
+        elif abs(prev["y"] - item["y"]) > _PLOT_ANCHOR_SAME_Y_TOL:
+            # 同编号多处不同 y：锚点不唯一，两条都剔除并报人（不静默择一）
+            excluded.append(dict(item, 原因="同编号多位置，锚点不唯一（已有 y=%.1f）" % prev["y"]))
+            excluded.append(dict(prev, 原因="同编号多位置，锚点不唯一（另有 y=%.1f）" % item["y"]))
+            anchors_by_num.pop(num, None)
+    anchors = sorted(anchors_by_num.values(), key=lambda a: -a["y"])
+    return anchors, excluded, hits
+
+
+def plot_band_windows(anchors, y_top, y_bot, cut_empty_tol=2000.0, all_texts=None):
+    """由分带锚点算窗口。返回 (windows, info, err, warns)。
+
+    windows —— [{"名称","ymin","ymax","锚点y","锚点x","锚点文字","锚点层","边界依据"}]
+    info    —— {"切点":[...], "取向说明":str, "y_top":.., "y_bot":..}
+    err     —— 非 None 表示无法判定，调用方须按 rc=2 报人（不得猜）
+    warns   —— [str,...] 独立核对发现的疑点（**不阻塞**，但必须报给人，不得当绿灯）
+
+    切点口径（实测立，2026-09-18）：
+      每块地在本带图区内部有一处「N块地」类锚点（其 y 按地块先后单调排开）。
+      带与带的切点取**相邻锚点 y 的中点**；首带上界取图幅顶、末带下界取图幅底。
+      · 依据：只用「锚点先后顺序 + 相邻中点」这两个客观量，**不预设内容画在锚点
+        上方还是下方**，也不依赖锚点与任一标题的固定偏移。
+      · 反例（实测）：直接以锚点 y 作切点，会把下邻带的场所标注吞进本带
+        （实测 4 条 / 带）；改中点后 0 条越界。
+      · 与铁律⑦ 的关系：铁律⑦ 的「带的下界取本带**楼栋标题** y」适用于**没有**
+        地块锚点的图；本图有锚点，锚点层级高于楼栋标题，故按锚点切。
+    取向说明仅作信息，不参与切分。
+    """
+    if not anchors:
+        return [], {}, "未提取到任何分带锚点（文字形态可能不在地块词表内，请人工补充词表）", []
+    if y_top is None or y_bot is None:
+        return [], {}, "图幅上下界取不到，无法定分带边界", []
+    if y_top <= y_bot:
+        return [], {}, "图幅上下界异常（y_top <= y_bot）", []
+    if len(anchors) == 1:
+        return [], {}, ("只提取到 1 个分带锚点（%s）—— 单一地块无需分带；"
+                        "若确为多地块请人工补充词表或改用 --band" % anchors[0]["文字"]), []
+
+    ys = [a["y"] for a in anchors]          # 已按 y 降序
+    cuts = [(ys[i] + ys[i + 1]) / 2.0 for i in range(len(ys) - 1)]
+    wins = []
+    for i, a in enumerate(anchors):
+        ymax = y_top if i == 0 else cuts[i - 1]
+        ymin = y_bot if i == len(anchors) - 1 else cuts[i]
+        wins.append({"名称": a["文字"], "ymin": ymin, "ymax": ymax,
+                     "锚点y": a["y"], "锚点x": a["x"], "锚点文字": a["文字"],
+                     "锚点层": a.get("层"),
+                     "边界依据": ("上界=图幅顶" if i == 0 else "上界=锚点「%s」与「%s」的中点"
+                                  % (anchors[i - 1]["文字"], a["文字"]))
+                                 + "；"
+                                 + ("下界=图幅底" if i == len(anchors) - 1
+                                    else "下界=锚点「%s」与「%s」的中点"
+                                         % (a["文字"], anchors[i + 1]["文字"]))})
+    bad = [w["名称"] for w in wins if not (w["ymin"] < w["ymax"])]
+    if bad:
+        return [], {}, "以下分带窗口无效（ymin>=ymax）：%s" % "/".join(bad), []
+
+    info = {"切点": cuts, "y_top": y_top, "y_bot": y_bot,
+            "取向说明": "（本节不预设取向；切点由锚点中点定）"}
+    # 取向仅作信息：锚点与其最近楼栋标题的上下关系
+    warns = []
+    if all_texts:
+        warns = verify_band_split(wins, anchors, all_texts, cut_empty_tol)
+    return wins, info, None, warns
+
+
+def verify_band_split(windows, anchors, texts, cut_empty_tol=2000.0):
+    """独立核对分带结果（不阻塞，只报疑点）。返回 [str,...]。
+
+    三项客观核对：
+      ① 切点空置：切点 y ± 容差内不得有文字 —— 有则说明切点落在内容里（会切坏）。
+      ② 带内自证：文字形如「N块地…」时，其所在带必须是编号 N 那块地的带。
+         图纸自身标注与几何切分互相印证；不一致=图纸标注陈旧 或 切点错，须人看。
+      ③ 楼栋标题不跨带：每条楼栋标题的「最近锚点」与「所在带」必须一致。
+         （最近锚点由标题 y 判，所在带由窗口判 —— 两条独立路径互证。）
+    """
+    warns = []
+    # 归一化为 (层,x,y,文)：兼容 collect_texts 的 dict 与 geom 的四元组
+    _T = []
+    for t in texts:
+        lay, x, y, s = _txt_fields(t)
+        if s is not None and y is not None:
+            _T.append((lay, _f(x), _f(y), s))
+    # ① 切点空置
+    for c in [w["ymin"] for w in windows[:-1]]:
+        near = [t for t in _T if abs(t[2] - c) <= cut_empty_tol]
+        if near:
+            warns.append("切点 y=%.1f 附近 %d 条文字（最近 y=%.1f「%s」）——"
+                         "切点可能落在内容里，请核对分带"
+                         % (c, len(near), near[0][2], str(near[0][3])[:20]))
+    # ② 带内自证（用图纸自身的「N块地…」标注）
+    import re as _re
+    for i, w in enumerate(windows):
+        wname = str(w["锚点文字"]).replace(" ", "")
+        for t in _T:
+            s = str(t[3]).strip()
+            m = _re.match(r"^(\d+(?:\s*[-–]\s*\d+)?)\s*(?:%s)" % "|".join(PLOT_BAND_WORDS), s)
+            if not m or s == wname:
+                continue
+            # 合并标注（如「5块地、8块地、9块地」）编号非唯一，不参与自证（已独立报过）
+            if len(_re.findall(r"\d+(?:\s*[-–]\s*\d+)?", s)) > 1:
+                continue
+            if w["ymin"] <= t[2] < w["ymax"] and abs(t[2] - w["ymin"]) > cut_empty_tol:
+                num = m.group(1).replace(" ", "")
+                if not wname.startswith(num):
+                    warns.append("带「%s」内出现标注「%s」(y=%.1f, x=%.1f) —— "
+                                 "该标注自述属 %s 块地，与几何切分不符；"
+                                 "多为图纸标注陈旧，请人工核对（不得当作已核）"
+                                 % (w["名称"], s, t[2], t[1], num))
+    # ③ 楼栋标题：最近锚点 vs 所在带
+    for t in _T:
+        if not is_bldg_title_text(str(t[3])):
+            continue
+        y = t[2]
+        near = min(range(len(anchors)), key=lambda k: abs(anchors[k]["y"] - y))
+        inside = next((k for k, w in enumerate(windows) if w["ymin"] <= y < w["ymax"]), None)
+        if inside is not None and inside != near:
+            warns.append("楼栋标题「%s」(y=%.1f) 最近锚点是「%s」，却落在带「%s」——"
+                         "两条独立路径不一致，请核对分带"
+                         % (str(t[3])[:24], y, anchors[near]["文字"], windows[inside]["名称"]))
+    return warns
+
+
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def ent_y(e):
+    """取实体代表性 y 坐标（文字/INSERT 用插入点，线段/多段线用顶点均值）。
+
+    唯一实现在此（2026-09-18 上收）：split_bands 与任何需要「按 y 分带」的脚本
+    必须共用本函数，否则同一个实体在探针与分带两处落到不同带（副本漂移）。
+    """
+    try:
+        t = e.dxftype()
+        if t in ("TEXT", "MTEXT", "INSERT"):
+            return e.dxf.insert.y
+        if t == "LINE":
+            s, p = e.dxf.start, e.dxf.end
+            return (s.y + p.y) / 2.0
+        if t == "LWPOLYLINE":
+            pts = list(e.get_points())
+            return sum(p[1] for p in pts) / len(pts) if pts else None
+        if t == "POLYLINE":
+            try:
+                vs = list(e.vertices)
+                if vs:
+                    return sum(v.dxf.location.y for v in vs) / len(vs)
+            except Exception:
+                pass
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def derive_plot_bands(msp, texts=None, cut_empty_tol=2000.0):
+    """一次算齐「分带锚点 + 分带窗口 + 独立核对」——唯一权威入口。
+
+    探针（写画像）与 split-band（切子图）都必须走本函数，**禁止任一方另算一遍**：
+    两处各算一次必然出现「画像里的窗口」与「实际切的带」不一致，且无人察觉。
+
+    返回 dict：
+      {"锚点":[...], "锚点排除":[...], "命中":[...], "分带窗口":[...],
+       "切点":[...], "y_top":.., "y_bot":.., "疑点":[...], "错误": None|str,
+       "去向": str}
+    """
+    if texts is None:
+        texts = collect_texts(msp, None, ["MTEXT", "TEXT"])
+    anchors, excluded, hits = find_plot_band_anchors(texts)
+    ys = [y for y in (ent_y(e) for e in msp) if y is not None]
+    y_top = max(ys) if ys else None
+    y_bot = min(ys) if ys else None
+    wins, info, err, warns = plot_band_windows(anchors, y_top, y_bot,
+                                               cut_empty_tol=cut_empty_tol,
+                                               all_texts=texts)
+    out = {"锚点": anchors, "锚点排除": excluded, "命中": hits,
+           "分带窗口": wins, "切点": (info or {}).get("切点", []),
+           "y_top": y_top, "y_bot": y_bot, "疑点": warns, "错误": err,
+           "去向": ("%d 个分带窗口 → `ftth.py split-band --auto --dxf <图> "
+                     "--out-dir <目录>`（先出方案，核对后加 --yes）" % len(wins))
+                   if wins else "无可用分带窗口"}
+    return out
 
 
 # ---------- 楼名/楼层工具 ----------
@@ -1023,9 +1477,44 @@ def normalize_bldg_name(name, num):
 
 
 def bldg_num(bldg_name):
-    """从楼名提取数字（如 '1#楼'→1, '2号楼'→2），失败返回 0。"""
+    """从楼名提取数字（如 '1#楼'→1, '2号楼'→2），失败返回 0。
+
+    注意：**失败返回 0 是本函数的既有语义**（调用点众多、依赖该行为），故保留不变；
+    新增代码若需要区分「解析失败」与「真的是 0 号」，请改用
+    :func:`parse_unit_key`（失败时返回 None，不冒充 0）。
+    """
     m = re.search(r"(\d+)", bldg_name)
     return int(m.group(1)) if m else 0
+
+
+# ---------- 中文数字（2026-09-18 上提自 verify_coverage_truth.py，全技能唯一实现） ----------
+# 上提理由：`cn2num` 原先只存在于 verify_coverage_truth.py 一个文件里，任何新脚本要用
+#   就只能再抄一份 —— 「同一逻辑多份实现必然漂移，且漂移后没有任何东西会报错」是本技能
+#   反复踩过的坑（判范围 / 楼号解析均已因此收口为共享实现，见 parse_unit_key）。
+CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+            "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
+            "十三": 13, "十四": 14, "十五": 15, "十六": 16, "十七": 17,
+            "十八": 18, "十九": 19, "二十": 20, "二十一": 21, "二十二": 22}
+
+
+def cn2num(s):
+    """中文数字 → 整数（支持 一 / 十 / 十一 / 二十 / 二十一 …）；无法识别返回 None。
+
+    **不得用 0 冒充失败值** —— 楼号 / 单元号 / 层号里 0 与「解析失败」语义完全不同；
+    失败一律 None，由调用方决定是否登记「未识别」。
+    """
+    s = str(s or "").strip()
+    if not s:
+        return None
+    if s in CN_DIGIT:
+        return CN_DIGIT[s]
+    m = re.fullmatch(r"([一二三四五六七八九])?十([一二三四五六七八九])?", s)
+    if m:
+        return (CN_DIGIT[m.group(1)] if m.group(1) else 1) * 10 + \
+               (CN_DIGIT[m.group(2)] if m.group(2) else 0)
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+    return None
 
 
 def floor_num(fl_name, floor_pattern=None, use_fullmatch=False):

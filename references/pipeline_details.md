@@ -85,11 +85,15 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 
 ## 11. `ftth.py pipeline` 阶段顺序为什么固定
 
-`geom → probe → plan → fxmap → parse → coverage → inspect`，`--stop-at` 的 choices 与之一致。
+`geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → inspect`，`--stop-at` 的 choices 与之一致（**由 `ftth.py` 的 `_PIPE_STAGES` 单一定义**，本节仅为说明 —— 两者不一致时以代码为准并改本节）。
 
 `fxmap` 必须在 `parse` **之前** —— 依据硬约束 ②，parse 与 coverage 都需要总图对照表来定楼栋 / 单元归属；排在其后会变成"先用被明文禁止的方法切完、再拿正确数据去补 coverage"，parse 侧永远 0 箱（实测 C0/C2/C3/C4/C6 全 FAIL）。同一份对照表在 parse（`--bldg-map` + `--fx-map`）与 coverage（`--bldg-map`）两处复用，**一份数据、两处同源**，避免各取各的。
 
 **2026-09-18 收紧**：`fxmap` 阶段仅当画像申报存在真实集中总图对照表（`fx_overview_map=present`）时执行；absent / variant 一律跳过（rc=3），不再产出降级对照表，pipeline 自动不向 parse / coverage 回填 —— 四种方法之外禁止自创来源，见 `ftth.py _pipe_fxmap_gate`。
+
+`fx_locations` 与 `unit_gaps` 同理必须在 `parse` **之前**：前者是安装层的独立第二来源、要在 coverage 交叉校验前备好；后者做「**单元 × 箱清单**」交叉清点，把「某单元没分纤箱」提前暴露（否则只能等 Step 2 覆盖门禁，那时 parse/coverage 已跑完、返工面大）。
+
+**`unit_gaps` 的三态语义（2026-09-18 新增，勿混）**：产物 `<outdir>/unit_box_gaps.json`，`预检结论` 取 `pending`（两侧来源齐备且差集非空，**有疑点要报人**）/ `settled`（齐备且一致）/ `unresolved`（**某侧来源未就绪，本次未判定**）。`unresolved` **不是通过** —— 它只说明探查期没核成，覆盖阶段门禁仍须照跑兜底。该阶段非 0 退出**不中止主链路**（它是预检，不是主数据来源），但必须显式打印。
 
 ## 12. 冷启动 vs 热启动的耗时不可横向比
 
@@ -129,3 +133,48 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 - **完整 schema** 与 `_src` 失效判据（`mtime + size + GEOM_VERSION`，任一变化即缓存失效）见 `references/scripts_reference.md`。
 - **前置约束**：需要**"多段线整组顶点"或"INSERT 块属性"**的脚本必须走 `ftth_common.load_dxf`（pkl 缓存），**不能走 `load_geom`**。
 - **本条的来源**：原在 SKILL.md 「Step 1a」节内，2026-09-18 外移至本文件（SKILL.md 仅保留"三坑"提示与指针）。
+
+## 17. `pipeline` 阶段细则：`titleblock` 与「图层参数按子命令分派」
+
+> 本条从 `scripts_reference.md` 外移（2026-09-18，该文件触 47,000 B 预警线）。
+> 阶段链与参数表仍在 `scripts_reference.md`；此处只放细则。
+
+### 17.1 `titleblock` 阶段（2026-09-18 实跑新增）
+
+**做什么**：画像 `titleblock_annotation = present / variant` 时，调 `read_titleblock_households.py`
+产出 `<outdir>/titleblock.json`（图签第二来源读数：栋级 `N层/M户每层` + `N单元`），
+并由 `inspect` 阶段作为 **C10** 的输入透传（`--titleblock`）。
+
+**为什么要有它**：画像早已把该信号判为 present 并写明「构成三来源协议的第二来源」，
+但 `pipeline` 的阶段列表里没有它、C1~C9 也没有对应检查 —— **规则写在文档里、没有代码执行它**。
+实测某图 7 栋的图签读数与系统图逐栋一致，可这条独立来源验证**从未发生过**。
+
+**行为约定**
+
+| 情形 | 行为 |
+|---|---|
+| 画像申报 `absent` | 该阶段合法缺席，记 rc=3（申报制语义，非错误） |
+| 脚本非 0 退出 | **不中止主链路**（它是校验来源、不是主数据来源），但**显式打印**，且 C10 随之判 **SKIP** —— 「没核」不得呈现成「通过」 |
+| 图层取不到 | **跳过不猜**（不硬编码图层名），同样打印 + C10 SKIP |
+
+**图层取值三级**（2026-09-18 实跑踩坑：只读 config 顶层 `text_layer` 取不到 ——
+实际它嵌在 `suggested_params` 里，于是本阶段静默跳过、C10 白 SKIP，属"修了但没生效"）：
+
+1. `config.json` → `titleblock_layer_candidates.候选图层[0]`
+   （probe **专为该脚本**产出的 advisory 字段，`用途` 字段里写明）；
+2. 回退 `config.json` → `suggested_params.text_layer`（取逗号首项）；
+3. 都取不到 → 跳过并说明。
+
+### 17.2 图层参数按子命令分派（2026-09-18 实跑修复）
+
+`--wire-layer` / `--fx-symbol-layer` / `--bldg-map` **只有 `coverage`（`analyze_coverage.py`）消费**。
+
+`coverage-vshape`（V 型法）的覆盖与楼栋/单元归属**全由文字标注决定**（米数列谷底 / 标题窗口几何），
+连线与符号图层对它无意义 —— 实测给 `coverage-vshape` 传 `--wire-layer BZ` 会得到
+`unrecognized arguments` 并**直接 rc=2**（脚本打印全部可用参数后退出）。
+
+原实现无条件追加这三个参数，只是恰好"画像两个图层都为 null"才未触发；
+换一张 `dedicated_wire_layer = present` 的图即挂。现按 `cov_cmd` 分派，不再一律传。
+
+> **同类缺陷提示**：`--bldg-map` 那处早已按子命令分派，这两处却漏了 ——
+> **只修报出来的那一个，等于留哑弹**。改动图层/对照表参数的传递逻辑前，先 grep 全部同类参数。
