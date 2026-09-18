@@ -1717,6 +1717,116 @@ def compute_bldg_ranges(anchors, total_pad=None):
     return _ranges_from_x_groups(_x_groups([(a[0], a[1]) for a in anchors]))
 
 
+# ---------- 带内 (x,y) 归属 + 共享区间识别（2026-09-18 新增） ----------
+# 病灶（实测）：旧归属是「纯 x 闭区间 + dict 序先到先得」，完全不看 y。它成立的前提是
+#   「x 区间互不重叠」，而这在两种图上不成立：
+#     ① **共享锚点**：一张系统图服务多栋（标题原文 `7#、8#、10#住宅光纤入户系统图`），
+#        `_x_groups` 已把同 x 锚点并组共用同一区间 → 区间内多栋、先到先得者独占，
+#        其余楼栋楼层表整片为空（实测某图 8#/10# 全空、7# 独占 12 条）。
+#     ② **上下分带**：配套楼小图与住宅楼大图 x 上重叠 → 分带后区间可重叠，
+#        纯 x 归属必错（实测某图 9# 楼实体第 1 列落左界外归了 4# 配套楼、
+#        第 2 列超右界成孤儿）。
+# 处置原则：**单候选零回归，多候选才启用新判据** —— 与旧实现只在多候选处分叉。
+def assign_by_xy(x, y, ranges, anchor_y_of=None, eps=1e-6):
+    """按 (x, y) 把点归属到楼栋，返回 (names, reason)。
+
+    参数:
+        x, y: 点坐标
+        ranges: {楼栋名: (xmin, xmax)}
+        anchor_y_of: {楼栋名: 锚点 y}，用于多候选时按 y 就近
+        eps: 边界含入容差（浮点比较）
+
+    返回 (names, reason)：
+        names = [] → 未命中任何区间（孤儿）
+        names = [名] → 唯一归属
+        names = [名1, 名2, ...] → **共享区间**，须克隆给组内全部（不是二选一）
+
+    reason 取值（供调用方分类登记，不得当布尔用）：
+        "x唯一命中"             —— 与旧实现行为逐位一致
+        "共享锚点(同区间N栋)"    —— 一张图服务多栋，按标题原文克隆
+        "y就近(候选N)"          —— 区间重叠，取 |y-锚点y| 最小者（几何测量，非推理）
+        "重叠无y判据(候选N)"     —— **不静默择一**：调用方须登记为待裁决
+        "x未落入任何楼栋区间"    —— 孤儿
+    """
+    hits = [(b, lo, hi) for b, (lo, hi) in ranges.items() if lo - eps <= x <= hi + eps]
+    if not hits:
+        return [], "x未落入任何楼栋区间"
+    if len(hits) == 1:
+        return [hits[0][0]], "x唯一命中"
+    keys = {(round(lo, 6), round(hi, 6)) for _b, lo, hi in hits}
+    if len(keys) == 1:
+        return sorted(b for b, _lo, _hi in hits), "共享锚点(同区间%d栋)" % len(hits)
+    if anchor_y_of and y is not None:
+        have = [(b, lo, hi) for b, lo, hi in hits if anchor_y_of.get(b) is not None]
+        if have:
+            def _dy(h):
+                return (abs(y - anchor_y_of[h[0]]), -(h[2] - h[1]))
+            best = min(have, key=_dy)
+            return [best[0]], "y就近(候选%d)" % len(hits)
+    # 多候选、且 y 不可比 —— 不猜，交调用方报裁决
+    return [], "重叠无y判据(候选%d)" % len(hits)
+
+
+def group_shared_ranges(ranges):
+    """{名:(lo,hi)} → [{"lo":..,"hi":..,"names":[...]}]，只保留 >=2 栋的共享组（x 区间完全相同）。
+
+    用途：出表前显式登记「哪几栋共用同一 x 区间」——共享意味着这些楼的实体/文字
+    在几何上不可分，正解是克隆（一张系统图服务多栋）或人工指定，**不得先到先得**。
+    """
+    g = {}
+    for n, (lo, hi) in ranges.items():
+        g.setdefault((round(lo, 6), round(hi, 6)), []).append(n)
+    return [{"lo": k[0], "hi": k[1], "names": sorted(v)}
+            for k, v in sorted(g.items()) if len(v) >= 2]
+
+
+def bldg_range_diagnostics(ranges, items, featured=None, anchor_y_of=None):
+    """区间自检：每栋区间宽、归属条数、x 跨度，以及**孤儿明细**（不猜、只登记）。
+
+    参数:
+        ranges: {名:(lo,hi)}
+        items: [{"x":..,"y":..,"内容":..}, ...]（待归属的物件；仅读 x/y/内容）
+        featured: 判「业务实体」的函数（内容 → bool）；None 则全视为非业务
+        anchor_y_of: {名: 锚点 y}
+
+    返回 {"楼栋": [...], "孤儿": [...], "共享组": [...], "异常": [...]}
+      「异常」= 区间宽 < 归属条数>0 时的 x 跨度（区间装不下自己的实体）→ 须复核；
+      若同时存在**含业务特征的孤儿**，则一并点名（这是实测的"整列被切出去"形态）。
+    """
+    is_feat = featured or (lambda _c: False)
+    rows, orphans = [], []
+    for b in sorted(ranges, key=lambda k: ranges[k][0]):
+        lo, hi = ranges[b]
+        mine = [t for t in items if lo <= t.get("x", 0) <= hi]
+        xs = [t["x"] for t in mine]
+        rows.append({"楼栋": b, "xlo": lo, "xhi": hi, "宽": hi - lo, "条数": len(mine),
+                     "x跨度": (max(xs) - min(xs)) if xs else 0.0,
+                     "x最左": min(xs) if xs else None, "x最右": max(xs) if xs else None,
+                     "锚点y": (anchor_y_of or {}).get(b)})
+    for t in items:
+        names, reason = assign_by_xy(t.get("x", 0), t.get("y"), ranges, anchor_y_of)
+        if names:
+            continue
+        near, nd = None, None
+        for b, (lo, hi) in ranges.items():
+            d = 0.0 if lo <= t["x"] <= hi else min(abs(t["x"] - lo), abs(t["x"] - hi))
+            if nd is None or d < nd:
+                near, nd = b, d
+        orphans.append({"x": t.get("x"), "y": t.get("y"), "内容": t.get("内容"),
+                        "最近楼栋": near, "距边界": nd, "业务实体": bool(is_feat(t.get("内容", "")))})
+    anomalies = []
+    for r in rows:
+        if r["条数"] > 0 and r["宽"] < 1e-9:
+            anomalies.append({"楼栋": r["楼栋"], "类型": "区间零宽", "宽": r["宽"]})
+        elif r["条数"] > 0 and r["x跨度"] > r["宽"] + 1e-6:
+            anomalies.append({"楼栋": r["楼栋"], "类型": "跨度超区间", "宽": r["宽"], "x跨度": r["x跨度"]})
+    biz_orphans = [o for o in orphans if o["业务实体"]]
+    for o in biz_orphans:
+        anomalies.append({"楼栋": o["最近楼栋"], "类型": "业务实体被切出区间",
+                          "x": o["x"], "距边界": o["距边界"], "内容": o["内容"]})
+    return {"楼栋": rows, "孤儿": orphans, "共享组": group_shared_ranges(ranges), "异常": anomalies}
+
+
 # ---------- 楼层匹配（排序+二分，替代 O(N×M) 遍历） ----------
 def match_y_to_floor(y, items, tol=None, y_key=None):
     """

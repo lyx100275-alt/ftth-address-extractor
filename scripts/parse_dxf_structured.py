@@ -42,10 +42,12 @@ from ftth_common import (
     INF_COORD, NEG_INF_COORD,
     setup_logger, bldg_num, floor_num_or_zero, parse_floor_label,
     load_dxf, collect_texts, find_bldg_anchors, cluster_by_x, compute_bldg_ranges, match_y_to_floor,
+    compute_bldg_ranges_banded, assign_by_xy, bldg_range_diagnostics, group_shared_ranges,
     MultiPlotDuplicateAnchorError,
     assign_floor_by_interval, clean_text, is_floor_text, require_params,
     floor_step_from_texts, set_expand_bldg_ranges,
     extract_geom, is_bldg_title_text, suggest_fx_symbol_layers,
+    find_plot_band_anchors, derive_plot_bands, PLOT_BAND_WORDS,
     ensure_parent, write_json, sanitize_nonfinite,
 )
 
@@ -60,6 +62,12 @@ ap.add_argument("--expand-bldg-ranges", action="store_true",
                      "不得替用户静默选定语义。")
 ap.add_argument("dxf", help="输入DXF文件路径")
 ap.add_argument("out", nargs="?", default=None, help="输出JSON路径（默认DXF同目录 _解析结果.json）")
+ap.add_argument("--title-band-tol", type=float, default=None,
+                help="楼栋标题分带容差（y）。相邻锚点 y 相差不超过本值者视为同一带，"
+                     "带内再按 x 中分；留空 → 按 2 倍层高自适应，层高不可得 → 单带。")
+ap.add_argument("--legacy-bldg-assign", action="store_true",
+                help="【仅对拍】强制旧的「纯 x 闭区间 + dict 序先到先得」楼栋归属（忽略 y）。"
+                     "仅供 A/B 回归对拍，正式出表不得启用。")
 ap.add_argument("--text-layer", default=None, help="文字所在图层，逗号分隔（必填，由探查提供）")
 ap.add_argument("--text-type", default="MTEXT,TEXT", help="文字实体类型，逗号分隔（默认两者都取）")
 ap.add_argument("--title-pattern", default=None, help="楼栋标题正则，含捕获组数字（必填，由探查提供）")
@@ -497,24 +505,22 @@ if args.probe:
                     log.info("  [探查] 图签候选图层: %s"
                              % {lay: dict(c) for lay, c in _tb_ranked[:4]})
 
-            # ---------- 地块/分带标注探测（2026-09-16，12坑复核·坑1/坑2）----------
+            # ---------- 地块/分带标注探测（2026-09-16 立；2026-09-18 改走共享实现）----------
             # 多地块混排竣工图常用短标注区分地块；**文件名不等于地块划分**——一张图
-            # 内部可含多个独立地块、楼号各自从 1 起。输出标注清单（advisory，不阻塞），
-            # 供 plan 画像与下游 --band 分带参考。
-            _PLOT_RE = re.compile(r"(\d+(?:\s*[-–]\s*\d+)?)\s*(块地|地块|块区|组团|分区)")
-            _plot_hits = []
-            for s in samples:
-                t = s["内容"].strip()
-                if len(t) > 16:
-                    continue
-                _m = _PLOT_RE.search(t)
-                if _m:
-                    _plot_hits.append({"文字": t, "层": s["层"],
-                                       "x": round(s["x"], 1), "y": round(s["y"], 1),
-                                       "编号": _m.group(1).replace(" ", "")})
+            # 内部可含多个独立地块、楼号各自从 1 起。输出**锚点候选 + 排除明细 +
+            # 分带窗口**，供 `ftth.py split-band --auto` 直接切子图。
+            # 2026-09-18 补：此前只输出「样例」且按 (编号,文字) 去重截断（同编号多位置
+            #   时静默只剩 1 条），并且**算了不接线** —— 下游 split-band 只吃人工 --band，
+            #   人被迫手搓 8 条 band spec。现在窗口由 derive_plot_bands 一次算齐，
+            #   与 split-band 同源同算法（画像里看到的就是实际会切出来的）。
+            _pb = derive_plot_bands(msp, samples)
+            _pb_anchors = _pb["锚点"]
+            _pb_excluded = _pb["锚点排除"]
+            _pb_hits = _pb["命中"]
             plot_band_annotations = None
-            if _plot_hits:
-                _names = sorted({h["编号"] for h in _plot_hits})
+            if _pb_hits:
+                _names = sorted({h["编号"] for h in _pb_hits if h.get("编号")},
+                                key=lambda s: (len(s), s))
                 _main_nums = set()
                 for _nm in _names:
                     _mm = re.match(r"(\d+)", _nm)
@@ -523,17 +529,35 @@ if args.probe:
                 _gaps = [i for i in range(min(_main_nums), max(_main_nums) + 1)
                          if i not in _main_nums] if _main_nums else []
                 plot_band_annotations = {
-                    "词表": "块地|地块|块区|组团|分区（内置通用词表；本图用词不同请人工补充）",
+                    "词表": ("%s（内置通用词表；本图用词不同请人工补充）"
+                           % "|".join(PLOT_BAND_WORDS)),
                     "种类": _names,
-                    "条数": len(_plot_hits),
+                    "条数": len(_pb_hits),
                     "缺号提醒": ("编号序列缺 %s——图纸可能只含部分地块或编号本就不连续，请人工确认"
                               % _gaps) if _gaps else None,
-                    "样例": sorted({(h["编号"], h["文字"]): h for h in _plot_hits}.values(),
-                                 key=lambda h: -h["y"])[:30],
+                    # 全量命中（**不再按 (编号,文字) 去重、不截断**）：去重会丢掉同编号的
+                    # 其余位置，下游若据此算分带锚点会静默少切带。
+                    "样例": _pb_hits,
+                    "锚点候选": _pb_anchors,
+                    "锚点排除": _pb_excluded,
+                    "分带窗口": _pb["分带窗口"],
+                    "分带切点": _pb["切点"],
+                    "分带核对疑点": _pb["疑点"],
+                    "分带错误": _pb["错误"],
+                    "锚点去向": _pb["去向"] if _pb_anchors else
+                             ("0 个严格形态锚点 —— 图上只有带附加字/合并形态的地块标注，"
+                              "需人工指定分带边界（--band）" if _pb_hits else None),
                 }
-                log.info("  [探查] 地块/分带标注 %d 条（编号 %s）%s"
-                         % (len(_plot_hits), "/".join(_names),
-                            ("，缺号 %s" % _gaps) if _gaps else ""))
+                log.info("  [探查] 地块/分带标注 %d 条（编号 %s）%s；严格锚点 %d 个，"
+                         "分带窗口 %d 个%s"
+                         % (len(_pb_hits), "/".join(_names),
+                            ("，缺号 %s" % _gaps) if _gaps else "",
+                            len(_pb_anchors), len(_pb["分带窗口"] or []),
+                            ("，排除 %d 条（见画像的「锚点排除」）" % len(_pb_excluded))
+                            if _pb_excluded else ""))
+                if _pb["疑点"]:
+                    log.warning("  [探查] 分带核对疑点 %d 条（不阻塞，须人工过目）：%s"
+                                % (len(_pb["疑点"]), _pb["疑点"][0]))
 
             # ---------- 箱位直读标注信号（2026-09-16，12坑复核·坑9）----------
             # 「N号楼M单元K层」格式标注直接给出箱位（楼栋/单元/安装层），是最可靠的
@@ -665,53 +689,85 @@ if args.insert_blocks:
     log.info(f"收集到 {len(insert_items)} 个匹配的 INSERT 实体")
 
 # ---------- 楼栋锚点 ----------
-# 多地块同名楼守卫：早失败（rc=3）、点名根因与同名锚点位置、零产物（--out 尚未写入）。
+# 多地块同名楼守卫：**rc=2（输入不足·须人工分带）**、点名根因与同名锚点位置、零产物
+#   （--out 尚未写入）。
+#   2026-09-18 实跑修正：原为 rc=3。rc=3 在 L1-C2 里的语义是「本图确实不提供该子任务
+#   数据（absent）→ 跳过 + 降级路径，**不是错误**」；而本处是**本图有数据、只是缺分带
+#   信息**，属 rc=2「有未作答项/必须修项 → 停」（C2 的 rc=2 适用范围本就写明含 `parse`
+#   门禁）。给成 rc=3 会让 pipeline/调用方读成「不适用，非错误」而放行 —— 实测两张多地块
+#   图都因此被读成「按画像降级路径继续」，实际链路已终止、下游从未运行。
 try:
     bldg_anchors = find_bldg_anchors(texts, TITLE_RE, log)
 except MultiPlotDuplicateAnchorError as _e:
     log.error(str(_e))
-    sys.exit(3)
+    sys.exit(2)
 
 if not bldg_anchors:
     log.error("未匹配到楼栋标题，请检查 --title-pattern / --text-layer，或先运行 --probe")
     sys.exit(1)
 
 anchor_xs = sorted([(k, v["x"]) for k, v in bldg_anchors.items()], key=lambda x: x[1])
-bldg_ranges = compute_bldg_ranges(anchor_xs)
+anchor_y_map = {k: v.get("y", 0) for k, v in bldg_anchors.items()}
+anchor_y_of = {k: v.get("y") for k, v in bldg_anchors.items()}
+
+# ---------- 楼栋 x 范围：按 y 分带 + 带内 x 中分（2026-09-18 重做） ----------
+# 旧实现是「全图统一 x 中分 + 纯 x 闭区间先到先得」，其成立前提为
+# 「各锚点同处一个 y 行，且各栋 x 区间互不重叠」。实测两类图纸破此前提：
+#   ① 共享锚点：一张系统图服务多栋（标题原文 `7#、8#、10#住宅光纤入户系统图`），
+#      `_x_groups` 已并组共用同一区间 → 归属时先到先得者独吞，其余楼栋楼层表整片为空。
+#   ② 上下分带：配套小图与住宅大图在 x 上重叠 → 分带后区间可重叠 → 实体归错楼或成孤儿。
+# 分带容差口径与 count_households.py 一致：--title-band-tol 优先，否则取 2 倍层高；
+# 层高不可得则退回单带（与改造前行为逐位一致）。
+_step_b, _basis_b = floor_step_from_texts(texts, _is_floor_text)
+_band_tol = args.title_band_tol or (2.0 * _step_b if _step_b else None)
+if args.legacy_bldg_assign:
+    _band_tol = None
+    log.info("[对拍] --legacy-bldg-assign：强制单带 + 纯 x 先到先得（复现改造前行为）")
+if _band_tol:
+    log.info("楼栋标题分带容差 = %.4g（%s）"
+             % (_band_tol, "--title-band-tol" if args.title_band_tol else "2 倍层高"))
+else:
+    log.warning("分带容差不可得（既未量出层高也未传 --title-band-tol）→ 退回单带 x 中分；"
+                "若图上有配套楼/住宅楼上下分带，可能串带，请显式传 --title-band-tol")
+bldg_ranges, _bldg_bands = compute_bldg_ranges_banded(
+    [(k, v["x"], v.get("y")) for k, v in bldg_anchors.items()], band_tol=_band_tol, log=log)
 
 log.info("\n楼栋x范围:")
 for bldg, (xmin, xmax) in bldg_ranges.items():
     log.info(f"  {bldg}: x {xmin:.1f}~{xmax:.1f}")
 
-# ---------- 楼栋区域边界重叠校验（2026-09-13 新增） ----------
-# 混合布局图纸中不同 y 行的楼栋（如住宅楼 y 行与配套楼 y 行），
-# 虽然中分法保证 x 范围不相交，但不同行楼栋 x 范围可能紧邻、间距过小，
-# 导致 HDD/皮线/楼层标注等实体按 x 归属时跨行混入邻楼。
+# 共享区间（一张系统图服务多栋）：显式登记 —— 归属时按标题原文克隆，**不得**先到先得
+_shared_groups = group_shared_ranges(bldg_ranges)
+for _g in _shared_groups:
+    log.info("  [共享区间] %s 共用 x %.1f~%.1f（宽 %.1f）：同区间实体按标题原文克隆给全部楼栋"
+             % ("、".join(_g["names"]), _g["lo"], _g["hi"], _g["hi"] - _g["lo"]))
+
+# ---------- 楼栋区域边界重叠校验 ----------
+# 混合布局图纸中不同 y 行的楼栋（如住宅楼 y 行与配套楼 y 行），虽然**同带内** x 范围
+# 不相交，但跨带楼栋 x 范围可能紧邻、间距过小，导致实体按 x 归属时跨行混入邻楼。
 # 检测方式：对每对不同 y 行的楼栋，若 x 范围间距 < 同行楼栋间距中位数的一半，告警。
-anchor_y_map = {k: v.get("y", 0) for k, v in bldg_anchors.items()}
-# 按 y 聚类（同 y 行的楼栋）
-y_groups = {}
-for bldg_name, (xmin, xmax) in bldg_ranges.items():
+import statistics as _stat
+_y_groups = {}
+for bldg_name in bldg_ranges:
     y = anchor_y_map.get(bldg_name, 0)
     matched = False
-    for yg in list(y_groups.keys()):
+    for yg in list(_y_groups.keys()):
         if abs(y - yg) < 100:
-            y_groups[yg].append(bldg_name)
+            _y_groups[yg].append(bldg_name)
             matched = True
             break
     if not matched:
-        y_groups[y] = [bldg_name]
+        _y_groups[y] = [bldg_name]
 
-if len(y_groups) > 1:
+if len(_y_groups) > 1:
     # 计算同行楼栋间距中位数
     same_row_gaps = []
-    for yg, bldg_list in y_groups.items():
+    for yg, bldg_list in _y_groups.items():
         xs = sorted([bldg_ranges[b][0] for b in bldg_list])
         for i in range(1, len(xs)):
             same_row_gaps.append(xs[i] - xs[i-1])
     if same_row_gaps:
-        import statistics
-        median_gap = statistics.median(same_row_gaps)
+        median_gap = _stat.median(same_row_gaps)
         threshold = median_gap / 2
         overlap_found = False
         sorted_bldg_list = sorted(bldg_ranges.items(), key=lambda r: r[1][0])
@@ -734,74 +790,99 @@ if len(y_groups) > 1:
         if overlap_found:
             log.warning("  [边界过近] 检测到跨行 x 间距过小，请在自检与出表时注意按 x 列精确拆分实体归属")
 
-# ---------- 楼栋区域边界重叠校验（2026-09-13 新增） ----------
-# 混合布局图纸中不同 y 行的楼栋（如住宅楼 y 行与配套楼 y 行），
-# 虽然中分法保证 x 范围不相交，但不同行楼栋 x 范围可能紧邻、间距过小，
-# 导致 HDD/皮线/楼层标注等实体按 x 归属时跨行混入邻楼。
-# 检测方式：对每对不同 y 行的楼栋，若 x 范围间距 < 同行楼栋间距中位数的一半，告警。
-anchor_y_map = {k: v.get("y", 0) for k, v in bldg_anchors.items()}
-# 按 y 聚类（同 y 行的楼栋）
-y_groups = {}
-for bldg_name, (xmin, xmax) in bldg_ranges.items():
-    y = anchor_y_map.get(bldg_name, 0)
-    matched = False
-    for yg in list(y_groups.keys()):
-        if abs(y - yg) < 100:
-            y_groups[yg].append(bldg_name)
-            matched = True
-            break
-    if not matched:
-        y_groups[y] = [bldg_name]
+# ---------- 归属：带内 (x, y)，多候选显式处置（2026-09-18 重做） ----------
+# 旧实现 `for bldg,(lo,hi) in bldg_ranges.items(): if lo<=x<=hi: break` 有三处问题：
+#   · 不看 y —— 分带后不同带区间可重叠，先到先得必错；
+#   · 闭区间 + break 依赖 dict 顺序 —— 边界上的点归谁取决于插入序，不可复现；
+#   · 命中即 break —— 共享区间（多栋同区间）时独占，其余楼栋整片为空。
+# 新实现：单候选 → 与旧行为逐位一致（零回归）；多候选 → 共享克隆 / y 就近 / 报裁决。
+_ASSIGN_STAT = Counter()
+_SHARE_CLONE = Counter()
+_PENDING_ASSIGN = []
 
-if len(y_groups) > 1:
-    # 计算同行楼栋间距中位数
-    same_row_gaps = []
-    for yg, bldg_list in y_groups.items():
-        xs = sorted([bldg_ranges[b][0] for b in bldg_list])
-        for i in range(1, len(xs)):
-            same_row_gaps.append(xs[i] - xs[i-1])
-    if same_row_gaps:
-        import statistics
-        median_gap = statistics.median(same_row_gaps)
-        threshold = median_gap / 2
-        overlap_found = False
-        sorted_bldg_list = sorted(bldg_ranges.items(), key=lambda r: r[1][0])
-        for i in range(len(sorted_bldg_list)):
-            for j in range(i + 1, len(sorted_bldg_list)):
-                n1, (x1lo, x1hi) = sorted_bldg_list[i]
-                n2, (x2lo, x2hi) = sorted_bldg_list[j]
-                y1 = anchor_y_map.get(n1, 0)
-                y2 = anchor_y_map.get(n2, 0)
-                if abs(y1 - y2) > 100:
-                    gap = x2lo - x1hi
-                    if gap < threshold:
-                        log.warning(
-                            f"  [边界过近] {n1} [x={x1lo:.1f}~{x1hi:.1f},y={y1:.0f}] 与 "
-                            f"{n2} [x={x2lo:.1f}~{x2hi:.1f},y={y2:.0f}] 不同行但 x 间距 "
-                            f"{gap:.1f} < 阈值 {threshold:.1f}（同行间距中位数 {median_gap:.1f}）"
-                            f"——按 x 归属可能把邻楼实体混入本楼，须按 x 列 + y 带双重维度精确归属"
-                        )
-                        overlap_found = True
-        if overlap_found:
-            log.warning("  [边界过近] 检测到跨行 x 间距过小，请在自检与出表时注意按 x 列精确拆分实体归属")
+def _assign(x, y, content):
+    """按 (x,y) 归属楼栋 → names 列表（长度>1 = 共享区间，须克隆给全部）。"""
+    if args.legacy_bldg_assign:            # 对拍：旧行为（纯 x + dict 序先到先得）
+        for bldg, (xmin, xmax) in bldg_ranges.items():
+            if xmin <= x <= xmax:
+                _ASSIGN_STAT["legacy先到先得"] += 1
+                return [bldg]
+        _ASSIGN_STAT["legacy未命中"] += 1
+        return []
+    _names, _reason = assign_by_xy(x, y, bldg_ranges, anchor_y_of)
+    _ASSIGN_STAT[_reason.split("(")[0]] += 1
+    if len(_names) > 1:
+        _SHARE_CLONE[tuple(_names)] += 1
+    elif (not _names) and _reason.startswith("重叠无y判据"):
+        _PENDING_ASSIGN.append({"x": round(x, 2), "y": y, "内容": content, "原因": _reason})
+    return _names
 
 # 为 INSERT 实体分配楼栋归属（须在 bldg_ranges 计算之后）
 if insert_items:
     for ins in insert_items:
-        for bldg, (xmin, xmax) in bldg_ranges.items():
-            if xmin <= ins["x"] <= xmax:
-                ins["楼"] = bldg
-                break
-        else:
-            ins["楼"] = None
+        _names = _assign(ins["x"], ins.get("y"), ins.get("块名"))
+        ins["楼"] = _names[0] if _names else None
+        if len(_names) > 1:
+            ins["楼_共享"] = _names
 
-# 为每栋楼分配文字
+# 为每栋楼分配文字（共享区间 → 同一批文字克隆给组内每一栋，不再先到先得）
 bldg_texts = defaultdict(list)
 for t in texts:
-    for bldg, (xmin, xmax) in bldg_ranges.items():
-        if xmin <= t["x"] <= xmax:
-            bldg_texts[bldg].append(t)
-            break
+    for _n in _assign(t["x"], t.get("y"), t.get("内容")):
+        bldg_texts[_n].append(t)
+
+# ---------- 区间自检：把「区间装不下自己的实体」显式报出（2026-09-18 新增） ----------
+def _is_biz_text(c):
+    """含业务特征的文字（楼层刻度 / 每层户数 / 皮线米数 / 分纤箱编号）。"""
+    if not c:
+        return False
+    if _is_floor_text(c):
+        return True
+    if FX_RE and FX_RE.search(c):
+        return True
+    if HU_RE and HU_RE.fullmatch(clean_text(c)):
+        return True
+    if CABLE_RE and CABLE_RE.fullmatch(clean_text(c)):
+        return True
+    return False
+
+_RANGE_DIAG = bldg_range_diagnostics(bldg_ranges, texts, featured=_is_biz_text,
+                                     anchor_y_of=anchor_y_of)
+_widths = [r["宽"] for r in _RANGE_DIAG["楼栋"]]
+_med_w = _stat.median(_widths) if _widths else 0.0
+_NARROW = []
+if _med_w > 0:
+    for _r in _RANGE_DIAG["楼栋"]:
+        if _r["宽"] < _med_w / 3.0:
+            _NARROW.append({"楼栋": _r["楼栋"], "宽": round(_r["宽"], 2),
+                            "中位宽": round(_med_w, 2), "区间内条数": _r["条数"]})
+            log.warning("  [区间过窄] %s 区间宽 %.1f，仅占中位宽 %.1f 的 %.0f%%（区间内 %d 条）"
+                        "——疑锚点不居中或共享锚点未拆分，本栋实体可能被切在区间外"
+                        % (_r["楼栋"], _r["宽"], _med_w, 100.0 * _r["宽"] / _med_w, _r["条数"]))
+_BIZ_ORPHAN = [o for o in _RANGE_DIAG["孤儿"] if o["业务实体"]]
+# 参考量：相邻锚点间距的中位数（仅登记进产物，不作判据）
+_sorted_b = sorted(bldg_ranges, key=lambda k: bldg_ranges[k][0])
+_gaps = [bldg_ranges[_sorted_b[i + 1]][0] - bldg_ranges[_sorted_b[i]][0]
+         for i in range(len(_sorted_b) - 1)]
+_med_gap = _stat.median(_gaps) if _gaps else 0.0
+# 只把「贴边」的孤儿当可疑：距最近区间边界 < **该栋区间宽的 1/4**。
+# 远离全部区间的（如图纸左侧总图区对照表、别带的箱清单）是独立图区，被排除本来
+# 就是对的，不报 —— 实测某图总图区箱清单距首栋左界 83~167（约半个区间宽），
+# 若用「锚点间距中位」当阈值会全部误报。
+_wmap = {r["楼栋"]: r["宽"] for r in _RANGE_DIAG["楼栋"]}
+_BIZ_ORPHAN_SUSPECT = [o for o in _BIZ_ORPHAN
+                       if o["距边界"] is not None and _wmap.get(o["最近楼栋"], 0) > 0
+                       and o["距边界"] < 0.25 * _wmap[o["最近楼栋"]]]
+if _BIZ_ORPHAN_SUSPECT:
+    log.warning("  [业务实体落空] %d 条含业务特征的文字紧贴区间边界却被排除"
+                "（判据：距边界 < 本栋区间宽的 1/4）——须复核是否被边界切出：%s"
+                % (len(_BIZ_ORPHAN_SUSPECT),
+                   "；".join("%s@x%.1f(距%.1f)" % (o["内容"], o["x"], o["距边界"])
+                             for o in _BIZ_ORPHAN_SUSPECT[:6])))
+elif _BIZ_ORPHAN:
+    log.info("  [业务实体落空] %d 条含业务特征的文字位于全部楼栋区间之外且远离边界"
+             "（判据：距边界 >= 本栋区间宽的 1/4）→ 判为独立图区（总图/平面图/别带），已排除"
+             % len(_BIZ_ORPHAN))
 
 # ---------- 尺度锚：阈值按层高自适应（2026-09-15 通用化，须在 split_units 系列首次使用 args.* 前解析） ----------
 # 比值的历史出处：层高 30 时 unit_cluster=30 / unit_range=120 / y_tol=2（原手调默认值）。
@@ -961,6 +1042,21 @@ result = {
         "y_tol": args.y_tol,
     },
     "楼栋": {},
+    # 2026-09-18 新增：把边界与归属依据落进产物（此前只进 log，下游拿不到 ⇒ 无法守门）
+    "楼栋边界": {
+        "分带容差": _band_tol,
+        "带": _bldg_bands,
+        "区间": {_b: [round(_lo, 3), round(_hi, 3)] for _b, (_lo, _hi) in bldg_ranges.items()},
+        "共享区间": _shared_groups,
+        "归属统计": dict(_ASSIGN_STAT),
+        "共享克隆": {"、".join(_k): _v for _k, _v in _SHARE_CLONE.items()},
+        "待裁决归属": _PENDING_ASSIGN[:100],
+        "区间过窄": _NARROW,
+        "业务实体落空": _BIZ_ORPHAN[:100],
+        "业务实体落空_可疑": _BIZ_ORPHAN_SUSPECT[:100],
+        "锚点间距中位": _med_gap,
+        "自检": {"楼栋": _RANGE_DIAG["楼栋"], "异常": _RANGE_DIAG["异常"]},
+    },
 }
 
 # ---------- --fx-map：总图对照表回填（2026-09-18 新增） ----------
