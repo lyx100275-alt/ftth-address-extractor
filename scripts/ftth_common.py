@@ -2531,3 +2531,174 @@ def suggest_fx_symbol_layers(polylines, texts, fx_count=None, top=3):
                     "层高依据": _step_why})
     out.sort(key=lambda d: (-d["得分"], d["层"]))
     return out[:top]
+
+# ---------- 图上箱位直写证据（2026-09-19，唯一实现） ----------
+# 背景：分纤箱编号文字常落在独立的总图/箱表区（x 不落在任何楼栋标题区间内），
+#   此前只能靠人工传 --bldg-map（extract_fx_map 产物）才能认领；不传就整图 0 箱
+#   （实测某项目 4 张图 84 个箱、另一图 23 个箱，全部归 0，rc 仍 0）。
+#   但图上往往**自己就写着箱位**（「N号楼M单元K层」或「N#楼M单元」），这是 A′ 级
+#   直写证据 —— 有能力自动认领却没认领，属「登记了疑点但没拦住结果」。
+# 纪律：本段是**全工具链唯一**的直写证据判定实现，extract_fx_map.py 与
+#   parse_dxf_structured.py 都调它，不得各抄一份（各抄一份必然漂移）。
+import math as _math
+
+# 箱位描述的完整拆分：楼栋号 / 单元号 / 安装层。写法容错：`号楼` 与 `#楼` 都收，
+#   单元号可缺省（单单元楼栋）。
+DESC_POS_RE = re.compile(r"(\d+)\s*(?:号楼|#?\s*(?:配套|商业|附属)?\s*楼)\s*(?:(\d+)\s*单元)?\s*(\d+)\s*层")
+# 仅到单元级的楼栋标注（`N#楼1单元` / `N号楼`），无安装层 —— 信息弱于上者，仅作二级证据。
+UNIT_POS_RE = re.compile(r"(\d+)\s*(?:号楼|#?\s*(?:配套|商业|附属)?\s*楼)\s*(?:(\d+)\s*单元)?")
+
+
+def nearest_unambiguous(x, y, cands, x_key="x", y_key="y"):
+    """在候选集里找**几何无歧义**的最近项。
+
+    判据（纯几何、尺度无关、可复核，故属「测量」不属「推理」）：
+        d1（到最近项 A 的距离）< 0.5 × dAB（A 与次近项 B 之间的距离）
+    推导：由三角不等式 dAB ≤ d1 + d2 ⇒ d2 ≥ dAB − d1 > 0.5·dAB > d1，
+        即**最近项严格唯一**——不是"比其他近一点"，而是落在以 A 为圆心、
+        半径为 dAB/2 的圆内，该圆内不可能再有第二个候选。
+    尺度取自**局部**（A 与 B 的间距）而非全图最小间距：后者会被图上某一处
+        特别密集的候选对拉低，导致别处本无歧义的归属被误拒（实测某图因此
+        少认 7 个箱）。局部判据同样满足上述推导，严格性不降。
+
+    返回 dict{best, d1, d2, dAB, min_gap, ok}；cands 少于 2 项时 ok=False。
+    """
+    res = {"best": None, "d1": None, "d2": None, "dAB": None, "min_gap": None, "ok": False}
+    if len(cands) < 2:
+        return res
+    ds = sorted((_math.hypot(x - c[x_key], y - c[y_key]), c) for c in cands)
+    d1, best = ds[0]
+    d2, second = ds[1]
+    dAB = _math.hypot(best[x_key] - second[x_key], best[y_key] - second[y_key])
+    min_gap = None
+    for i in range(len(ds)):
+        for j in range(i + 1, len(ds)):
+            g = _math.hypot(ds[i][1][x_key] - ds[j][1][x_key],
+                            ds[i][1][y_key] - ds[j][1][y_key])
+            if min_gap is None or g < min_gap:
+                min_gap = g
+    res.update({"best": best, "d1": d1, "d2": d2, "dAB": dAB, "min_gap": min_gap})
+    if not dAB:
+        return res
+    res["ok"] = bool(d1 < 0.5 * dAB)
+    return res
+
+
+def build_fx_direct_evidence(texts, fx_re, max_len=24):
+    """从图上文字里直接构建「编号 -> 箱位」的直写证据表。
+
+    两级证据（信息越完整越优先）：
+      A′ 级：`N号楼M单元K层` —— 楼栋/单元/安装层三者齐备；
+      B′ 级：`N#楼M单元`   —— 只到单元，安装层留给调用方的区间法（纪律：只改归属不改楼层）。
+    采纳条件（缺一不可，无法满足则**不采纳、交人工**，绝不猜）：
+      ① 编号的每个出现位置都能用 nearest_unambiguous 定出唯一最近候选；
+      ② 各位置推出的箱位归一化后**唯一**（同编号多处绘制指向同一箱位才收敛）；
+      ③ 编号在同级证据里不与其它编号冲突（此处不做全局分配，冲突由调用方按 ② 判定）。
+    返回 (emap, report)；emap[编号] = {楼栋, 单元, 安装楼层, 口径, 证据, 距离, 次近, 最小间距}
+    """
+    fx_items, desc_items, unit_items = [], [], []
+    for t in texts:
+        c = str(t.get("内容") or "").strip()
+        if not c or len(c) > max_len:
+            continue
+        if fx_re is not None and fx_re.search(c):
+            fx_items.append((fx_re.search(c).group(0).strip(), t))
+        elif DESC_POS_RE.fullmatch(c):
+            desc_items.append(t)
+        elif UNIT_POS_RE.fullmatch(c):
+            unit_items.append(t)
+    report = {"FX文字": len(fx_items), "A级箱位描述": len(desc_items),
+              "B级单元标注": len(unit_items), "采纳": [], "未采纳": []}
+    if not fx_items:
+        return ({}, report)
+
+    def _try(cands, level):
+        """对全部编号在给定候选集上试判，返回 {编号: entry}"""
+        out = {}
+        _skip = {}
+        for fx_id, t in fx_items:
+            nu = nearest_unambiguous(t["x"], t["y"], cands)
+            best, d1, d2, gap, ok = (nu["best"], nu["d1"], nu["d2"], nu["min_gap"], nu["ok"])
+            if not ok:
+                _why = ("候选不足 2 个，无从判歧义" if len(cands) < 2 else
+                        ("最近距 %.2f ≥ 最近与次近两候选间距的一半 %.2f（几何上有歧义，不猜）"
+                         % (d1, 0.5 * nu["dAB"]) if d1 is not None and nu["dAB"]
+                         else "无法度量"))
+                _skip.setdefault(fx_id, []).append(
+                    {"证据": level, "原因": _why,
+                     "最近候选": (str(best.get("内容")) if best else None),
+                     "最近距": (round(d1, 2) if d1 is not None else None),
+                     "次近距": (round(d2, 2) if d2 is not None else None),
+                     "最近与次近间距": (round(nu["dAB"], 2) if nu["dAB"] else None),
+                     "候选最小间距": (round(gap, 2) if gap else None)})
+                continue
+            c = str(best.get("内容") or "").strip()
+            m = DESC_POS_RE.fullmatch(c) if level == "A" else None
+            if level == "A" and m:
+                bno, uno, fl = m.group(1), m.group(2), m.group(3)
+                # 单元名**不拆**：产物单元粒度由图纸自身的单元划分决定；本证据只解决
+                #   「箱属于哪栋楼」+「装在哪一层」。若在此处带上单元名，会出现
+                #   「楼层表留在原容器、箱落到新单元」的脱节（下游 join 不上），
+                #   且等于凭空引入图上没有独立单元划分的颗粒度。图上单元号原文另行留痕。
+                e = {"楼栋": "%s号楼" % bno,
+                     "单元": "%s号楼" % bno,
+                     "图上单元": ("%s单元" % uno) if uno else None,
+                     "安装楼层": "%sF" % fl,
+                     "安装楼层口径": "口径A′:图上箱位直写（『N号楼M单元K层』）"}
+            else:
+                mu = UNIT_POS_RE.fullmatch(c)
+                if not mu:
+                    continue
+                bno, uno = mu.group(1), mu.group(2)
+                # 楼栋名保留**原文写法**（含「配套/商业/附属」等修饰词），只去掉尾部单元号。
+                #   若统一改写成「N号楼」，锚点是「4#配套楼」这类形态的楼会匹配不上，
+                #   配套楼的箱会被 silently 丢掉（实测某图 2 个配套楼箱因此无归属）。
+                _bn_full = re.sub(r"\d+\s*单元\s*$", "", c).strip()
+                e = {"楼栋": _bn_full,
+                     "单元": _bn_full,
+                     "楼号": bno,
+                     "图上单元": ("%s单元" % uno) if uno else None,
+                     "安装楼层": None,
+                     "安装楼层口径": "口径B′:图上单元标注直写（仅楼栋/单元，安装层仍走区间法）"}
+            e.update({"证据": level, "原文": c, "x": round(t["x"], 2), "y": round(t["y"], 2),
+                      "距离": round(d1, 2), "次近": round(d2, 2),
+                      "最近与次近间距": round(nu["dAB"], 2), "最小间距": round(gap, 2)})
+            out.setdefault(fx_id, []).append(e)
+        return out, _skip
+
+    emap = {}
+    for level, cands in (("A", desc_items), ("B", unit_items)):
+        if not cands:
+            continue
+        got, skipped = _try(cands, level)
+        for fx_id, lst in got.items():
+            if fx_id in emap:
+                continue                       # 高级证据已覆盖
+            keys = {(str(e.get("楼栋")), str(e.get("单元")), str(e.get("安装楼层"))) for e in lst}
+            if len(keys) != 1:
+                report["未采纳"].append({"编号": fx_id, "证据": level,
+                                        "原因": "同编号多处绘制推出的箱位不一致（未自行择一）",
+                                        "候选": sorted(keys)[:4]})
+                continue
+            e = dict(lst[0])
+            e["出现次数"] = len(lst)
+            emap[fx_id] = e
+            report["采纳"].append({"编号": fx_id, "证据": level, "楼栋": e["楼栋"],
+                                   "单元": e["单元"], "安装楼层": e["安装楼层"],
+                                   "原文": e["原文"], "距离": e["距离"], "次近": e["次近"],
+                                   "最小间距": e["最小间距"], "出现次数": len(lst)})
+    # 未采纳登记：只有在 A/B 两级都没采纳的编号才报（便于人工一次裁决）
+    _adopted = set(emap)
+    for _lv, _cands in (("A", desc_items), ("B", unit_items)):
+        if not _cands:
+            continue
+        _, _sk = _try(_cands, _lv)
+        for _fid, _rows in _sk.items():
+            if _fid in _adopted:
+                continue
+            _r = dict(_rows[0])
+            _r["编号"] = _fid
+            _r["出现次数"] = len(_rows)
+            report["未采纳"].append(_r)
+    report["采纳数"] = len(emap)
+    return (emap, report)
