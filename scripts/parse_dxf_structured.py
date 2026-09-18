@@ -1287,6 +1287,67 @@ if args.bldg_map:
              % (len(_entries2), len(BDG_MAP),
                 ("（重号 %d 个不改派：%s）" % (len(_dups2), "、".join(_dups2[:8]))) if _dups2 else ""))
 
+# ---------- 图上箱位直写证据（2026-09-19 新增）----------
+# 根因：箱编号常落在独立总图/箱表区（x 不落任何楼栋标题区间），此前只能靠人工
+#   --bldg-map 认领；不传则整图 0 箱、rc 仍 0（实测柳辛庄 4 图 84 个箱、云峰 23 个箱
+#   全部归 0）。但图上自己就写着箱位（「N号楼M单元K层」/「N#楼M单元」）——
+#   A′ 级直写证据有能力自动认领却没认领，属「登记了疑点但没拦住结果」。
+# 处置：调用 ftth_common 的**唯一实现**建证据表，只补对照表**没有**的编号
+#   （人工对照表 = A 级，优先级高于图上 A′/B′ 级），采纳条件不足的编号一律不采纳、
+#   交人工裁决，绝不猜。判定实现见 ftth_common.build_fx_direct_evidence。
+_DESC_EVID, _DESC_REPORT, _DESC_ADDED = {}, None, []
+_DESC_SKIP_GEOM = []      # 已有「系统图内几何归属」的编号：强证据优先，自证不覆盖
+if FX_RE is not None:
+    try:
+        from ftth_common import build_fx_direct_evidence as _build_desc_evid
+        _DESC_EVID, _DESC_REPORT = _build_desc_evid(texts, FX_RE)
+    except Exception as _e:                                          # noqa: BLE001
+        log.warning("图上箱位直写证据构建失败（不影响其它环节）：%s" % _e)
+        _DESC_REPORT = None
+
+
+def _x_in_any_bldg(x):
+    """x 是否落在任一楼栋区间内（= 该编号文字已在某栋系统图里，归属已有强证据）"""
+    for _lo, _hi in bldg_ranges.values():
+        try:
+            if float(_lo) <= x <= float(_hi):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+if _DESC_EVID:
+    # 证据优先级：人工对照表(A) > 系统图内几何归属(E-DXF-GEOM) > 图上箱位直写(A′/B′)。
+    #   后者是**救无归属者**用的：凡该编号有任何一处文字落在某栋 x 区间内，说明它
+    #   本来就在那栋的系统图里（几何归属已成立），此时再用"图上最近的箱位标注"去
+    #   改派，等于拿弱证据覆盖强证据 —— 实测会把已正确归属的箱整批改到错误的楼栋。
+    for _no_d, _e_d in _DESC_EVID.items():
+        if _no_d in BDG_MAP:
+            continue                     # 人工对照表优先，不覆盖
+        _locs = [t for t in texts
+                 if FX_RE.search(t["内容"])
+                 and FX_RE.search(t["内容"]).group(0).strip() == _no_d]
+        if any(_x_in_any_bldg(t["x"]) for t in _locs):
+            _DESC_SKIP_GEOM.append(_no_d)
+            continue
+        BDG_MAP[_no_d] = [_e_d]
+        _DESC_ADDED.append(_no_d)
+    if _DESC_SKIP_GEOM:
+        log.info("图上箱位直写证据：%d 个编号已有系统图内几何归属（强证据优先），"
+                 "未用直写证据改派" % len(_DESC_SKIP_GEOM))
+    if _DESC_ADDED:
+        log.info("图上箱位直写证据：采纳 %d 个编号（A′ 箱位描述 / B′ 单元标注；"
+                 "对照表已覆盖者不重复采纳）" % len(_DESC_ADDED))
+        if _bdgmap_meta is None:
+            # 未传 --bldg-map 时该容器为 None，但下面「改派条数」等记账会用到它 ——
+            #   自证来源同样是一次「对照表式」归属，故补建容器并写明来源，留痕可追溯。
+            _bdgmap_meta = {"来源": "图上箱位直写自证（本图未传 --bldg-map）",
+                            "文件": None, "条目数": len(_DESC_ADDED),
+                            "唯一编号": len(_DESC_ADDED), "重号编号": []}
+    # 注意：此处不告警 —— 判据不足的编号多数已由「系统图几何归属」正常入楼，
+    #   只有在产物「未归属分纤箱」里仍存在的才算真待裁决（见下方产物段过滤）。
+
 # ---------- --bldg-map 改派：把 FX 文字挂到对照表给定的楼栋/单元 ----------
 # 必须在楼栋循环之前完成。改派对象是**文字本身**：先在每栋文字里摘出有对照表映射的
 # FX 文字，再按对照表楼栋/单元重新挂入（同栋同单元的也统一走这条通道，保证单元名
@@ -1798,6 +1859,26 @@ if _UNPAIRED or FX_DROPPED_DUP:
 if PENDING_NOTES:
     result["需人工裁决"] = PENDING_NOTES
     log.warning("parse 侧需人工裁决 %d 项（明细见产物「需人工裁决」）" % len(PENDING_NOTES))
+if _DESC_REPORT is not None:
+    result["图上箱位自证"] = {
+        "说明": "图上直写的箱位标注（『N号楼M单元K层』=A′级；『N#楼M单元』=B′级）"
+                "按几何无歧义判据（最近距 < 候选最小间距的一半）自动认领，"
+                "仅补人工对照表未覆盖的编号；判据不足者不采纳、交人工裁决",
+        "候选": {"FX文字": _DESC_REPORT.get("FX文字"),
+                 "A级箱位描述": _DESC_REPORT.get("A级箱位描述"),
+                 "B级单元标注": _DESC_REPORT.get("B级单元标注")},
+        "采纳数": len(_DESC_ADDED),
+        # 只列**真正启用**的：候选清单里被几何归属抢先的编号不算采纳，避免误读。
+        "采纳清单": [x for x in (_DESC_REPORT.get("采纳") or [])
+                     if x.get("编号") in set(_DESC_ADDED)],
+        # 只保留最终仍未归属的编号 —— 其余判据不足者已由系统图几何正常入楼，不是缺陷。
+        "未采纳": [x for x in (_DESC_REPORT.get("未采纳") or [])
+                   if x.get("编号") in set(_un_group)],
+        "因已有几何归属未启用": _DESC_SKIP_GEOM,
+    }
+    log.info("图上箱位自证：采纳 %d / 候选 %s"
+             % (len(_DESC_ADDED), _DESC_REPORT.get("采纳数")))
+
 if _bdgmap_meta:
     _bdgmap_meta["单元名并存"] = BDGMAP_NAMEMISS
     _bdgmap_meta["重号按坐标配对"] = BDGMAP_DUP_MATCHED
