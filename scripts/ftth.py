@@ -916,6 +916,10 @@ def main():
                          help="楼栋区间标题（如 `1-3号楼`）按区间语义展开为 1,2,3；"
                               "默认不展开（只取字面数字并 WARNING 待裁决）——须用户确认后启用")
     p_parse.add_argument("--out", default=None, help="输出 JSON 路径")
+    p_parse.add_argument("--title-band-tol", type=float, default=None,
+                         help="楼栋标题分带容差（y）；留空 → 2 倍层高自适应，层高不可得 → 单带")
+    p_parse.add_argument("--legacy-bldg-assign", action="store_true", default=False,
+                         help="【仅对拍】强制旧的纯 x 先到先得楼栋归属（忽略 y）")
     p_parse.add_argument("--text-layer", default=None)
     p_parse.add_argument("--text-type", default=None)
     p_parse.add_argument("--title-pattern", default=None)
@@ -1378,7 +1382,9 @@ def main():
         cmd = [args.dxf]
         if args.out:
             cmd += [args.out]
-        cmd += build_cmd(args, ("cmd", "dxf", "out", "config", "profile"))
+        cmd += build_cmd(args, ("cmd", "dxf", "out", "config", "profile", "legacy_bldg_assign"))
+        if args.legacy_bldg_assign:
+            cmd += ["--legacy-bldg-assign"]
         sys.exit(run_script("parse_dxf_structured.py", cmd))
     elif args.cmd == "coverage":
         rc = check_profile_gate("coverage", getattr(args, "profile", None))
