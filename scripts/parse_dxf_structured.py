@@ -43,6 +43,7 @@ from ftth_common import (
     setup_logger, bldg_num, floor_num_or_zero, parse_floor_label,
     load_dxf, collect_texts, find_bldg_anchors, cluster_by_x, compute_bldg_ranges, match_y_to_floor,
     compute_bldg_ranges_banded, assign_by_xy, bldg_range_diagnostics, group_shared_ranges,
+    column_consensus_y,
     MultiPlotDuplicateAnchorError,
     assign_floor_by_interval, clean_text, is_floor_text, require_params,
     floor_step_from_texts, set_expand_bldg_ranges,
@@ -732,32 +733,66 @@ else:
 bldg_ranges, _bldg_bands = compute_bldg_ranges_banded(
     [(k, v["x"], v.get("y")) for k, v in bldg_anchors.items()], band_tol=_band_tol, log=log)
 
+# 单锚点带：带内只有一组锚点 x → 区间由 `_ranges_from_x_groups` 的 **±1000 绝对常量**兜底。
+# 该常量与图纸比例无关（实测某图层高 6.5，±1000 相当于 153 倍层高）→ 命中必须显式告警
+# 并落产物，不得静默。（本轮三个真机项目未命中：每个带内最少 2 组锚点。）
+_SINGLE_ANCHOR_BANDS = []
+for _i, _b in enumerate(_bldg_bands):
+    _xs = sorted({round(float((bldg_anchors.get(_n) or {}).get("x")), 6)
+                  for _n in _b.get("names") or [] if bldg_anchors.get(_n)})
+    if len(_xs) <= 1:
+        _SINGLE_ANCHOR_BANDS.append({"带": _i + 1, "y0": _b.get("y0"),
+                                     "锚点x": _xs, "楼栋": _b.get("names")})
+        log.warning("  [单锚点带] 带%d(y0=%s) 内只有一组锚点 x=%s → 区间按 ±1000 绝对兜底给出，"
+                    "与图纸比例无关，须人工确认：%s"
+                    % (_i + 1, _b.get("y0"), _xs, "、".join(_b.get("names") or [])))
+
 log.info("\n楼栋x范围:")
 for bldg, (xmin, xmax) in bldg_ranges.items():
     log.info(f"  {bldg}: x {xmin:.1f}~{xmax:.1f}")
 
 # 共享区间（一张系统图服务多栋）：显式登记 —— 归属时按标题原文克隆，**不得**先到先得
 _shared_groups = group_shared_ranges(bldg_ranges)
+_shared_src = []
 for _g in _shared_groups:
     log.info("  [共享区间] %s 共用 x %.1f~%.1f（宽 %.1f）：同区间实体按标题原文克隆给全部楼栋"
              % ("、".join(_g["names"]), _g["lo"], _g["hi"], _g["hi"] - _g["lo"]))
+    # 共享组的**来源标题原文** —— 人工判「克隆是否成立」的唯一依据：
+    #   同一标题展开多栋（如 `7#、8#、10#住宅光纤入户系统图`）→ 克隆成立；
+    #   不同标题却落在同一 x 区间 → **疑假共享**，不得克隆，须报人。
+    _titles = sorted({str((bldg_anchors.get(_n) or {}).get("内容") or "").strip()
+                      for _n in _g["names"]})
+    _g2 = dict(_g)
+    _g2["源标题"] = _titles
+    _g2["判据"] = "同一标题展开多栋" if len(_titles) == 1 else "不同标题同区间（疑假共享）"
+    if len(_titles) != 1:
+        log.warning("  [疑假共享] %s 落在同一 x 区间，但来源标题不止一种：%s —— 不得克隆，须人工裁决"
+                    % ("、".join(_g["names"]), _titles))
+    _shared_src.append(_g2)
 
 # ---------- 楼栋区域边界重叠校验 ----------
 # 混合布局图纸中不同 y 行的楼栋（如住宅楼 y 行与配套楼 y 行），虽然**同带内** x 范围
 # 不相交，但跨带楼栋 x 范围可能紧邻、间距过小，导致实体按 x 归属时跨行混入邻楼。
 # 检测方式：对每对不同 y 行的楼栋，若 x 范围间距 < 同行楼栋间距中位数的一半，告警。
 import statistics as _stat
+# 2026-09-18 统一口径：y 分行**只允许一份实现** —— 直接复用上面
+# `compute_bldg_ranges_banded` 返回的 `_bldg_bands`（口径 = --title-band-tol 或 2×层高）。
+# 旧实现此处又重算一遍且硬编码 `abs(y - yg) < 100`，与归属侧的分带容差是**两套口径**
+# （同一维度两套口径必然漂移，且校验与归属会各说各话）。
 _y_groups = {}
-for bldg_name in bldg_ranges:
-    y = anchor_y_map.get(bldg_name, 0)
-    matched = False
-    for yg in list(_y_groups.keys()):
-        if abs(y - yg) < 100:
-            _y_groups[yg].append(bldg_name)
-            matched = True
-            break
-    if not matched:
-        _y_groups[y] = [bldg_name]
+_band_of = {}
+if len(_bldg_bands) > 1:
+    for _i, _b in enumerate(_bldg_bands):
+        _names_in = [n for n in (_b.get("names") or []) if n in bldg_ranges]
+        if _names_in:
+            _y_groups[_i] = _names_in
+            for _n in _names_in:
+                _band_of[_n] = _i
+else:
+    _k0 = (_bldg_bands[0].get("y0") if _bldg_bands else None)
+    _y_groups[0 if _k0 is None else _k0] = list(bldg_ranges)
+    for _n in bldg_ranges:
+        _band_of[_n] = 0
 
 if len(_y_groups) > 1:
     # 计算同行楼栋间距中位数
@@ -777,7 +812,7 @@ if len(_y_groups) > 1:
                 n2, (x2lo, x2hi) = sorted_bldg_list[j]
                 y1 = anchor_y_map.get(n1, 0)
                 y2 = anchor_y_map.get(n2, 0)
-                if abs(y1 - y2) > 100:
+                if _band_of.get(n1) != _band_of.get(n2):
                     gap = x2lo - x1hi
                     if gap < threshold:
                         log.warning(
@@ -800,8 +835,28 @@ _ASSIGN_STAT = Counter()
 _SHARE_CLONE = Counter()
 _PENDING_ASSIGN = []
 
-def _assign(x, y, content):
-    """按 (x,y) 归属楼栋 → names 列表（长度>1 = 共享区间，须克隆给全部）。"""
+# ---------- 列共识 y（2026-09-18 新增） ----------
+# 病灶（实测、坐标级）：跨带 x 重叠时**逐点**按 y 就近归属，会把同一条楼层刻度列在带分界
+#   处拦腰拆开 —— 实测某图 x 完全相同的 12 个刻度（B1,1F..10F,WF，步长=层高）被判成
+#   上半列归住宅、下半列归配套楼，下游表现为「住宅少 5 层、配套楼多 4 层」，且同 x 的
+#   另两栋（共享该图的）整列落空。皮线标注列同样被拆成 10/10。
+# 处置：同一 x（精确同值）的实体是一条「列」＝同一张系统图的同一根楼层轴，**不可按 y 拆**；
+#   判带时用列的 y 中位代表该列。**只对「x 命中 >=2 个楼栋区间」的点启用**，其余点仍用
+#   自身 y（故单候选点与改造前逐位一致）。
+_COL_Y = column_consensus_y(list(texts) + list(insert_items))
+_COL_USED = Counter()
+
+
+def _hits_n(x):
+    """x 命中的楼栋区间个数（用于判定是否需要列共识）。"""
+    return sum(1 for (lo, hi) in bldg_ranges.values() if lo <= x <= hi)
+
+def _assign(x, y, content, y_repr=None):
+    """按 (x,y) 归属楼栋 → names 列表（长度>1 = 共享区间，须克隆给全部）。
+
+    y_repr：该点所属**列**的代表 y（同 x 列的 y 中位）。仅当 x 命中 >=2 个楼栋区间时
+    才用它替代自身 y —— 跨带重叠区逐点判 y 会把一条列拆给两栋（见上方「列共识 y」）。
+    """
     if args.legacy_bldg_assign:            # 对拍：旧行为（纯 x + dict 序先到先得）
         for bldg, (xmin, xmax) in bldg_ranges.items():
             if xmin <= x <= xmax:
@@ -809,18 +864,23 @@ def _assign(x, y, content):
                 return [bldg]
         _ASSIGN_STAT["legacy未命中"] += 1
         return []
-    _names, _reason = assign_by_xy(x, y, bldg_ranges, anchor_y_of)
+    _yy = y
+    if y_repr is not None and _hits_n(x) >= 2:
+        _yy = y_repr                                  # 列共识：跨带重叠时按「列」判带
+        _COL_USED[round(x, 6)] += 1
+    _names, _reason = assign_by_xy(x, _yy, bldg_ranges, anchor_y_of)
     _ASSIGN_STAT[_reason.split("(")[0]] += 1
     if len(_names) > 1:
         _SHARE_CLONE[tuple(_names)] += 1
     elif (not _names) and _reason.startswith("重叠无y判据"):
-        _PENDING_ASSIGN.append({"x": round(x, 2), "y": y, "内容": content, "原因": _reason})
+        _PENDING_ASSIGN.append({"x": round(x, 2), "y": y, "列代表y": _yy,
+                                "内容": content, "原因": _reason})
     return _names
 
 # 为 INSERT 实体分配楼栋归属（须在 bldg_ranges 计算之后）
 if insert_items:
     for ins in insert_items:
-        _names = _assign(ins["x"], ins.get("y"), ins.get("块名"))
+        _names = _assign(ins["x"], ins.get("y"), ins.get("块名"), _COL_Y.get(id(ins)))
         ins["楼"] = _names[0] if _names else None
         if len(_names) > 1:
             ins["楼_共享"] = _names
@@ -828,7 +888,7 @@ if insert_items:
 # 为每栋楼分配文字（共享区间 → 同一批文字克隆给组内每一栋，不再先到先得）
 bldg_texts = defaultdict(list)
 for t in texts:
-    for _n in _assign(t["x"], t.get("y"), t.get("内容")):
+    for _n in _assign(t["x"], t.get("y"), t.get("内容"), _COL_Y.get(id(t))):
         bldg_texts[_n].append(t)
 
 # ---------- 区间自检：把「区间装不下自己的实体」显式报出（2026-09-18 新增） ----------
@@ -883,6 +943,48 @@ elif _BIZ_ORPHAN:
     log.info("  [业务实体落空] %d 条含业务特征的文字位于全部楼栋区间之外且远离边界"
              "（判据：距边界 >= 本栋区间宽的 1/4）→ 判为独立图区（总图/平面图/别带），已排除"
              % len(_BIZ_ORPHAN))
+
+# ---------- 孤儿分类账（2026-09-18 新增） ----------
+# 「未命中」常占全图文字 40%~60%（实测三项目 175~393 条/图），此前只有一个总数 ——
+# 既看不出是「独立图区（图例/材料表/图框）」还是「被边界切出」，也无法核对与复现。
+# 现按**机械判据**分类计数（只登记、不裁决），并把每类样本落产物：
+#   ①贴边疑切出 —— 距最近区间边界 < τ（τ = 0.25×最近楼栋区间宽，与既有可疑口径同源）
+#   ②跨带落空   —— x 落在**别带**的区间内（本带无区间覆盖）
+#   ③带内缝隙   —— x 在本带包络内，但落在相邻区间之间
+#   ④图区外     —— x 在本带包络（含 τ 余量）之外 → 独立图区，被排除本来就是对的
+_band_env, _band_of_bldg = {}, {}
+for _i, _b in enumerate(_bldg_bands):
+    _rs = [bldg_ranges[_n] for _n in (_b.get("names") or []) if _n in bldg_ranges]
+    if _rs:
+        _band_env[_i] = (min(r[0] for r in _rs), max(r[1] for r in _rs))
+    for _n in (_b.get("names") or []):
+        _band_of_bldg[_n] = _i
+_ORPHAN_CLS = Counter()
+_ORPHAN_SAMPLE = defaultdict(list)
+for _o in _RANGE_DIAG["孤儿"]:
+    _x = _o.get("x") or 0.0
+    _nb = _o.get("最近楼栋")
+    _bw = _wmap.get(_nb, 0.0)
+    _tau = 0.25 * _bw if _bw > 0 else 0.0
+    _bi = _band_of_bldg.get(_nb)
+    _env = _band_env.get(_bi) if _bi is not None else None
+    if _tau > 0 and _o.get("距边界") is not None and _o["距边界"] < _tau:
+        _cls = "①贴边疑切出"
+    elif [n for n, (lo, hi) in bldg_ranges.items()
+          if lo <= _x <= hi and _band_of_bldg.get(n) != _bi]:
+        _cls = "②跨带落空"
+    elif _env and (_env[0] <= _x <= _env[1]):
+        _cls = "③带内缝隙"
+    else:
+        _cls = "④图区外(独立图区)"
+    _ORPHAN_CLS[_cls] += 1
+    if _o.get("业务实体"):
+        _ORPHAN_CLS[_cls + "/含业务特征"] += 1
+    if len(_ORPHAN_SAMPLE[_cls]) < 3:
+        _ORPHAN_SAMPLE[_cls].append("%s@x%.1f" % (str(_o.get("内容"))[:16], _x))
+log.info("  [孤儿分类账] 合计 %d 条：%s"
+         % (len(_RANGE_DIAG["孤儿"]),
+            " ｜ ".join("%s=%d" % (k, v) for k, v in sorted(_ORPHAN_CLS.items()))))
 
 # ---------- 尺度锚：阈值按层高自适应（2026-09-15 通用化，须在 split_units 系列首次使用 args.* 前解析） ----------
 # 比值的历史出处：层高 30 时 unit_cluster=30 / unit_range=120 / y_tol=2（原手调默认值）。
@@ -1047,13 +1149,25 @@ result = {
         "分带容差": _band_tol,
         "带": _bldg_bands,
         "区间": {_b: [round(_lo, 3), round(_hi, 3)] for _b, (_lo, _hi) in bldg_ranges.items()},
-        "共享区间": _shared_groups,
+        "共享区间": _shared_src,
         "归属统计": dict(_ASSIGN_STAT),
         "共享克隆": {"、".join(_k): _v for _k, _v in _SHARE_CLONE.items()},
-        "待裁决归属": _PENDING_ASSIGN[:100],
-        "区间过窄": _NARROW,
-        "业务实体落空": _BIZ_ORPHAN[:100],
-        "业务实体落空_可疑": _BIZ_ORPHAN_SUSPECT[:100],
+        # 列共识判带：跨带重叠时改用「同 x 列」的 y 中位判带（防一条列被拆给两栋）。
+        # 只列参与的点数与列 x，供人工复核「这条列凭什么判给这个带」。
+        "列共识判带": {"条数": sum(_COL_USED.values()),
+                       "列数": len(_COL_USED),
+                       "列x": [{"x": _k, "条数": _v}
+                               for _k, _v in sorted(_COL_USED.items())[:50]]},
+        "单锚点带": _SINGLE_ANCHOR_BANDS,
+        # 2026-09-18：**截断必须带总数** —— 旧实现只存前 100 条且不记总数，下游看到 100 会
+        #   当成全部（实测两处真值均 >=100，属「没核不得输出成通过」同族缺陷）。
+        "待裁决归属": {"总数": len(_PENDING_ASSIGN), "展示": _PENDING_ASSIGN[:100]},
+        "区间过窄": {"总数": len(_NARROW), "展示": _NARROW[:100]},
+        "业务实体落空": {"总数": len(_BIZ_ORPHAN), "展示": _BIZ_ORPHAN[:100]},
+        "业务实体落空_可疑": {"总数": len(_BIZ_ORPHAN_SUSPECT), "展示": _BIZ_ORPHAN_SUSPECT[:100]},
+        "孤儿总数": len(_RANGE_DIAG["孤儿"]),
+        "孤儿分类账": dict(sorted(_ORPHAN_CLS.items())),
+        "孤儿分类样本": {k: v for k, v in sorted(_ORPHAN_SAMPLE.items())},
         "锚点间距中位": _med_gap,
         "自检": {"楼栋": _RANGE_DIAG["楼栋"], "异常": _RANGE_DIAG["异常"]},
     },

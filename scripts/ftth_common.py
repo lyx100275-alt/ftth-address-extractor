@@ -1745,6 +1745,7 @@ def assign_by_xy(x, y, ranges, anchor_y_of=None, eps=1e-6):
         "x唯一命中"             —— 与旧实现行为逐位一致
         "共享锚点(同区间N栋)"    —— 一张图服务多栋，按标题原文克隆
         "y就近(候选N)"          —— 区间重叠，取 |y-锚点y| 最小者（几何测量，非推理）
+        "y就近+共享克隆(候选N)"   —— 同上前提，但选中项属共享区间 → 返回**整组**
         "重叠无y判据(候选N)"     —— **不静默择一**：调用方须登记为待裁决
         "x未落入任何楼栋区间"    —— 孤儿
     """
@@ -1762,9 +1763,44 @@ def assign_by_xy(x, y, ranges, anchor_y_of=None, eps=1e-6):
             def _dy(h):
                 return (abs(y - anchor_y_of[h[0]]), -(h[2] - h[1]))
             best = min(have, key=_dy)
+            # 2026-09-18 修：选中项若属**共享区间**（一图服务多栋），必须把该组**整组**
+            # 返回 —— 否则同组其余楼栋被独吞。实测某图 y 就近分支把这批点全给了同组
+            # 其中一栋，致同组另两栋整列落空（8#/10# 楼层表为空）。
+            _bk = (round(best[1], 6), round(best[2], 6))
+            _grp = sorted(b for b, lo, hi in hits if (round(lo, 6), round(hi, 6)) == _bk)
+            if len(_grp) > 1:
+                return _grp, "y就近+共享克隆(候选%d)" % len(hits)
             return [best[0]], "y就近(候选%d)" % len(hits)
     # 多候选、且 y 不可比 —— 不猜，交调用方报裁决
     return [], "重叠无y判据(候选%d)" % len(hits)
+
+
+def column_consensus_y(items, x_key="x", y_key="y", ndigits=6):
+    """同 x（精确到 ndigits 位小数）实体视为一条「列」，返回 {id(item): 列的 y 中位}。
+
+    动机（实测，非推理）：跨带 x 重叠时**逐点**按 y 就近归属，会把同一条楼层刻度列
+    在带分界处拦腰拆开 —— 实测某图 1F~6F 归住宅、7F~WF 归配套楼，下游表现为
+    甲栋少 5 层、乙配套楼多 4 层，且同 x 的另一栋整列落空。
+    一条列来自同一张系统图（同一根楼层轴），**不可按 y 拆开**，故判带须以「列」为
+    单位取共识（列内 y 中位）。调用方只应对「x 命中多个楼栋区间」的点使用本值，
+    其余点仍用自身 y —— 保证单候选点与改造前逐位一致（零回归）。
+    """
+    buckets = {}
+    for it in items:
+        x = it.get(x_key)
+        if x is None:
+            continue
+        buckets.setdefault(round(float(x), ndigits), []).append(it)
+    out = {}
+    for _x, grp in buckets.items():
+        ys = sorted(float(it[y_key]) for it in grp if it.get(y_key) is not None)
+        if not ys:
+            continue
+        n = len(ys)
+        med = ys[n // 2] if n % 2 else (ys[n // 2 - 1] + ys[n // 2]) / 2.0
+        for it in grp:
+            out[id(it)] = med
+    return out
 
 
 def group_shared_ranges(ranges):
