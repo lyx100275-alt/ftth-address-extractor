@@ -565,15 +565,26 @@ def main(argv=None):
                 % (len(_tol_missing), ex))
             return 1
         if _tol_est is None:
+            # rc 语义修复（2026-09-18 实跑）：本条**不是「命令自身失败」**，而是
+            #   **本图未提供图签形态的成对标注**（图层内「楼名」与「层户」标注不同时
+            #   出现足够的量），属申报制下的 rc=3 早失败：跳过 + 走降级路径，
+            #   不是错误、不需重试、不必去调参。
+            #   此前 return 1 会让调用方把「图上没有」呈现成「脚本坏了」
+            #   （实测 pipeline 打出 `! titleblock 阶段 rc=1 —— 第二来源本次未取得` 的
+            #   告警形态），把排错方向误导到「校正正则 / 补传容差」。
+            #   注意上一分支（ToleranceEstimateError，量测到但排版自相矛盾）仍保持
+            #   rc=1：那是"确实有问题"，与"本图没有"是两回事。
             sys.stderr.write(
-                '[ERROR] read_titleblock_households: 有 %d 项几何容差未显式传入，'
-                '而按图自适应也量不出来——\n'
-                '  图层 %s 内没有同时出现足够的「楼名」与「层户」标注。\n'
-                '  请用 --bldg-re / --lev-re 校正正则，或显式传入 6 个容差'
-                '（可先用 probe_titleblock_tolerances.py 量测）。%s\n'
-                % (len(_tol_missing), a.floor_layer,
+                '[SKIP] read_titleblock_households: 本图未提供图签形态的成对标注'
+                '（图层 %s 内没有同时出现足够的「楼名」与「层户」标注），'
+                '有 %d 项几何容差按图无从量测。\n'
+                '  处置：rc=3（本图不适用，非错误）——第二来源本次不参与，'
+                '调用方应跳过本环节并注明「本次未做」。\n'
+                '  若确认本图另有可读的层户标注，请用 --bldg-re / --lev-re 校正正则，'
+                '或显式传入 6 个容差（可先用 probe_titleblock_tolerances.py 量测）。%s\n'
+                % (a.floor_layer, len(_tol_missing),
                    _layer_candidates_hint(a.dxf, a.bldg_re, a.lev_re)))
-            return 1
+            return 3
         for n in _tol_missing:
             setattr(a, n, _tol_est[n])
         _still = [n for n in _tol_missing if getattr(a, n) is None]
