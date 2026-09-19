@@ -1674,6 +1674,35 @@ def cluster_by_x(items, threshold, x_key=None):
     return clusters
 
 
+def cluster_by_y(items, tol, y_of):
+    """按 y「锚定分带」——唯一实现（2026-09-19 八十二上收）。
+
+    语义（与 compute_bldg_ranges_banded 既有口径**逐位一致**）：
+      · 过滤 y 为 None 的成员后按 y 升序稳定排序；
+      · 每带的锚是**带首 y0**，带内成员不改变锚点 —— abs(y - y0) <= tol 归入本带；
+      · 这与 cluster_chain_mean / cluster_by_x 的「链式」语义不同（链式跟上一个
+        入簇值比较、锚点随成员移动），两族不可互换：锚定保证带不因带内缓坡无限生长。
+    此前该循环在 compute_bldg_ranges_banded 与 analyze_coverage.py 的标题分带
+    各抄一份 —— 即「两处各抄一份必然漂移」的现行形态，上收后只此一份。
+
+    参数:
+        items: 任意对象列表；y_of(it) 取 y（None 成员被跳过）
+        tol: 带容差（绝对图纸单位）
+        y_of: it -> y 的取值函数
+
+    返回 [{"y0":.., "items":[...]}, ...]（y0 升序；items 保持 y 升序稳定序）。
+    """
+    out = []
+    for it in sorted((it for it in items if y_of(it) is not None),
+                     key=lambda t: y_of(t)):
+        y = y_of(it)
+        if out and abs(y - out[-1]["y0"]) <= tol:
+            out[-1]["items"].append(it)
+        else:
+            out.append({"y0": y, "items": [it]})
+    return out
+
+
 # ---------- 楼栋 x 范围计算（中分法） ----------
 def _x_groups(items):
     """[(name, x), ...] → [(x, [name, ...]), ...]（x 升序，同一 x 的锚点并组）。
@@ -1738,14 +1767,11 @@ def compute_bldg_ranges_banded(anchors, band_tol=None, log=None):
         return (_ranges_from_x_groups(_x_groups([(n, x) for n, x, _y in items])),
                 [{"y0": None, "names": [n for n, _x, _y in items]}])
 
-    bands = []          # [{"y0": float, "items": [(name, x)]}]
-    for name, x, y in sorted(items, key=lambda t: (t[2] is None, t[2])):
-        if y is None:
-            continue
-        if bands and abs(y - bands[-1]["y0"]) <= band_tol:
-            bands[-1]["items"].append((name, x))
-        else:
-            bands.append({"y0": y, "items": [(name, x)]})
+    # 2026-09-19（八十二）上收：分带循环改走唯一实现 cluster_by_y（语义逐位不变：
+    #   None 跳过、带首 y0 锚定）。此前此处与 analyze_coverage.py 的标题分带各抄一份。
+    #   注意：cluster_by_y 透传完整成员 (name,x,y)，而本函数下游按 (name,x) 消费 → 映射回二元组。
+    bands = [{"y0": _b["y0"], "items": [(_t[0], _t[1]) for _t in _b["items"]]}
+             for _b in cluster_by_y(items, band_tol, y_of=lambda t: t[2])]
 
     ranges = {}
     band_info = []
@@ -1845,8 +1871,8 @@ def assign_by_xy(x, y, ranges, anchor_y_of=None, eps=1e-6):
     return [], "重叠无y判据(候选%d)" % len(hits)
 
 
-def column_consensus_y(items, x_key="x", y_key="y", ndigits=6):
-    """同 x（精确到 ndigits 位小数）实体视为一条「列」，返回 {id(item): 列的 y 中位}。
+def column_consensus_y(items, x_key="x", y_key="y", ndigits=6, x_tol=None):
+    """同 x 实体视为一条「列」，返回 {id(item): 列的 y 中位}。
 
     动机（实测，非推理）：跨带 x 重叠时**逐点**按 y 就近归属，会把同一条楼层刻度列
     在带分界处拦腰拆开 —— 实测某图 1F~6F 归住宅、7F~WF 归配套楼，下游表现为
@@ -1854,15 +1880,33 @@ def column_consensus_y(items, x_key="x", y_key="y", ndigits=6):
     一条列来自同一张系统图（同一根楼层轴），**不可按 y 拆开**，故判带须以「列」为
     单位取共识（列内 y 中位）。调用方只应对「x 命中多个楼栋区间」的点使用本值，
     其余点仍用自身 y —— 保证单候选点与改造前逐位一致（零回归）。
+
+    2026-09-19（八十二）新增 x_tol：给定时改用**链式聚类**分列（x 升序、相邻差
+    <= x_tol 归同列，语义同 cluster_chain_mean），代替 ndigits 精确同值分桶 ——
+    后者对手工排版的 x 微差过脆：同一条刻度列会分裂成多个子列、各取各的中位，
+    共识 y 随之漂移。None（默认）保持精确同值分桶，行为与历史版本逐位一致。
     """
-    buckets = {}
-    for it in items:
-        x = it.get(x_key)
-        if x is None:
-            continue
-        buckets.setdefault(round(float(x), ndigits), []).append(it)
+    if x_tol is None:
+        buckets = {}
+        for it in items:
+            x = it.get(x_key)
+            if x is None:
+                continue
+            buckets.setdefault(round(float(x), ndigits), []).append(it)
+        groups = list(buckets.items())
+    else:
+        cols = []  # [ [列内最后x, [items]], ... ]（x 升序）
+        for it in sorted((it for it in items if it.get(x_key) is not None),
+                         key=lambda t: float(t[x_key])):
+            x = float(it[x_key])
+            if cols and x - cols[-1][0] <= x_tol:
+                cols[-1][0] = x
+                cols[-1][1].append(it)
+            else:
+                cols.append([x, [it]])
+        groups = [(c[0], c[1]) for c in cols]
     out = {}
-    for _x, grp in buckets.items():
+    for _x, grp in groups:
         ys = sorted(float(it[y_key]) for it in grp if it.get(y_key) is not None)
         if not ys:
             continue

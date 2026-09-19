@@ -918,6 +918,8 @@ def main():
     p_parse.add_argument("--out", default=None, help="输出 JSON 路径")
     p_parse.add_argument("--title-band-tol", type=float, default=None,
                          help="楼栋标题分带容差（y）；留空 → 2 倍层高自适应，层高不可得 → 单带")
+    p_parse.add_argument("--consensus-x-tol", type=float, default=None,
+                         help="列共识分列容差（x）；留空 = 精确同值分桶（历史行为）")
     p_parse.add_argument("--legacy-bldg-assign", action="store_true", default=False,
                          help="【仅对拍】强制旧的纯 x 先到先得楼栋归属（忽略 y）")
     p_parse.add_argument("--text-layer", default=None)
