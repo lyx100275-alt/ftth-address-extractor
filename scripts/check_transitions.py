@@ -40,6 +40,16 @@ import json
 import os
 import sys
 
+# 控制台 UTF-8 兜底：中文 Windows 默认 GBK，print CJK 即崩；被替换的流则跳过。
+# （共享实现见 ftth_common.ensure_console_utf8；本文件只依赖 ledger_state，故内联。）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _rec = getattr(_s, "reconfigure", None)
+        if callable(_rec):
+            _rec(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ledger_state as LS  # noqa: E402  （同目录模块，复用其 schema 常量与读取函数）
 

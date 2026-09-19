@@ -329,13 +329,13 @@ P列(某层某户) = 该层所属分纤箱编号
 
 产出图纸同目录 `<DXF>.geom.json`（文字/INSERT/线段/图层统计/包围盒，含 `closed` 标记）。下方探查清单第 1 项的全部几何统计，以及本会话后续任何内联临时查询，**读该 JSON 即可，不再回原图解析**。
 
-⚠️ **`geom.json` 字段序（schema v3）有三坑**，读错会白跑一轮 —— 三坑清单、完整 schema 与 `_src` 失效判据（`mtime+size+GEOM_VERSION`）见 [pipeline_details.md §16](references/pipeline_details.md)。**需要"多段线整组顶点"或"INSERT 块属性"的脚本必须走 `load_dxf`（pkl 缓存），不能走 `load_geom`**。
+⚠️ `geom.json`三坑（读错白跑一轮）与schema见[pipeline_details §16]；要整组顶点/块属性走`load_dxf`，不走`load_geom`。
 
-对每张新DXF，先用ezdxf探查以下信息，**不预设任何项目特有参数**（完整子项与判据见 [probe_checklist.md](references/probe_checklist.md)）：
+对每张新DXF，先用ezdxf探查（**不预设任何项目特有参数**；全子项与判据见 [probe_checklist.md](references/probe_checklist.md)）：
 
-1. **六项基础探查**：图层清单（含FTTH标注层）/ 文字实体类型 / 文字内容采样 / 坐标尺度感知（**不假设固定阈值**）/ 线段实体 / INSERT 实体——**按属性值识别设备、不按块名**（块名随图而异）
-2. **编号↔楼栋/单元对照表检查（如有，必须先做）**：**按内容特征定位、不看图名**（楼栋单元标注 + FX 编号 + 楼层标注三者同行/邻近），提取 FX→楼栋→单元→安装楼层权威映射；**`--bldg-map` 优先于任何几何归属**；楼栋正则须覆盖本图全部行写法（先枚举实际写法再定 `--bldg-pattern`）；映射须人工目视核对。**判为 absent/variant 时不得以任何坐标推算代替** —— 分纤箱所在楼层/覆盖/每层户数只允许四种方法来源（2026-09-18 用户裁决）。
-3. **单元×箱交叉清点**：骨架与箱清单（对照表/箱位标注）双向差集，两个方向均报人；**任一源缺席记「未核」，非「全无箱」**。
+1. **六项基础探查**（图层/文字/采样/尺度/线段/INSERT；**按属性值识别设备、不按块名**）
+2. **对照表检查（如有，先做）**：按内容特征定位提映射（`--bldg-map` 优先几何；正则先枚举本图写法；映射须人工目视核对；absent/variant不推算）
+3. **单元×箱交叉清点**：双向差集，缺席记「未核」。
 
 探查结果决定后续解析脚本使用的参数（图层名、文字类型、坐标阈值等），**不硬编码**。
 
@@ -347,11 +347,10 @@ P列(某层某户) = 该层所属分纤箱编号
 ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 ```
 
-- `plan_methods.py` 读 `methods/signals.json` 的 13 个信号逐项判定本图状态并写 evidence，生成 `candidates[]`；**`--probe` 回填检测类参数**（命令行显式优先，实际生效值与来源记在 `param_source_actual`，**出画像后先核对它**）。
-- 画像给出与已沉淀档案（`methods/*/manifest.json`）的**一致率对比**，低者即新形态 → 按 [measurement_methods.md](references/measurement_methods.md) §五 走接入 SOP（含 ⑤沉淀 / ⑥回归）。schema 见同文件 §4.2。
+- 画像：`plan`逐信号判定写evidence（先核对`param_source_actual`）；与档案一致率低即新形态，走measurement_methods §4.2/§五接入SOP。
 - **交接契约与总图判据**见 **L1-C3** / **L1-C4**。
 
-**探查搜索纪律**（2026-09-14 用户确立；事故记录见 [visual_model_lessons.md](references/visual_model_lessons.md) §四）：**① 禁止预设狭窄搜索范围**；**② 禁止用关键词过滤做首次扫描**（首次必须无过滤打印全部 TEXT/MTEXT）；**③ 找不到标注时必须检查实体内容**（有 INSERT/LINE 但没标注＝标注被遗漏，必须继续找）。
+**探查搜索纪律**：禁窄范围、禁关键词首扫、无标注查实体（见visual_model_lessons §四）。
 
 #### Step 1b: 结构化解析
 
@@ -393,9 +392,9 @@ ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 
 **其余必查项（四条硬点；完整 26 条清单见 [step2_selfcheck.md](references/step2_selfcheck.md) —— 出表前必须逐条过）**
 
-- **口径**：户数**先判形态**（箱=层 + `xN` 乘数 → `count-box` rc=2 拦断；皮线口径启用前按 `(x,y)` 去重）；楼层归属确认用**区间法**（非最近楼层线法），楼层数两方交叉、单元列数与对照表比对。
+- **口径**：户数先判形态（箱=层+xN→count-box rc=2拦断；皮线先去重）；归属用区间法。
 - **空集合不得判 PASS**：核查项在「有效对象数 = 0」时只能判 `SKIP` 并写明原因，**不得判 PASS，也不得把空集合的合计写成 `0`**（实测 C5 曾输出「整图户数合计 0」、C8 曾对 0 个单元判 PASS）—— 否则「**没取到数**」会看起来像「**数就是 0**」，属最隐蔽的静默丢数。未取到数须显式交接给图标法（`count-box`）。
-- **覆盖三字段 + 两类图纸交叉**：逐箱 `覆盖楼层`/`判定依据`/`依据来源` 齐全，**有真值表必须跑 `verify_coverage_truth.py` 反查**（0 个不一致才算通过）；对照表与系统图互验、矛盾即停，**户数以带逐层户数标注的那张为准，不读楼层平面图**，`*N`/`xN` 乘数处**图标数 ≠ 户数**交用户裁决。
+- **覆盖三字段+交叉**：逐箱三字段齐全；有真值表必跑verify反查；户数以逐层标注图为准（不读平面图）；乘数处图标数≠户数交裁决。
 
 ### Step 3: 提交用户校验
 
@@ -420,9 +419,9 @@ ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 
 **实现方式**：`gen_addressbook.py` —— `--dxf-json` 解析 JSON、`--coverage-json` 裁决后覆盖 JSON、`--template` 仅取表头列结构（**不复制示例数据**）、`--addr` 前5级地址（**留空须显式传空串**，省略会回退读模板第2行示例值，与留空不等价）。生成后**回读校验**（**L1-C6**）。完整参数与可抄示例见 [scripts_reference.md](references/scripts_reference.md)。
 
-**多楼栋合并出表**：逐栋解析 → `merge_json.py` 合并 → `gen_addressbook.py --dxf-json 合并JSON`；某栋楼层户数为全楼合计时先用 `split_units.py` 按用户确认规则拆分。
+**多楼栋合并**：逐栋解析→`merge_json`合并→gen；全楼合计户数先`split_units`拆分（用户确认规则）。
 
-**九级地址树形态出表**：用 `scripts/gen_9level_addressbook.py`，**不要用 `gen_addressbook.py`**；`--header-xlsx` 必需（**表头取项目已定稿的表，禁止自造**）；内置行数恒等式校验（**L1-C6**），不通过即报错退出。命令示例见 [scripts_reference.md](references/scripts_reference.md)。可直接吃 `read_titleblock_households.py` 的输出，自动按单元数展开并对"单元数>1 各单元同配置"告警（图上无逐单元证据，需核对）。
+**九级树**：用`gen_9level`（不用gen_addressbook）；`--header-xlsx`必需（表头取定稿表）；恒等式见L1-C6；单元数>1同配置展开须核对。
 
 ## 参考文件
 

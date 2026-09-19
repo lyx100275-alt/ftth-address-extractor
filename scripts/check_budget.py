@@ -33,6 +33,16 @@ import json
 import os
 import sys
 
+# 控制台 UTF-8 兜底：中文 Windows 默认 GBK，print CJK 即崩；被替换的流则跳过。
+# （共享实现见 ftth_common.ensure_console_utf8；本文件刻意零依赖，故内联。）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _rec = getattr(_s, "reconfigure", None)
+        if callable(_rec):
+            _rec(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 DEFAULT_BUDGET = {
     "warning_bytes": 47000,
     "hard_limit_bytes": 49000,
@@ -89,6 +99,41 @@ def judge(size, budget):
     return "OK", 0, "距预警线还有 %d B" % (warn - size)
 
 
+def eol_info(path):
+    """→ (换行风格, CRLF行数, LF归一化字节数)。
+
+    2026-09-19 八十九：闸门量磁盘字节，而磁盘字节受 EOL 影响
+    （实测 SKILL.md CRLF/LF 摆幅 447 B vs 硬上限余量 21 B）。
+    输出换行风格与 LF 归一字节，让“形态变化”可见；判罚口径仍是磁盘字节（不改语义）。
+    """
+    try:
+        with open(path, "rb") as f:
+            b = f.read()
+    except OSError:
+        return "未知", -1, -1
+    crlf = b.count(b"\r\n")
+    lf = b.count(b"\n") - crlf
+    if crlf and lf:
+        style = "MIXED"
+    elif crlf:
+        style = "CRLF"
+    else:
+        style = "LF"
+    return style, crlf, len(b.replace(b"\r\n", b"\n"))
+
+
+def tight_margin_note(size, budget):
+    """距硬上限不足 1000 B 时的二次信号（rc 不变，只加字）。
+
+    背景：此前只有 预警/硬上限 两条线，余量 21 B 时 WARN 的 rc 仍是 0，
+    “马上越线”没有任何信号。本函数只提示，不改变任何判罚。
+    """
+    left = budget["hard_limit_bytes"] - size
+    if 0 <= left < 1000:
+        return "；⚠ 距硬上限仅剩 %d B（<1000，先外移再新增）" % left
+    return ""
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="SKILL.md / references 体量闸门（阈值取自 version.json，单一权威）")
@@ -118,7 +163,9 @@ def main():
     sk_size = os.path.getsize(sk)
     state, drc, note = judge(sk_size, budget)
     rc = max(rc, drc)
-    print("  SKILL.md  %d B  [%s] %s" % (sk_size, state, note))
+    _st, _nc, _lf = eol_info(sk)
+    print("  SKILL.md  %d B  [%s] %s%s" % (sk_size, state, note, tight_margin_note(sk_size, budget)))
+    print("    换行：%s（CRLF %d 行，LF 归一 %d B）" % (_st, _nc, _lf))
 
     # references 单文件同受约束（否则闸门只是把问题搬家）
     refs = sorted(glob.glob(os.path.join(root, "references", "*.md")))
@@ -137,7 +184,10 @@ def main():
                 print("    %-38s %7d B  [%s] %s" % (os.path.basename(p), sz, st, nt))
             if worst is None or sz > worst[1]:
                 worst = (os.path.basename(p), sz)
-        print("    最大者：%s %d B（%s）" % (worst[0], worst[1], judge(worst[1], budget)[0]))
+        print("    最大者：%s %d B（%s）%s" % (worst[0], worst[1], judge(worst[1], budget)[0],
+              tight_margin_note(worst[1], budget)))
+        _wst, _wnc, _wlf = eol_info(os.path.join(root, "references", worst[0]))
+        print("    最大者换行：%s（CRLF %d 行，LF 归一 %d B）" % (_wst, _wnc, _wlf))
         n_bad = sum(1 for p in refs if judge(os.path.getsize(p), budget)[0] != "OK")
         if n_bad == 0:
             print("    全部 references 文件均在预警线内。")
