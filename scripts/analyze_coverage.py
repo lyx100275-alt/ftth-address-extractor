@@ -46,7 +46,7 @@ from ftth_common import (
     judge_pending_scope, pending_items_from_rulings,
     load_dxf, collect_texts, cluster_by_x, match_y_to_floor, assign_floor_by_interval,
     parse_floor_label, clean_text, is_floor_text, attrib_hit, require_params,
-    cluster_values_by_gap, measure_column_step,
+    cluster_values_by_gap, measure_column_step, cluster_by_y,
     RE_DRAWING_WORD,
 )
 
@@ -346,8 +346,8 @@ if FX_MAP:
 
     # ② 系统图标题锚点：先按 y 分带（配套图与住宅图常上下两带），带内再按 x 中分
     #    —— 用系统图自己的标题定 x，而不是用总图区 FX 文字的 x（后者是拓扑图/表格位置，与主干无关）
-    _bands = []
     _title_hits = []
+    _cands = []  # (y, x, nums)
     for _t in sorted(all_texts, key=lambda t: t["y"]):
         if not TITLE_RE or not TITLE_RE.search(_t["内容"]):
             continue
@@ -361,10 +361,11 @@ if FX_MAP:
                         "若实为区间请人工更正", _t["内容"])
         if not _nums:
             continue
-        if _bands and abs(_t["y"] - _bands[-1]["y0"]) <= args.title_band_tol:
-            _bands[-1]["items"].append((_t["x"], _nums))
-        else:
-            _bands.append({"y0": _t["y"], "items": [(_t["x"], _nums)]})
+        _cands.append((_t["y"], _t["x"], _nums))
+    # 2026-09-19（八十二）上收：分带改走唯一实现 cluster_by_y（带首 y0 锚定，
+    #   语义与原内联循环逐位一致）—— 此前与 compute_bldg_ranges_banded 各抄一份。
+    _bands = [{"y0": b["y0"], "items": [(it[1], it[2]) for it in b["items"]]}
+              for b in cluster_by_y(_cands, args.title_band_tol, y_of=lambda t: t[0])]
 
     # 标题池形态护栏（2026-09-16 新增，P1-2）：
     #   `--title-pattern` 的**匹配对象必须是图纸标题**（本技能普遍约定：含

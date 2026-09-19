@@ -66,6 +66,11 @@ ap.add_argument("out", nargs="?", default=None, help="输出JSON路径（默认D
 ap.add_argument("--title-band-tol", type=float, default=None,
                 help="楼栋标题分带容差（y）。相邻锚点 y 相差不超过本值者视为同一带，"
                      "带内再按 x 中分；留空 → 按 2 倍层高自适应，层高不可得 → 单带。")
+ap.add_argument("--consensus-x-tol", type=float, default=None,
+                help="列共识（跨带 x 重叠时按列取 y 中位）的分列容差（x）。"
+                     "留空 = 精确同值分桶（历史行为）；给值 = 链式聚类（x 升序相邻差"
+                     "<=本值归同列），修复手工排版 x 微差把同一条刻度列拆成多个子列。"
+                     "命名避开 count_box_icons.py 的 --col-x-tol（图标列容差，语义不同）。")
 ap.add_argument("--legacy-bldg-assign", action="store_true",
                 help="【仅对拍】强制旧的「纯 x 闭区间 + dict 序先到先得」楼栋归属（忽略 y）。"
                      "仅供 A/B 回归对拍，正式出表不得启用。")
@@ -741,11 +746,33 @@ for _i, _b in enumerate(_bldg_bands):
     _xs = sorted({round(float((bldg_anchors.get(_n) or {}).get("x")), 6)
                   for _n in _b.get("names") or [] if bldg_anchors.get(_n)})
     if len(_xs) <= 1:
-        _SINGLE_ANCHOR_BANDS.append({"带": _i + 1, "y0": _b.get("y0"),
-                                     "锚点x": _xs, "楼栋": _b.get("names")})
+        # 八十二：兜底区间仍为 ±1000（无真机命中案例，不臆改数值），但补**测量证据** ——
+        # 取该带 y 窗口（相邻带 y0 中分为界；首尾带用 band_tol 外延）内全部文字的 x 跨度，
+        # 人工据此即可判断 ±1000 是宽是窄，不再凭空猜。窗口推导失败则如实留空。
+        _y0 = _b.get("y0")
+        _ext = [None, None, 0]
+        if _y0 is not None:
+            _prev_y0 = _bldg_bands[_i - 1].get("y0") if _i > 0 else None
+            _next_y0 = _bldg_bands[_i + 1].get("y0") if _i + 1 < len(_bldg_bands) else None
+            _ylo = ((_prev_y0 + _y0) / 2 if _prev_y0 is not None
+                    else (_y0 - _band_tol if _band_tol else None))
+            _yhi = ((_y0 + _next_y0) / 2 if _next_y0 is not None
+                    else (_y0 + _band_tol if _band_tol else None))
+            if _ylo is not None and _yhi is not None:
+                _in = [t for t in texts
+                       if t.get("y") is not None and _ylo <= t["y"] <= _yhi
+                       and str(t.get("内容") or "").strip()]
+                if _in:
+                    _ext = [min(t["x"] for t in _in), max(t["x"] for t in _in), len(_in)]
+        _SINGLE_ANCHOR_BANDS.append({"带": _i + 1, "y0": _y0,
+                                     "锚点x": _xs, "楼栋": _b.get("names"),
+                                     "带内文字x跨度": (_ext[0], _ext[1]) if _ext[2] else None,
+                                     "带内文字条数": _ext[2]})
         log.warning("  [单锚点带] 带%d(y0=%s) 内只有一组锚点 x=%s → 区间按 ±1000 绝对兜底给出，"
-                    "与图纸比例无关，须人工确认：%s"
-                    % (_i + 1, _b.get("y0"), _xs, "、".join(_b.get("names") or [])))
+                    "与图纸比例无关，须人工确认：%s；带内文字实测 x %s（%d 条）"
+                    % (_i + 1, _b.get("y0"), _xs, "、".join(_b.get("names") or []),
+                       ("%.1f~%.1f" % (_ext[0], _ext[1])) if _ext[2] else "（窗口内无文字）",
+                       _ext[2]))
 
 log.info("\n楼栋x范围:")
 for bldg, (xmin, xmax) in bldg_ranges.items():
@@ -843,7 +870,8 @@ _PENDING_ASSIGN = []
 # 处置：同一 x（精确同值）的实体是一条「列」＝同一张系统图的同一根楼层轴，**不可按 y 拆**；
 #   判带时用列的 y 中位代表该列。**只对「x 命中 >=2 个楼栋区间」的点启用**，其余点仍用
 #   自身 y（故单候选点与改造前逐位一致）。
-_COL_Y = column_consensus_y(list(texts) + list(insert_items))
+_COL_ITEMS = list(texts) + list(insert_items)
+_COL_Y = column_consensus_y(_COL_ITEMS, x_tol=args.consensus_x_tol)
 _COL_USED = Counter()
 
 
