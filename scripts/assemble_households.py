@@ -35,7 +35,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ftth_common import protect_out_path
+from ftth_common import protect_out_path, UNIT_RE_SRC, unit_num
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -67,16 +67,22 @@ if not isinstance(cols, list) or not cols:
 
 
 def norm_unit(ukey, bkey=None):
-    """单元键归一（与 gen_addressbook._norm_unit_key 同则）：N单元 / 楼栋N单元 / 楼栋名→1单元"""
+    """单元键归一（与 gen_addressbook._norm_unit_key 同则）：N单元 / 楼栋N单元 / 楼栋名→1单元
+
+    数字写法兼容表见 ftth_common.UNIT_RE_SRC —— 图上并存 `1单元`（图签/对照表）
+    与 `一单元`（系统图单元轴），两者必须归一到同一个键（ASCII `N单元`），
+    否则跨来源 join 会静默失败。
+    """
     s = str(ukey).strip()
     if not s:
         return s
-    m = re.search(r"(\d+)\s*[#号]?\s*楼?\s*(\d+)\s*单元", s)
-    if m:
-        return "%s单元" % m.group(2)
-    m2 = re.fullmatch(r"(\d+)\s*单元", s)
-    if m2:
-        return "%s单元" % m2.group(1)
+    # 2026-09-19 修（P0）：原先首分支用单捕获组 `(\d+)…楼?…UNIT` 取的是串首数字，
+    #   `3#楼1单元` 被归一成 `3单元`（取了楼号），致 coverage 多箱错位并相互覆盖。
+    #   改走 ftth_common.unit_num 唯一入口（尾部 N单元 取号，与 gen/apply 同则，
+    #   另兼容一单元等中文写法）；楼栋名本身仍归 1单元。
+    _n = unit_num(s)
+    if _n is not None:
+        return "%d单元" % _n
     if bkey is not None and s == str(bkey).strip():
         return "1单元"
     return s
@@ -111,7 +117,8 @@ def parse_col_map(spec):
                 bkey, ukey = bkey.strip(), ukey.strip()
             else:
                 # 无斜杠：或为「楼栋N单元」全名，或为裸楼栋名（单单元楼 → 1单元）
-                m = re.fullmatch(r"(.+?\d+\s*[#号]?\s*楼?)\s*(\d+\s*单元)", u)
+                #   单元号兼容 ASCII 与中文数字（见 ftth_common.UNIT_RE_SRC）
+                m = re.fullmatch(r"(.+?\d+\s*[#号]?\s*楼?)\s*(" + UNIT_RE_SRC + r")", u)
                 if m:
                     bkey, ukey = m.group(1).strip(), m.group(2).strip()
                 else:

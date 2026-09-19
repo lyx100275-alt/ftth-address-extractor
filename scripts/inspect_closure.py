@@ -533,6 +533,25 @@ def main():
         R.check("C6", "覆盖闭合", "SKIP", "未提供 coverage JSON")
     else:
         n_ok = n_noclue = n_outof = 0
+        # 2026-09-19 修复（与 C3 同一条件、同一处置）：coverage 提供了 JSON，但**箱级
+        #   记录为 0** 时，上面那个 `for blk, un, fid, ... in boxes` 循环里每个箱都会
+        #   走到 `if not recs: continue` —— 循环体一次有效判定都没做，三个计数全 0，
+        #   末行 `st = "PASS" if (n_noclue == 0 and n_outof == 0)` 于是输出
+        #   「[PASS] 覆盖闭合 —— 闭合 0 / 缺线索 0 / 安装层越界 0」。
+        #   这是**空集合判 PASS**：实测柳辛庄 1-4 地块四带全部命中，
+        #   把「本图 0 个箱有任何覆盖线索」伪装成「覆盖全部闭合」——最隐蔽的一类静默丢数。
+        #   处置与 C3 一致：报 SKIP + WARN，**明示不可核**，绝不判 PASS。
+        _cmap_n = 0
+        for _blk0, _bv0 in (C.get("楼栋") or {}).items():
+            for _un0, _uv0 in (_bv0.get("单元") or {}).items():
+                _cmap_n += len(_uv0.get("分纤箱") or [])
+        if boxes and _cmap_n == 0:
+            R.check("C6", "覆盖闭合", "SKIP",
+                    "coverage 提供了 JSON 但其箱级记录为 0 —— 覆盖闭合**无对象可核**"
+                    "（空集合不得判 PASS）；parse 侧 %d 个箱的覆盖范围本图未产出，"
+                    "覆盖判定须补做或列待确认项" % len(boxes))
+            R.warn("C6", "覆盖判定本图未产出任何箱级覆盖范围（parse 侧 %d 个箱全部无法闭合）"
+                   "—— 不得读作覆盖已闭合" % len(boxes))
         # 同单元覆盖楼层完全相同 → WARN
         for blk, bv in (C.get("楼栋") or {}).items():
             for un, uv in (bv.get("单元") or {}).items():
