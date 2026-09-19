@@ -91,7 +91,7 @@ from ftth_common import (
     measure_column_step,
     HOME_BOX_STRONG_KEYS, HOME_BOX_WEAK_KEYS,
     kw_split_ascii, kw_hit,
-    protect_out_path,
+    protect_out_path, auto_scaled,
 )
 
 import ezdxf
@@ -275,11 +275,20 @@ def _scales_from_rows(rows, min_floors=3):
             continue
         scales.append({"x": x, "ys": [p[0] for p in v], "names": [p[1] for p in v],
                        "y0": v[0][0], "y1": v[-1][0]})
-    # 合并相邻近的刻度列（同一列的 x 可能因圆整差 0.1~0.3）
+    # 合并相邻近的刻度列（同一列的 x 可能因圆整差 0.1~0.3）。
+    # 2026-09-19（实测某图）：**必须同时要求 y 区间重叠**。图上「上下两个图区的
+    #   刻度列」x 可能几乎相同（实测仅差 0.7），只按 x 合并会把标注少的那条吞掉，
+    #   该图区此后**再无可用刻度列** —— 其图标列被迫配到邻图区的列，且因为 y 范围
+    #   不覆盖而**整列未归属**（实测丢 8 户，且 rc 仍为 0，属静默错）。
+    #   判据：同 x 候选若楼层 y 区间不重叠 = 两个图区的独立列，各自保留。
     merged = []
     for s in sorted(scales, key=lambda z: z["x"]):
         if merged and s["x"] - merged[-1]["x"] <= 1.0:
-            if len(s["names"]) > len(merged[-1]["names"]):
+            _m = merged[-1]
+            _ov = min(s["y1"], _m["y1"]) - max(s["y0"], _m["y0"])
+            if _ov <= 0:
+                merged.append(s)
+            elif len(s["names"]) > len(_m["names"]):
                 merged[-1] = s
         else:
             merged.append(s)
@@ -333,10 +342,8 @@ AUTO_FALLBACK = {"search_radius": 80.0, "region_pad": 150.0, "col_x_tol": 1.0,
                  "tol_cap": 30.0}
 
 
-def auto_scaled(step, name):
-    """按图纸自身层高还原某个几何阈值的图纸单位值。"""
-    v = AUTO_RATIOS[name] * step if step else AUTO_FALLBACK[name]
-    return round(v, 6)
+# auto_scaled 已上收 ftth_common（2026-09-19 八十九）：与 analyze_coverage.py 原先各存一份
+# 逐字相同的实现。比率表仍用本模块的 AUTO_RATIOS / AUTO_FALLBACK，调用处关键字传入。
 
 
 # ---------------------------------------------------------------- 容差自适应
@@ -415,6 +422,45 @@ def _nearest(seq, val, key):
     return best, bd
 
 
+def mode_base(dxs):
+    """主偏移 = **最大显著簇**的中心（簇 = 相邻值相对差 ≤10%；显著 = 成员 ≥2）。
+
+    为什么不用中位数：本法的合法偏移是「本栋刻度列 → 本栋第 k 个图标列」的距离
+    = k × 单元间距，天然是一条**离散的整数谱**。中位数隐含「全体列偏移同分布」
+    假设，当某图「第 2 单元列」占多数时中位数会落到 2× 间距上，合法的 1× 列
+    反被判异常（反之亦然）；取"最小簇"又会被少数真错配值凑成的小簇带偏。
+    取**最大簇** = 出现次数最多的那个 k，是本形态下唯一稳定的基准。
+    """
+    if not dxs:
+        return None
+    s = sorted(dxs)
+    clusters = [[s[0]]]
+    for v in s[1:]:
+        if abs(v - clusters[-1][-1]) <= 0.10 * clusters[-1][-1]:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    sig = [c for c in clusters if len(c) >= 2]
+    big = max(sig if sig else clusters, key=len)
+    return sum(big) / len(big)
+
+
+def period_dev(dx, base):
+    """dx 相对 base 的**整数倍偏离率**。返回 (k, dev)。
+
+    dx ≥ base：按 dx ≈ k·base 取最近整数 k；dx < base：按 base ≈ k·dx。
+    dev = 相对偏差（0 表示恰为整数倍）。合法配对恒为整数倍；偏离整数谱
+    ⇒ 配到了别栋/别图区的刻度列。
+    """
+    if not base or not dx or dx <= 0:
+        return None, None
+    if dx >= base:
+        k = max(1, int(round(dx / base)))
+        return k, abs(dx - k * base) / (k * base)
+    k = max(1, int(round(base / dx)))
+    return k, abs(base - k * dx) / (k * dx)
+
+
 def parse_col_scale_map(spec, scales, col_list, tol, log):
     """解析 --col-scale-map "列x=刻度列x;列x=刻度列x;..."，返回 {列x(1位小数): 刻度列对象}。
 
@@ -485,10 +531,14 @@ def main():
     ap.add_argument("--floor-layer", default=None, help="楼层标注图层（默认自动识别）")
     ap.add_argument("--scale-max-dx", type=float, default=None,
                     help="图标列到刻度列的最大 x 距离（默认自适应 p90×1.3）")
-    ap.add_argument("--scale-outlier-ratio", type=float, default=1.5,
-                    help="刻度列**偏移异常**判据：某列到其刻度列的 x 偏移 > 本值 × "
-                         "全体列偏移的中位数时，标记为异常并告警（0=关闭）。"
-                         "用于发现「本楼栋刻度列缺失 → 安静配到相邻楼栋刻度列」的静默错位。")
+    ap.add_argument("--scale-period-tol", dest="scale_period_tol", type=float, default=0.07,
+                    help="刻度列**配对偏移异常**判据（0=关闭）：某列偏移与主偏移（最大簇中心）"
+                         "不成整数倍、且相对偏离 > 本值时标记异常。合法偏移 = k × 单元间距，"
+                         "天然呈整数谱；偏离即说明配到了别栋/别图区的刻度列。")
+    ap.add_argument("--scale-outlier-ratio", type=float, default=None,
+                    help="[已弃用] 旧判据（偏移 > 中位数 × 本值）。中位数隐含「全体列偏移"
+                         "同分布」假设，在「一条刻度列服务本栋多个图标列」形态下会同时"
+                         "误报与漏报；**传了也不参与判定**，仅为兼容旧命令行保留。")
     ap.add_argument("--region-y", default=None,
                     help="显式限定图区 y 范围 min,max（默认由楼层刻度列界定）")
     ap.add_argument("--region-pad", type=float, default=0.0,
@@ -555,7 +605,7 @@ def main():
     if step:
         for _k in _AUTO_KEYS:
             if not getattr(args, _k, None) or getattr(args, _k) <= 0:
-                setattr(args, _k, auto_scaled(step, _k))
+                setattr(args, _k, auto_scaled(step, _k, ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK))
         log("图纸尺度锚：层高 = %.6g（%s）→ 阈值按层高倍数还原：%s"
             % (step, step_why, "、".join("%s=%.6g" % (k, getattr(args, k))
                                          for k in _AUTO_KEYS)))
@@ -626,7 +676,7 @@ def main():
         log("追加小闭合方块候选 = %d" % n_sq)
 
     # ---- 每个候选到最近皮线端点的距离 ----
-    g = Grid(end_uq, cell=auto_scaled(step, "grid_cell"))
+    g = Grid(end_uq, cell=auto_scaled(step, "grid_cell", ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK))
     for c in cands:
         idx, d = g.nearest(c["x"], c["y"], args.search_radius)
         c["端点"] = list(end_uq[idx]) if idx >= 0 else None
@@ -646,16 +696,16 @@ def main():
         tol, tol_why = args.tol, "命令行显式指定"
     elif len(seed_d) >= 3:
         tol, tol_why = estimate_tol(
-            seed_d, bucket=auto_scaled(step, "tol_bucket"),
-            scan_max=auto_scaled(step, "tol_scan_max"),
-            tol_cap=auto_scaled(step, "tol_cap"))
+            seed_d, bucket=auto_scaled(step, "tol_bucket", ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK),
+            scan_max=auto_scaled(step, "tol_scan_max", ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK),
+            tol_cap=auto_scaled(step, "tol_cap", ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK))
         tol_why = "种子候选（关键词命中，n=%d）" % len(seed_d) + tol_why
     else:
         tol, tol_why = estimate_tol(
             all_d, ratio=0.05, min_peak=5,
-            bucket=auto_scaled(step, "tol_bucket"),
-            scan_max=auto_scaled(step, "tol_scan_max"),
-            tol_cap=auto_scaled(step, "tol_cap"))
+            bucket=auto_scaled(step, "tol_bucket", ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK),
+            scan_max=auto_scaled(step, "tol_scan_max", ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK),
+            tol_cap=auto_scaled(step, "tol_cap", ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK))
         tol_why = "全部候选（无关键词种子）" + (tol_why or "")
     if tol is None:
         log("")
@@ -783,19 +833,20 @@ def main():
         else:
             max_dx = 1e9
 
-    # 刻度列**偏移异常**检测（2026-09-16，TeleAgent 复盘 P0-1）：
+    # 刻度列**偏移异常**检测（2026-09-16 立，2026-09-19 判据重做）：
     #   根因：pick_scale 只按「y 覆盖是否够 + 同批里 x 最近」挑刻度列，**不看偏移大小**
     #   （见其 docstring）。当本楼栋的刻度列不在候选批里时，它会安静地配到
-    #   **相邻楼栋/图区**的刻度列上——实测某图 3#2单元列(偏移 207.8)配到了
-    #   5# 的刻度列(233.2)，B1/1F 归属整体错位，而全程**零告警**。
-    #   改法：以全体列偏移的**中位数为主偏移**，超过 ratio 倍的列标为异常，
-    #   在 JSON 与控制台显式列出。**不静默改结果**——归层是否重算交人工裁决
-    #   （遵循「不自行择一」原则：偏移大也可能确属正常远距配列）。
-    _dx_sorted = sorted(dxs)
-    dx_main = _dx_sorted[len(_dx_sorted) // 2] if _dx_sorted else None
-    if dx_main and args.scale_outlier_ratio:
-        log("刻度列偏移：主偏移（中位数）= %.1f，异常阈值 = %.1f"
-            % (dx_main, dx_main * args.scale_outlier_ratio))
+    #   **相邻楼栋/图区**的刻度列上，B1/1F 归属整体错位，而全程**零告警**。
+    #   旧判据（偏移 > 中位数 × ratio）隐含「全体列偏移同分布」假设，在「一条刻度列
+    #   服务本栋多个图标列」形态下偏移天然呈 k 的**整数谱**（1×/2×/3× 单元间距），
+    #   中位数只落在其中一档 ⇒ **别的档全部误报，而真错配偏离谱线却不报**
+    #   （实测同一图既淹真阳性又放真阴性）。改法：以**最大簇中心**为主偏移，
+    #   偏移与之不成整数倍且偏离超容差者标为异常，JSON 与控制台显式列出。
+    #   **仍不静默改结果**——归层是否重算交人工裁决（遵循「不自行择一」原则）。
+    dx_main = mode_base(dxs)
+    if dx_main and args.scale_period_tol:
+        log("刻度列偏移：主偏移（最大簇中心）= %.1f，整数倍容差 = %.0f%%"
+            % (dx_main, args.scale_period_tol * 100))
 
     results = []
     for col in col_list:
@@ -806,12 +857,13 @@ def main():
         if sc is not None and dx > max_dx:
             sc = None
         _out_why = None
-        if (sc is not None and dx is not None and dx_main
-                and args.scale_outlier_ratio and dx > args.scale_outlier_ratio * dx_main):
-            _out_why = ("偏移 %.1f 达主偏移 %.1f 的 %.2f 倍（>%.2g 倍阈值）——"
-                        "疑似本楼栋刻度列缺失、配到了相邻楼栋/图区的刻度列，"
-                        "该列归层结果不可信" % (dx, dx_main, dx / dx_main,
-                                          args.scale_outlier_ratio))
+        if sc is not None and dx is not None and dx_main and args.scale_period_tol:
+            _pk, _pdev = period_dev(dx, dx_main)
+            if _pdev is not None and _pdev > args.scale_period_tol:
+                _out_why = ("偏移 %.1f 与主偏移 %.1f 不成整数倍（最近 %d×，偏离 %.0f%% > "
+                            "%.0f%% 容差）——疑似本楼栋刻度列缺失、配到了相邻楼栋/图区的"
+                            "刻度列，该列归层结果不可信"
+                            % (dx, dx_main, _pk, _pdev * 100, args.scale_period_tol * 100))
         per, un = Counter(), []
         if sc:
             for c in col["图标"]:
@@ -890,8 +942,8 @@ def main():
     if scale_outliers:
         log("")
         log("!" * 74)
-        log("! 刻度列配对**偏移异常** = %d 列（主偏移中位数 %.1f）"
-            % (len(scale_outliers), dx_main or 0))
+        log("! 刻度列配对**偏移异常** = %d 列（主偏移 %.1f · 整数倍容差 %.0f%%）"
+            % (len(scale_outliers), dx_main or 0, (args.scale_period_tol or 0) * 100))
         for _o in scale_outliers:
             log("!   列 x=%-11.1f 偏移=%-8s %s" % (_o["列x"], _o["刻度偏移"], _o["说明"]))
         log("!  → 这些列的归层结果**不可信**（可能整体错位到邻栋/邻图区）。")
@@ -946,8 +998,9 @@ def main():
             "强关键词": list(strong), "弱关键词": list(weak),
             "含小方块候选": bool(args.include_square),
             "刻度max_dx": round(max_dx, 2) if max_dx < 1e8 else None,
-            "刻度偏移主中位数": round(dx_main, 2) if dx_main else None,
-            "偏移异常阈值倍数": args.scale_outlier_ratio,
+            "刻度偏移主偏移": round(dx_main, 2) if dx_main else None,
+            "主偏移定义": "最大簇中心（合法偏移 = k × 单元间距，天然呈整数谱）",
+            "整数倍容差": args.scale_period_tol,
             "显式列刻度映射": {("%.1f" % k): v["x"] for k, v in sorted(col_scale_map.items())},
         },
         "皮线图元数": len(wires), "皮线端点数": len(end_uq),

@@ -47,7 +47,7 @@ from ftth_common import (
     load_dxf, collect_texts, cluster_by_x, match_y_to_floor, assign_floor_by_interval,
     parse_floor_label, clean_text, is_floor_text, attrib_hit, require_params,
     cluster_values_by_gap, measure_column_step, cluster_by_y,
-    RE_DRAWING_WORD,
+    RE_DRAWING_WORD, auto_scaled,
 )
 
 log = setup_logger("analyze_coverage")
@@ -109,10 +109,8 @@ AUTO_FALLBACK = {"bldg_pad": 200.0, "title_band_tol": 60.0, "fx_symbol_cluster":
 AUTO_KEYS = tuple(AUTO_RATIOS)
 
 
-def auto_scaled(step, name):
-    """按图纸自身层高还原某个几何阈值的图纸单位值。"""
-    v = AUTO_RATIOS[name] * step if step else AUTO_FALLBACK[name]
-    return round(v, 6)
+# auto_scaled 已上收 ftth_common（2026-09-19 八十九）：与 count_box_icons.py 原先各存一份
+# 逐字相同的实现。比率表仍用本模块的 AUTO_RATIOS / AUTO_FALLBACK，调用处关键字传入。
 
 
 ap = argparse.ArgumentParser(description="FTTH 覆盖范围分析（输出线索，竖线法）")
@@ -307,7 +305,7 @@ DRAW_STEP, DRAW_STEP_WHY = measure_column_step(_cols)
 if DRAW_STEP:
     for _k in AUTO_KEYS:
         if not getattr(args, _k, None) or getattr(args, _k) <= 0:
-            setattr(args, _k, auto_scaled(DRAW_STEP, _k))
+            setattr(args, _k, auto_scaled(DRAW_STEP, _k, ratios=AUTO_RATIOS, fallback=AUTO_FALLBACK))
     log.info("图纸尺度锚：层高 = %.6g（%s）→ 阈值按层高倍数还原：%s",
              DRAW_STEP, DRAW_STEP_WHY,
              "、".join("%s=%.6g" % (k, getattr(args, k)) for k in AUTO_KEYS))
@@ -648,6 +646,7 @@ fx_symbol_src = None
 if SYM_LAYERS:
     _sym_layers = SYM_LAYERS
     _rect, _axis, _other = [], [], []
+    _drop_sym = 0  # 2026-09-19 八十九：符号实体读取失败计数（此前两处裸 pass 静默丢实体）
     for _e in msp:
         if _e.dxf.layer not in _sym_layers:
             continue
@@ -678,9 +677,12 @@ if SYM_LAYERS:
                     _p0 = _e.dxf.insert
                     _other.append({"x": _p0.x, "y": _p0.y, "宽": 0.0, "高": 0.0, "类型": _tp})
                 except Exception:
-                    pass
+                    _drop_sym += 1
         except Exception:
+            _drop_sym += 1
             continue
+    if _drop_sym:
+        log.warning("分纤箱符号实体 %d 个因读取失败被跳过（INSERT无插入点/实体异常），符号完备性须人工复核" % _drop_sym)
     # 判别顺序：闭合小矩形（唯一可靠特征）→ 有向线段 → 其他图元。
     # 实测：分纤箱符号 = 宽而矮的闭合 LWPOLYLINE（矩形）；同图层另有大量 len=0 的 LINE，
     # 是皮线锚点而非箱体——若把 len=0 线段当箱，一个单元会凭空多出十几个"箱"。

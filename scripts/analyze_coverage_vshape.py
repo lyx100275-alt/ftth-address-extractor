@@ -67,10 +67,13 @@ import sys
 import ftth_common
 from ftth_common import (
     clean_text, collect_texts, cluster_chain_mean, cluster_values_by_gap,
-    floor_num, floor_step_from_texts, first_group, judge_pending_scope,
-    load_dxf, median_text_height, parse_bldg_nums, parse_bldg_nums_ex,
-    parse_floor_label, pending_items_from_rulings, require_params, setup_logger,
+    ensure_console_utf8, floor_num, floor_step_from_texts, first_group,
+    judge_pending_scope, load_dxf, median_text_height, parse_bldg_nums,
+    parse_bldg_nums_ex, parse_floor_label, pending_items_from_rulings,
+    require_params, setup_logger,
 )
+
+ensure_console_utf8()
 
 log = setup_logger("analyze_coverage_vshape")
 
@@ -376,7 +379,8 @@ def main():
             titles.append((x, y, s, nums))
     titles.sort(key=lambda t: t[0])
     if not titles:
-        sys.exit('未匹配到任何楼栋标题，请检查 --title-pattern 与 --text-layer')
+        log.error("未匹配到任何楼栋标题，请检查 --title-pattern 与 --text-layer")
+        sys.exit(1)
 
     # 展开为「每栋一个分析窗口」。共享标题的多栋共用同一 x 区间——
     #   此处不按栋切分窗口内数据（切分需图纸语义），改在结果里标注为待人工核对。
@@ -1098,7 +1102,8 @@ def main():
             with open(args.fx_locations, 'r', encoding='utf-8') as _fp:
                 _fxl = _json.load(_fp)
         except Exception as _ex:                                        # noqa: BLE001
-            sys.exit('无法读取 --fx-locations %s: %s' % (args.fx_locations, _ex))
+            log.error("无法读取 --fx-locations %s: %s", args.fx_locations, _ex)
+            sys.exit(1)
         _loc_idx = {}
         for _e in _fxl.get('唯一箱位') or []:
             _loc_idx.setdefault((_e['楼栋'], _e['单元']), set()).add(_e['安装层'])
