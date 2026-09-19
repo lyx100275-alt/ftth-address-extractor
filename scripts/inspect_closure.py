@@ -128,6 +128,10 @@ def main():
                          "（箱体只画图标、不写编号）时，用它提供箱清单的替代口径；"
                          "否则 C2/C3/C4/C6 在零箱数据上会得出无意义的 PASS。")
     ap.add_argument("--fx-pattern", default=r"FL\d+-FX\d+", help="分纤箱编号正则")
+    ap.add_argument("--titleblock", dest="titleblock_json", default=None,
+                    help="read_titleblock_households.py 输出的图签读数 JSON（可选）。"
+                         "提供后 C10 做「图签 vs 系统图」逐栋互证；不提供则 C10 判 SKIP"
+                         "（写明本次未做交叉校验，不得当作已核）")
     ap.add_argument("--json", dest="json_out", default=None, help="机读结果输出路径（可选）")
     args = ap.parse_args()
 
@@ -411,12 +415,22 @@ def main():
     grand = 0
     n_rows_total = 0      # 全图非空行数（户数或布线任一非空）
     n_hu_total = 0        # 其中「户数」列非空的行数
+    # 2026-09-18（实跑修复，P1）：**「有楼层刻度、但户数/布线两列皆空」的层行**。
+    #   原实现把它们直接从清单里过滤掉（`if hu is not None or bx is not None`），
+    #   后果是这些层既不出现、也不被告知 —— 实测某图 12 个单元各带 B1/B2 两个刻度行、
+    #   24 行全部消失，C1~C9 无一提及，出表后地下 2 层凭空不见且零说明。
+    #   这与 SKILL.md Step 1c 硬点②「某层无户数标注即不生成户号，**列待确认项**」冲突：
+    #   「图上确实没有户数」与「我没读到户数」必须可区分。
+    #   本项只**登记事实**、不下结论（地下车库/设备层/储藏层都是合法图面事实）。
+    blank_rows = []             # (楼栋, 单元, 层名)
     for blk, un, fltab in units:
         rows = []
         for fname, fv in fltab.items():
             hu, bx = fv.get("户数"), fv.get("布线")
             if hu is not None or bx is not None:
                 rows.append((fv.get("fl_num", norm_floor(fname)), fname, hu, bx))
+            else:
+                blank_rows.append((blk, un, fname))
         rows.sort(key=lambda r: (r[0] is None, r[0]))
         subtotal = sum(r[2] for r in rows if isinstance(r[2], int))
         grand += subtotal
@@ -436,9 +450,20 @@ def main():
                 "楼层表共 %d 个非空行，但「户数」列全空 —— 本图户数须由图标法（count-box）提供；"
                 "不得把「没有户数列」读作「合计 0」" % n_rows_total)
     else:
-        R.check("C5", "楼层表直读清单", "INFO",
-                "整图户数合计 %d（来源：楼层表户数列，非空户数行 %d/%d）"
-                % (grand, n_hu_total, n_rows_total))
+        _c5_note = ("整图户数合计 %d（来源：楼层表户数列，非空户数行 %d/%d）"
+                    % (grand, n_hu_total, n_rows_total))
+        if blank_rows:
+            R.emit("  ↓ 有楼层刻度、但「户数/布线」两列皆空的层（%d 行）：" % len(blank_rows))
+            for _b, _u, _f in blank_rows[:40]:
+                R.emit("      %s/%s/%s" % (_b, _u, _f))
+            if len(blank_rows) > 40:
+                R.emit("      ... 另有 %d 行未列出" % (len(blank_rows) - 40))
+            R.check("C5", "楼层表直读清单", "WARN",
+                    _c5_note + ("；另有 %d 个层行**有楼层刻度但无户数/布线标注** —— "
+                                "按 Step 1c 这些层不生成户号，须人工确认是否图纸事实"
+                                "（地下车库/设备层/储藏层等），明细见上" % len(blank_rows)))
+        else:
+            R.check("C5", "楼层表直读清单", "INFO", _c5_note)
 
     # ---------- C8 同单元跨层户数一致性（2026-09-17 新增） ----------
     # 为什么要它（实测依据）：
@@ -654,6 +679,134 @@ def main():
             R.check("C9", "结果状态闭合", "PASS",
                     "%d 项结果均已定案（settled）；%s" % (len(_rs_items), _rs_scope))
 
+    # ---------- C10 图签第二来源逐栋比对（2026-09-18 实跑新增，P1） ----------
+    # 为什么需要它（实测依据，非设计偏好）：
+    #   图纸画像把 titleblock_annotation 判为 present，并明确写出「后果与处置：图签可直读
+    #   栋级入户规模 → 与采集表构成『三来源协议』的第二来源」。但**全流程没有任何环节去读它**：
+    #   `ftth.py pipeline` 的阶段列表里没有它，C1~C9 也没有它。实测某图 7 栋楼的图签
+    #   (单元数/层数/每层户数) 与系统图解析**逐栋一致**，可这条「独立来源互证」从未发生 ——
+    #   属典型的「规则只写在文档里、没有代码执行它」。本项把比对落到可机械判定的检查项上。
+    # 判据：逐栋比 (单元数, 层数, 每层户数)，楼栋按**楼号数字**归一化配对
+    #   （图签写 `N号楼`、系统图写 `N#楼`，字符串不等但同一栋）。
+    #   不一致即列双方数值交人裁定（L0-I4，禁止自动择一）；两侧楼号集合不同的也逐条列出。
+    #   未提供 titleblock JSON 时判 SKIP 并写明「本次未做」，**不得判 PASS**。
+    R.emit()
+    R.emit("--- C10 图签第二来源逐栋比对 ---")
+    TB = None
+    if not args.titleblock_json:
+        R.check("C10", "图签第二来源逐栋比对", "SKIP",
+                "未提供 --titleblock（<outdir>/titleblock.json）—— 本次**未做**图签交叉校验，"
+                "不等于已核；图上确无图签形态时属正常")
+    else:
+        try:
+            with open(args.titleblock_json, "r", encoding="utf-8") as _tf:
+                TB = json.load(_tf)
+        except Exception as _te:                                     # noqa: BLE001
+            R.check("C10", "图签第二来源逐栋比对", "SKIP",
+                    "titleblock JSON 不可读（%s）—— 本次未做交叉校验" % _te)
+            TB = None
+    if args.titleblock_json and TB is not None:
+        _tb_b = {}
+        for _area, _bl in (TB.get("地块") or {}).items():
+            for _bn, _bv in (_bl or {}).items():
+                _k = bldg_num(_bn)
+                if _k is not None:
+                    _tb_b[_k] = {"楼": _bn, "单元数": (_bv or {}).get("单元数"),
+                                 "层数": (_bv or {}).get("层数"),
+                                 "每层户数": (_bv or {}).get("每层户数")}
+        _p_b = {}
+        for _bn, _bv in buildings.items():
+            _k = bldg_num(_bn)
+            if _k is None:
+                continue
+            _u = _bv.get("单元") or {}
+            _best, _fc, _best_alt = None, [], None
+            for _un, _uv in _u.items():
+                # 「层数」只数**户数非空**的层：地下刻度行（户数 null）不计入，
+                # 恰与图签 `N层` 的住宅层口径对齐（也是 C5 登记的那批行）。
+                _vals = [int(_x["户数"]) for _x in ((_uv or {}).get("楼层表") or {}).values()
+                         if isinstance((_x or {}).get("户数"), int)]
+                # 图标法回退（2026-09-19 实测柳辛庄：户数全空 ⇒ 层数=None ⇒ 与图签必假 FAIL）：
+                # 户数一列全空时，层数改取**地上刻度行数**（数字前缀为正的键），
+                # 地下/夹层（B\d、-\d、W 前缀）不计，住宅层口径与图签仍对齐。
+                # 有任何户数非空则维持原口径（已与凤鸣朝阳图签逐栋验证一致，不得改动）。
+                _keys = list(((_uv or {}).get("楼层表") or {}).keys())
+                _alt = sum(1 for _f in _keys
+                           if re.match(r'^\s*(\d+)', str(_f)) and not re.match(r'^\s*[-BWW]', str(_f)))
+                if _vals:
+                    _fc.append(len(_vals))
+                    if _best is None or len(_vals) > len(_best):
+                        _best = _vals
+                if _best_alt is None or _alt > _best_alt:
+                    _best_alt = _alt
+            if _best is not None:
+                _p_b[_k] = {"楼": _bn, "单元数": len(_u), "层数": len(_best),
+                            "每层户数": max(set(_best), key=_best.count),
+                            "各单元层数": sorted(set(_fc))}
+            elif _best_alt:
+                _p_b[_k] = {"楼": _bn, "单元数": len(_u), "层数": _best_alt,
+                            "每层户数": None, "层数口径": "地上刻度行数（图标法回退，无户数标注）"}
+            else:
+                _p_b[_k] = {"楼": _bn, "单元数": len(_u), "层数": None, "每层户数": None}
+        if not _tb_b:
+            R.check("C10", "图签第二来源逐栋比对", "SKIP",
+                    "titleblock JSON 里没有任何楼栋读数（本图无图签形态？）—— 本次未做交叉校验")
+        else:
+            _diff, _both, _nonuni, _unver = [], 0, [], []
+            for _k in sorted(set(_tb_b) | set(_p_b)):
+                _t, _p = _tb_b.get(_k), _p_b.get(_k)
+                if _t is None:
+                    _diff.append("楼%s：图签**无**此楼，系统图有（%s）" % (_k, _p["楼"]))
+                    continue
+                if _p is None:
+                    _diff.append("楼%s：系统图**无**此楼，图签有（%s）" % (_k, _t["楼"]))
+                    continue
+                _both += 1
+                # 字段级可比性（2026-09-19 实测柳辛庄 r4：15 处「不一致」里 11 处是
+                # 单侧不可读被当矛盾——图标法系统图不标户数 ⇒ None vs 图签有值 ⇒ 假 FAIL，
+                # 把真矛盾淹没）。判据：**双非空且不等**才算矛盾；
+                # 单侧 None = 「无法比对」，单独登记、不计 FAIL、不冒充已核。
+                for _f in ("单元数", "层数", "每层户数"):
+                    _tv, _pv = _t.get(_f), _p.get(_f)
+                    if _tv is None or _pv is None:
+                        _unver.append("楼%s %s（图签=%s，系统图=%s）"
+                                      % (_k, _f, _tv, _pv))
+                    elif _tv != _pv:
+                        _diff.append("楼%s（图签 %s / 系统图 %s）：%s 图签=%s，系统图=%s"
+                                     % (_k, _t["楼"], _p["楼"], _f, _tv, _pv))
+                if len(_p.get("各单元层数") or []) > 1:
+                    _nonuni.append("楼%s 各单元层数不一致 %s（本项取层数最多的单元比对）"
+                                   % (_k, _p["各单元层数"]))
+            for _d in _diff[:30]:
+                R.emit("  x " + _d)
+            for _d in _nonuni[:10]:
+                R.emit("  ! " + _d)
+            for _d in _unver[:15]:
+                R.emit("  ? " + _d + " —— 单侧不可读，无法比对（不计矛盾）")
+            if _diff:
+                _note = ("；另有 %d 处单侧不可读未核" % len(_unver)) if _unver else ""
+                R.check("C10", "图签第二来源逐栋比对", "FAIL",
+                        "%d 处不一致（共同楼栋 %d）—— 图签与系统图矛盾，按 L0-I4 停下交人裁定，"
+                        "**禁止自动择一**；双方数值见上%s" % (len(_diff), _both, _note))
+                for _d in _diff[:20]:
+                    R.fail("C10", _d)
+            elif _unver:
+                # 没核不得呈现成通过：可比字段全一致、但存在单侧不可读字段 ⇒ WARN。
+                R.check("C10", "图签第二来源逐栋比对", "WARN",
+                        "可比字段逐栋一致（共同楼栋 %d）；另有 %d 处**单侧不可读**未核"
+                        "（系统图标法户数 / 图签缺项），不冒充已核，见上" % (_both, len(_unver)))
+            elif _both == 0:
+                # 防御分支：两侧都有楼栋读数、却按楼号归一化后零交集 —— 说明楼名里取不出
+                # 数字（如 `甲号楼`），此时**没有可比对的共同楼栋**，不得判 PASS。
+                R.check("C10", "图签第二来源逐栋比对", "SKIP",
+                        "图签 %d 栋 / 系统图 %d 栋，按楼号归一化后共同楼栋为 0 —— "
+                        "未形成有效比对（空集合不得判 PASS）" % (len(_tb_b), len(_p_b)))
+            else:
+                _notes = "；另有 %d 个单元层数不一致的楼（" % len(_nonuni) if _nonuni else ""
+                R.check("C10", "图签第二来源逐栋比对", "PASS",
+                        "%d 栋的 (单元数 / 层数 / 每层户数) 与系统图逐栋一致%s%s"
+                        % (_both, _notes, "）" if _nonuni else ""))
+
     # ---------- 汇总 ----------
     R.emit()
     R.emit("=" * 72)
@@ -668,7 +821,7 @@ def main():
 
     if args.json_out:
         payload = {"parse": args.parse_json, "coverage": args.coverage_json, "geom": args.geom_json,
-                   "count_box": args.count_box_json,
+                   "count_box": args.count_box_json, "titleblock": args.titleblock_json,
                    "checks": R.checks, "fails": R.fails, "warns": R.warns, "rc": rc}
         # 2026-09-18：写产物前先建父目录。此前未建 —— 目标目录不存在时 open() 直接
         #   Traceback（实测 rc=1、不落任何产物，且报错点远离调用处，排查成本高）。
