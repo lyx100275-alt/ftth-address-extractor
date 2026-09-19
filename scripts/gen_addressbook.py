@@ -46,7 +46,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
-from ftth_common import setup_logger, floor_num, floor_num_or_zero, bldg_num
+from ftth_common import setup_logger, floor_num, floor_num_or_zero, bldg_num, unit_num
 
 log = setup_logger("gen_addressbook")
 
@@ -104,20 +104,43 @@ except (IOError, json.JSONDecodeError) as e:
 def _norm_unit_key(ukey, bkey=None):
     """把单元键归一到「N单元」形式。
 
-    兼容：`1#楼1单元` / `1号楼1单元` / `1单元` / 楼栋名本身（单单元楼栋）。
+    兼容：`1#楼1单元` / `1号楼1单元` / `1单元` / 中文写法 / 楼栋名本身（单单元楼栋）。
+
+    2026-09-19 八十九：改走 ftth_common.unit_num 唯一入口（此前自写双分支只认
+    ASCII 数字；ASCII 输入行为不变）。
     """
     s = str(ukey).strip()
     if not s:
         return s
-    m = re.search(r"(\d+)\s*[#号]?\s*楼?\s*(\d+)\s*单元", s)
-    if m:
-        return "%s单元" % m.group(2)
-    m2 = re.fullmatch(r"(\d+)\s*单元", s)
-    if m2:
-        return "%s单元" % m2.group(1)
+    _n = unit_num(s)
+    if _n is not None:
+        return "%d单元" % _n
     if bkey is not None and s == str(bkey).strip():
         return "1单元"
     return s
+
+
+# 2026-09-16（12坑复核·坑10）：分纤箱编号前缀归一化（可选，显式传入才生效）。
+#   作用于 coverage 键与 parse 侧箱编号两处，保证两来源一致可比；
+#   归一后编号冲突（覆盖范围不同）显式告警交人裁决，不自动择一。
+# 2026-09-19 修（实测 NameError）：本定义块原先嵌在 `if args.coverage_json:` 内，
+#   走 assembly 路径（不传 --coverage-json）时 _norm_fx 不存在，而模块级
+#   gen_unit_rows 引用它必然 NameError。故上移至模块级；归一化**应用**块
+#   仍在 coverage 加载之后（无 coverage 时无需归一，跳过即可）。
+_fx_pmap = {}
+if args.fx_prefix_map:
+    for _item in args.fx_prefix_map.split(";"):
+        _item = _item.strip()
+        if "=" in _item:
+            _pa, _pb = _item.split("=", 1)
+            _fx_pmap[_pa.strip()] = _pb.strip()
+
+
+def _norm_fx(_fid):
+    for _pa, _pb in _fx_pmap.items():
+        if _pa and isinstance(_fid, str) and _fid.startswith(_pa):
+            return _pb + _fid[len(_pa):]
+    return _fid
 
 
 coverage = {}
@@ -163,23 +186,7 @@ if args.coverage_json:
             # else: 无法识别，跳过
     log.info(f"覆盖范围JSON已加载（格式自动检测）：{len(coverage)}栋")
 
-    # 2026-09-16（12坑复核·坑10）：分纤箱编号前缀归一化（可选，显式传入才生效）。
-    #   作用于 coverage 键与 parse 侧箱编号两处，保证两来源一致可比；
-    #   归一后编号冲突（覆盖范围不同）显式告警交人裁决，不自动择一。
-    _fx_pmap = {}
-    if args.fx_prefix_map:
-        for _item in args.fx_prefix_map.split(";"):
-            _item = _item.strip()
-            if "=" in _item:
-                _pa, _pb = _item.split("=", 1)
-                _fx_pmap[_pa.strip()] = _pb.strip()
-
-    def _norm_fx(_fid):
-        for _pa, _pb in _fx_pmap.items():
-            if _pa and isinstance(_fid, str) and _fid.startswith(_pa):
-                return _pb + _fid[len(_pa):]
-        return _fid
-
+    # （_fx_pmap / _norm_fx 定义已上移模块级，2026-09-19；下方仅保留应用块）
     if _fx_pmap:
         _ren = 0
         for _b, _bd in coverage.items():
@@ -360,10 +367,7 @@ def floor_num_local(fl_name):
 
 # NOTE: floor_num_local 保留为本文件包装（调用方较多），但底层已统一到 ftth_common.floor_num。
 # gen_addressbook 中需 None 回退（而非 0），故不直接用 floor_num_or_zero。
-
-def bldg_num_local(bldg_name):
-    """从楼名提取数字（如 1#楼→1, 2号楼→2），失败返回 0（用于排序）"""
-    return bldg_num(bldg_name)
+# bldg_num 薄包装（bldg_num_local）仅一处排序调用，已删除，调用点直用共享入口。
 
 # ---------- 模板格式转换 ----------
 # 2026-09-16：`--floor-format` / `--door-format` 显式指定时**优先于模板示例行自动判定**。
@@ -473,7 +477,7 @@ def gen_unit_rows(bldg_name, unit_name, unit_data):
 # 组装所有行
 all_rows = []
 skipped_floors = []     # 2026-09-11 新增：记录被静默丢弃的楼层，用于守恒校验
-for bldg_name, bldg_data in sorted(data.get("楼栋", {}).items(), key=lambda x: bldg_num_local(x[0])):
+for bldg_name, bldg_data in sorted(data.get("楼栋", {}).items(), key=lambda x: bldg_num(x[0])):
     for unit_name, unit_data in bldg_data.get("单元", {}).items():
         unit_rows = gen_unit_rows(bldg_name, unit_name, unit_data)
         for fl, seq, box_id in unit_rows:

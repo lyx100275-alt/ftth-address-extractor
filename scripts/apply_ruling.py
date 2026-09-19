@@ -45,7 +45,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ftth_common import protect_out_path
+from ftth_common import protect_out_path, unit_num
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -137,17 +137,16 @@ for i, r in enumerate(rulings, 1):
 
 
 def norm_unit(u):
-    """单元键归一（与 assemble_households.norm_unit / gen_addressbook 同则）"""
+    """单元键归一（与 assemble_households.norm_unit / gen_addressbook 同则）。
+
+    2026-09-19 八十九：改走 ftth_common.unit_num 唯一入口（此前自写双分支只认
+    ASCII 数字，`7#楼二单元` 等中文写法原样返回致失配；ASCII 输入行为不变）。
+    """
     s = str(u).strip()
     if not s:
         return s
-    m = re.search(r"(\d+)\s*[#号]?\s*楼?\s*(\d+)\s*单元", s)
-    if m:
-        return "%s单元" % m.group(2)
-    m2 = re.fullmatch(r"(\d+)\s*单元", s)
-    if m2:
-        return "%s单元" % m2.group(1)
-    return s
+    _n = unit_num(s)
+    return "%d单元" % _n if _n is not None else s
 
 
 def pick_units(bkey, ukey):

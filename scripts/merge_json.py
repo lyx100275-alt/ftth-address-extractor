@@ -51,8 +51,8 @@ log.info(f"待合并文件: {len(input_files)} 个")
 
 merged = {"楼栋": {}}
 
-def bldg_num_local(name):
-    return bldg_num(name)
+# 楼号排序直接用共享入口 ftth_common.bldg_num（失败返 0，排最前）。
+# 此处曾有 `bldg_num_local` 薄包装（2026-09-18 七十三遗留），仅一处调用，已内联删除。
 
 for fpath in input_files:
     try:
@@ -119,7 +119,7 @@ for fpath in input_files:
 
 # 按楼栋编号排序
 sorted_buildings = {}
-for name in sorted(merged["楼栋"].keys(), key=bldg_num_local):
+for name in sorted(merged["楼栋"].keys(), key=bldg_num):
     sorted_buildings[name] = merged["楼栋"][name]
 merged["楼栋"] = sorted_buildings
 

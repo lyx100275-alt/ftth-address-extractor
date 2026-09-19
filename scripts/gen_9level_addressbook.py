@@ -33,6 +33,16 @@ import os
 import re
 import sys
 
+# 控制台 UTF-8 兜底：中文 Windows 默认 GBK，print CJK 即崩；被替换的流则跳过。
+# （共享实现见 ftth_common.ensure_console_utf8；本文件只依赖 openpyxl，故内联。）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _rec = getattr(_s, "reconfigure", None)
+        if callable(_rec):
+            _rec(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def load_header(xlsx, sheet, row=1):
     import openpyxl
