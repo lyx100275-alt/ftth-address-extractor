@@ -39,6 +39,7 @@
     verify_coverage_truth 用于**有定稿标准地址表之后**的回归反查。阶段不同，不重叠。
 """
 import argparse
+from ftth_common import bldg_num_or_none  # 楼号提取：失败返 None（勿与 bldg_num 失败返 0 混用）
 import json
 import os
 import re
@@ -113,9 +114,7 @@ def count_box_summary(K):
     return "；".join(parts)
 
 
-def bldg_num(name):
-    m = re.search(r"(\d+)", str(name))
-    return int(m.group(1)) if m else None
+# bldg_num 已上收：ftth_common.bldg_num_or_none（失败返 None，原语义一致）
 
 
 def main():
@@ -241,8 +240,8 @@ def main():
     # ---------- C1 楼栋单元全貌 ----------
     R.emit()
     R.emit("--- C1 楼栋单元全貌 ---")
-    nums = sorted(n for n in (bldg_num(b) for b in buildings) if n is not None)
-    for blk in sorted(buildings, key=lambda b: (bldg_num(b) is None, bldg_num(b) or 0)):
+    nums = sorted(n for n in (bldg_num_or_none(b) for b in buildings) if n is not None)
+    for blk in sorted(buildings, key=lambda b: (bldg_num_or_none(b) is None, bldg_num_or_none(b) or 0)):
         bv = buildings[blk]
         ulist = list((bv.get("单元") or {}).keys())
         nfx = sum(len((bv.get("单元") or {})[u].get("分纤箱") or []) for u in ulist)
@@ -709,14 +708,14 @@ def main():
         _tb_b = {}
         for _area, _bl in (TB.get("地块") or {}).items():
             for _bn, _bv in (_bl or {}).items():
-                _k = bldg_num(_bn)
+                _k = bldg_num_or_none(_bn)
                 if _k is not None:
                     _tb_b[_k] = {"楼": _bn, "单元数": (_bv or {}).get("单元数"),
                                  "层数": (_bv or {}).get("层数"),
                                  "每层户数": (_bv or {}).get("每层户数")}
         _p_b = {}
         for _bn, _bv in buildings.items():
-            _k = bldg_num(_bn)
+            _k = bldg_num_or_none(_bn)
             if _k is None:
                 continue
             _u = _bv.get("单元") or {}
