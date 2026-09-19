@@ -1,0 +1,8 @@
+# EOL 纪律（2026-09-19 八十九）：禁用一切换行自动转换。
+# 体量闸门量的是磁盘字节数 —— 只有「检出字节 == 入库字节」，闸门结论才与仓库状态对齐。
+# 背景：core.autocrlf=true 曾让 SKILL.md 以 CRLF(48979B) 存在于工作区、
+# 以 LF(48532B) 存在于库内，447B 摆幅 vs 21B 余量，同一份内容两种判罚。
+* -text
+# Windows 批处理启动器强制 CRLF（cmd.exe 对纯 LF 解析不可靠；入库形态不管，检出恒为 CRLF）。
+*.cmd text eol=crlf
+*.bat text eol=crlf

@@ -1,0 +1,6 @@
+# FTTH ftth-address-extractor 运行依赖（2026-09-19 八十九实测锁定）
+# 实测环境：Python 3.13.12（见 version.json runtime_tested_with）
+# 用法：解释器须真实 import ezdxf（技能经 scripts/ftth.cmd 探测，不按路径猜）。
+ezdxf==1.4.4      # DXF 解析（全部解析链经 ftth.cmd 探测可用解释器）
+openpyxl==3.1.5   # xlsx 标准地址表读写（gen_addressbook / assets 模板）
+xlrd==2.0.2       # xls《楼宇信息采集表》读取
