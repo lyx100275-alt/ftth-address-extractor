@@ -34,6 +34,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ftth_common  # noqa: E402
 
+ftth_common.ensure_console_utf8()
+
 
 def main():
     ap = argparse.ArgumentParser(description="DXF 全量几何转储(轻量 JSON 缓存)")

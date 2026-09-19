@@ -46,11 +46,14 @@ import os
 import re
 import sys
 
-from ftth_common import ToleranceEstimateError, estimate_titleblock_tolerances
+from ftth_common import (ToleranceEstimateError, ensure_console_utf8,
+                         estimate_titleblock_tolerances, UNIT_RE_SRC)
+
+ensure_console_utf8()
 
 DEFAULT_BLDG_RE = r"\d+\s*[#＃号]?\s*楼"
 DEFAULT_LEV_RE = r"(\d+)层/(\d+)户"
-DEFAULT_UNIT_RE = r"\d+单元"
+DEFAULT_UNIT_RE = UNIT_RE_SRC
 
 TOL_KEYS = ('dx_tol', 'dy_lo', 'dy_hi', 'unit_dx', 'unit_dy_lo', 'unit_dy_hi')
 

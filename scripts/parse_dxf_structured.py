@@ -50,6 +50,7 @@ from ftth_common import (
     extract_geom, is_bldg_title_text, suggest_fx_symbol_layers,
     find_plot_band_anchors, derive_plot_bands, PLOT_BAND_WORDS,
     ensure_parent, write_json, sanitize_nonfinite,
+    UNIT_RE_SRC, UNIT_TOKEN, unit_num,
 )
 
 log = setup_logger("parse_dxf")
@@ -268,8 +269,8 @@ if args.probe:
                                 attdefs.append(f"{sub.dxftype()}={txt}")
                     if attdefs:
                         log.info(f"    块定义: {', '.join(attdefs)}")
-            except Exception:
-                pass
+            except Exception as _ex:
+                log.debug("读取块 %s 的块定义失败，已跳过块内明细: %s", bname, _ex)
         # 统计 INSERT 实例的 ATTRIB 属性值
         log.info("\n== INSERT 实例 ATTRIB 属性样例（前20个） ==")
         shown = 0
@@ -342,7 +343,7 @@ if args.probe:
                     m.add("米数")
                 if re.fullmatch(r"\d+\s*户", t.strip()):
                     m.add("户数")
-                if re.fullmatch(r"\d+\s*单元", t.strip()):
+                if re.fullmatch(UNIT_RE_SRC, t.strip()):
                     m.add("单元")
                 if re.search(r"\d+芯|光分|分光器|光交", t):
                     m.add("芯数")
@@ -451,7 +452,12 @@ if args.probe:
                 cable_forms_note = ("本图采样未发现米数标注（含 `Xm*N` / `NPxM芯xLm` / `X芯xLm` /"
                                     " `Xm` 四种已知写法）—— 需人工确认是否另有写法")
                 log.info("  [探查] " + cable_forms_note)
-            suggested_unit = r"(\d+)单元" if any(re.fullmatch(r"\d+\s*单元", s["内容"].strip()) for s in samples) else None
+            # 推荐正则取自 ftth_common.UNIT_RE_SRC（全技能唯一写法兼容表）：必须同时覆盖
+            #   ASCII（图签/对照表 `1单元`）与中文数字（系统图单元轴 `一单元`）。
+            #   只认一种会把系统图自带的单元划分整批丢掉，且下游只表现为「单元数=1」。
+            suggested_unit = (r"(%s)\s*单元" % UNIT_TOKEN
+                              if any(re.fullmatch(UNIT_RE_SRC, s["内容"].strip())
+                                     for s in samples) else None)
 
             # 楼栋标注正则候选（供 extract_fx_map / analyze_coverage 使用）：
             # 必须覆盖『N#配套楼』『N#商业楼』以及无『楼』字的写法
@@ -464,7 +470,7 @@ if args.probe:
             suggested_proximity = None
             _fx_pts = [(s["x"], s["y"]) for s in samples if re.search(r"FX\s*\d+", s["内容"])]
             _bd_pts = [(s["x"], s["y"]) for s in samples
-                       if re.search(r"\d+#.*楼|\d+号楼|\d+\s*单元", s["内容"])]
+                       if re.search(r"\d+#.*楼|\d+号楼|" + UNIT_RE_SRC, s["内容"])]
             if _fx_pts and _bd_pts:
                 _ds = sorted(min(((x - bx) ** 2 + (y - by) ** 2) ** 0.5 for bx, by in _bd_pts)
                              for x, y in _fx_pts)
@@ -488,7 +494,7 @@ if args.probe:
                     _hit.append("NF")
                 if re.fullmatch(r"\d+\s*户\s*/\s*层", t):
                     _hit.append("户/层")
-                if re.fullmatch(r"\d+\s*单元", t):
+                if re.fullmatch(UNIT_RE_SRC, t):
                     _hit.append("单元")
                 if _hit:
                     c = _tb_marks.setdefault(s["层"], _C())
@@ -1093,12 +1099,30 @@ def split_units_by_marker(bldg_text_list, unit_marks, bldg_name=None):
       1. 单元名重名时报错退出，不再静默覆盖（旧实现 dict key 覆盖导致 1#楼只剩 2 个假单元）。
       2. 若 bldg_name 提供，校验单元标注与楼栋同号（如「2#楼」只认「2#楼N单元」），
          避免总图区的「N#楼M单元」被误归给不相关楼栋。
+
+    2026-09-19 补「共享列」：单元锚点 x 只圈住**单元块**，而一栋一张系统图时
+      **楼层轴只画一根**、且常画在各单元块之外（本图即：楼层刻度在 x≈9.966e6，
+      单元块在 1.00e7 之后）—— 按锚点中分会让这条共用轴落在所有单元范围之外，
+      结果是**每个单元的楼层表都为空**（实测：单元划分恢复了，18 层楼层表却全没了）。
+      处置（有客观判据，属测量非推理）：落在所有单元范围之外、且**不是**单元专属
+      实体（箱编号 / 皮线米数 / 户数）的文字，判为该图共用图元 → **克隆进每个单元**并留痕；
+      单元专属实体若落空则不克隆（会重复计数），改挂最近的单元并登记「需人工裁决」。
     """
     units = []
     seen_names = set()
     for t in sorted(unit_marks, key=lambda t: t["x"]):
         m = UNIT_RE.search(t["内容"])
-        uname = m.group(1) + "单元" if m else t["内容"]
+        # 单元键**统一归一为 ASCII `N单元`**（2026-09-19）：图上系统图单元轴写 `一单元`、
+        #   图签/对照表写 `1单元`，两者是同一对象；若原样保留 `一单元`，
+        #   下游 assemble/gen 的 norm_unit（产出 `N单元`）与本键对不上，join 静默失败。
+        #   归一走 ftth_common.unit_num（中文数字 → int），取不到号时保留原文不编造。
+        _n = unit_num(t["内容"])
+        if _n is not None:
+            uname = "%d单元" % _n
+        elif m:
+            uname = m.group(1) + "单元"
+        else:
+            uname = t["内容"]
         # P0-2 修正③：重名单元报错，不静默覆盖
         if uname in seen_names:
             log.warning(f"  [重复单元] 单元名 {uname!r} 重复出现（来自 {t['内容']!r}），"
@@ -1114,6 +1138,46 @@ def split_units_by_marker(bldg_text_list, unit_marks, bldg_name=None):
     for u in units:
         xlo, xhi = unit_ranges[u["名"]]
         result[u["名"]] = [t for t in bldg_text_list if xlo <= t["x"] < xhi]
+
+    # ---- 共享列补齐（见 docstring） ----
+    _covered = set()
+    for _lst in result.values():
+        for _t in _lst:
+            _covered.add(id(_t))
+    _left = [t for t in bldg_text_list if id(t) not in _covered]
+    if _left:
+        def _is_unit_specific(c):
+            """单元专属实体：箱编号 / 皮线米数 / 户数 —— 克隆会给每个单元重复计数。"""
+            c = c or ""
+            if FX_RE and FX_RE.search(c):
+                return True
+            if HU_RE and HU_RE.fullmatch(clean_text(c)):
+                return True
+            if CABLE_RE and CABLE_RE.fullmatch(clean_text(c)):
+                return True
+            return False
+
+        _shared = [t for t in _left if not _is_unit_specific(t.get("内容"))]
+        _orphan = [t for t in _left if _is_unit_specific(t.get("内容"))]
+        if _shared:
+            for _k in result:
+                result[_k].extend(_shared)
+            log.info("  [单元共享列] %s：%d 条非单元专属文字落在全部单元范围之外"
+                     "（共用图元，如楼层轴/行头）→ 克隆进 %d 个单元：%s"
+                     % (bldg_name or "?", len(_shared), len(result),
+                        "、".join(sorted({(t.get("内容") or "")[:10] for t in _shared})[:8])))
+        for _t in _orphan:
+            _best = min(units, key=lambda u: abs(u["x"] - _t["x"]))
+            result[_best["名"]].append(_t)
+        if _orphan:
+            _msg = ("%s：%d 条**单元专属**文字（箱编号/皮线米数/户数）落在全部单元 x 范围之外，"
+                    "已按最近单元挂入并由本项登记交人复核 —— 克隆会重复计数，故不克隆"
+                    % (bldg_name or "?", len(_orphan)))
+            log.warning("  [单元共享列·落空] " + _msg)
+            PENDING_NOTES.append({"对象": bldg_name or "?", "事项": _msg,
+                                  "说明": "落空内容样例：%s"
+                                          % "、".join((t.get("内容") or "")[:14]
+                                                     for t in _orphan[:8])})
     return result
 
 def split_units_by_fx_cluster(fx_texts, bldg_text_list):
@@ -1134,13 +1198,29 @@ def split_units_by_fx_cluster(fx_texts, bldg_text_list):
         result[uname] = [t for t in bldg_text_list if xlo <= t["x"] < xhi]
     return result
 
+_UNIT_SPLIT_SRC = {"kind": None}   # 见 split_units 内注释
+
+
 def split_units(bldg):
+    # 记录本次划分**来自哪一路**（2026-09-19）：只有 `marker` 一路是图上真实存在的
+    #   单元轴标注；`fx_cluster` 是兜底合成名（`单元1/单元2`），其编号与图上「N单元」
+    #   无对应关系。把箱按单元号归位时**只允许**认 `marker` 一路，否则会拿合成编号
+    #   去冒充图上单元号（一次静默错挂）。
+    # 判「走哪一路」只看**图上有没有单元轴标注**，不再先看有没有 FX 文字。
+    #   病灶（实测）：本类图纸的箱编号文字全部落在楼栋 x 区间之外（在独立的箱位直读/
+    #   箱表区），`--bldg-map` / 直写自证又会把这些文字**从 bldg_texts 里摘走**；
+    #   于是 `fx_texts` 恒为空 ⇒ 永远走 `split_units_no_fx` ⇒ 全部楼层挤进「楼栋名」一个
+    #   容器 ⇒ **单元划分整批丢失**（图上明明有一单元/二单元两根轴）。
+    #   楼层表按「层归属单元」组织是图纸信息模型的固有要求，与有没有 FX 文字无关。
     fx_texts = [t for t in bldg_texts[bldg] if FX_RE and FX_RE.search(t["内容"])]
     unit_marks = [t for t in bldg_texts[bldg] if UNIT_RE and UNIT_RE.search(t["内容"])]
-    if not fx_texts:
-        return split_units_no_fx(bldg_texts[bldg])
     if unit_marks:
+        _UNIT_SPLIT_SRC["kind"] = "marker"
         return split_units_by_marker(bldg_texts[bldg], unit_marks, bldg_name=bldg)
+    if not fx_texts:
+        _UNIT_SPLIT_SRC["kind"] = "no_fx"
+        return split_units_no_fx(bldg_texts[bldg])
+    _UNIT_SPLIT_SRC["kind"] = "fx_cluster"
     return split_units_by_fx_cluster(fx_texts, bldg_texts[bldg])
 
 # ---------- 楼层信息解析（正则全部参数化） ----------
@@ -1397,7 +1477,8 @@ def _norm_bldg(s):
     t = re.sub(r"\s+", "", str(s))
     t = t.replace("＃", "号").replace("#", "号")
     # 去掉描述性后缀（单元号 / 层号 / 户数），保留楼栋本体
-    t = re.sub(r"\d+\s*单元.*$", "", t)
+    #   单元号写法见 ftth_common.UNIT_RE_SRC：`3#楼2单元` 与 `3#楼二单元` 都要剥掉。
+    t = re.sub(UNIT_RE_SRC + r".*$", "", t)
     t = re.sub(r"\d+\s*层.*$", "", t)
     return t
 
@@ -1454,7 +1535,9 @@ BDGMAP_DUP_MATCHED = []  # 重号按坐标配对成功的留痕
 FX_DROPPED_DUP = []      # 重号编号中「与任何对照表实例都配不上坐标」的文字实例（不产出箱）
 
 
-_FX_FORCE = {}          # 楼栋名 -> {对照表单元名: [text, ...]}
+BDGMAP_NO_UNIT = set()  # 条目的「单元」字段取不出单元号（退回楼栋级容器，登记交人）
+
+_FX_FORCE = {}          # 楼栋名 -> {单元号(int) 或 None: [text, ...]}
 if BDG_MAP:
     # 改派必须从**全图 texts** 出发，不能从 bldg_texts 出发 —— bldg_texts 是「已按
     #   楼栋标题 x 区间切好」的结果，而本类图纸的箱编号恰好落在**所有楼栋区间之外**
@@ -1508,15 +1591,26 @@ if BDG_MAP:
             BDGMAP_UNRESOLVED.append("%s: 对照表楼栋=%r 未命中本图锚点（锚点：%s）"
                                      % (_no, _tb0, "/".join(sorted(bldg_ranges)[:8])))
             continue
-        # 单元粒度纪律（2026-09-19 补齐到 A 级对照表路径；此前只改了自证路径）：
-        #   箱只归到**楼栋**单元（与楼层表同键），不按对照表原文（`N号楼M单元`）凭空
-        #   创建单元键 —— 实测某图传对照表后楼层表留在「全部」、箱落到新建单元，
-        #   两容器脱节、下游 join 不上；且系统图区本无独立单元划分。
-        #   图上单元原文不丢：记入该箱的「图上单元」字段留痕（见下方 fx 循环）。
-        # 缺该字段时退化为楼栋名，不自行编造单元号。
+        # 单元粒度（2026-09-19 二次修正）：原先此处 `_tu = _tb` 一律用楼栋名，单元字段
+        #   **被取出来后又丢掉**（`_tu_raw` 成了死变量），代价是图上自带的单元划分被
+        #   整批抹平 —— 实测柳辛庄 8 个地块**全部**表现为「单元数=1、单元名=楼栋名」，
+        #   而图签与系统图单元轴都写着 2 单元，最终由 C10 报成「图签与系统图矛盾」，
+        #   **把解析漏洞误报成图面矛盾**（人工按矛盾去查图，必然查不到）。
+        #   现按**单元号**归位：`1单元` / `一单元` 同号归一（unit_num 统一取号）；
+        #   判不出单元号时才退回楼栋级容器 —— 保留首修「不凭空建容器、与楼层表同键」的初衷。
         _tu_raw = str(_cand[0].get("单元") or "").strip()
-        _tu = _tb
-        _FX_FORCE.setdefault(_tb, {}).setdefault(_tu, []).append(_t)
+        # 单元号要**从真正存着单元号的字段**取：实测两处来源字段名不同 ——
+        #   · 图上箱位直写证据（build_fx_direct_evidence）：`单元` 字段刻意存的是**楼栋名**
+        #     （历史决定，为保住「箱与楼层表同键」），单元号在 `图上单元` 字段；
+        #   · 对照表（extract_fx_map）：`单元` 字段形如 `1号楼1单元`。
+        #   只读 `单元` 会让直写证据这一路的单元号恒为 None ⇒ 箱整批落到楼栋级容器，
+        #   单元划分等于没恢复（实测踩中：单元键出来了，箱却一个都没进去）。
+        _tu_num = unit_num(_cand[0].get("图上单元"))
+        if _tu_num is None:
+            _tu_num = unit_num(_tu_raw)
+        _FX_FORCE.setdefault(_tb, {}).setdefault(_tu_num, []).append(_t)
+        if _tu_num is None:
+            BDGMAP_NO_UNIT.add("%s（对照表单元字段=%r）" % (_no, _tu_raw))
         # 配对到的对照表条目按文字实例记账（(编号, x) 为该实例的唯一键）——
         #   安装楼层须用**该实例自己**的条目，不能再用「编号→条目」查表（重号时查不出）。
         _FX_ENTRY[(_no, round(_t["x"], 2))] = _cand[0]
@@ -1524,9 +1618,12 @@ if BDG_MAP:
         _moved += 1
         _old = _owner.get(id(_t))
         if _old != _tb:
-            # 「(不在任何楼栋x区间)」这一情形正是本类图纸的特征，留痕备查
+            # 「(不在任何楼栋x区间)」这一情形正是本类图纸的特征，留痕备查。
+            #   单元位写**图上单元原文**（取不到号时注明），不得写成已归一的目标容器名
+            #   —— 目标容器要到楼栋循环里才可能与图上单元轴对上，此处还不是结论。
             BDGMAP_MOVED.append("%s: %s -> %s/%s"
-                                % (_no, _old or "(不在任何楼栋x区间)", _tb, _tu))
+                                % (_no, _old or "(不在任何楼栋x区间)", _tb,
+                                   _tu_raw or "(单元字段为空→待定)"))
     if _claimed:                              # 从原楼栋摘除，避免重复计数
         for _b0 in list(bldg_texts.keys()):
             bldg_texts[_b0] = [_t0 for _t0 in bldg_texts[_b0]
@@ -1544,25 +1641,46 @@ if BDG_MAP:
 for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
     titles = [t["内容"] for t in bldg_texts[bldg] if TITLE_RE.search(t["内容"])]
     units = split_units(bldg)
-    # --bldg-map：把对照表认领的箱注入其单元，单元名以对照表为准。
-    #   该楼对照表只有一个单元名时，parse 原划分（常是占位名「全部」）整体并入该名下
-    #   —— 否则 parsed.json 的单元名与 coverage.json（走 bldg-map）对不上、无法 join。
-    #   有多个单元名时保留 parse 原划分作**非箱文字容器**，另按要求新增单元，并登记
-    #   「名称并存」交人工，不静默合并、不丢文字。
+    # --bldg-map / 直写自证：把认领到的箱按**单元号**注入图上已有的单元容器。
+    #   （2026-09-19 二次修正，取代原先「一律并入楼栋名容器」的做法 —— 那会抹平单元划分，
+    #     见上方收集处的注释。首修的目标「箱与楼层表同键、不建孤儿容器」在此保留：
+    #     只有图上确实**没有**单元轴标注（`_UNIT_SPLIT_SRC != "marker"`）时才用楼栋级容器。）
     _forced = _FX_FORCE.get(bldg) or {}
     if _forced:
-        if len(_forced) == 1:
-            _only = list(_forced.keys())[0]
-            _merged = []
-            for _u0, _tl0 in units.items():
-                _merged.extend(_tl0)
-            units = {_only: _merged}
-        elif units:
-            BDGMAP_NAMEMISS.append(
-                "%s: 对照表单元 %s 与 parse 原单元 %s 并存（非箱文字仍在原单元）"
-                % (bldg, "/".join(sorted(_forced)), "/".join(sorted(units.keys()))))
-        for _u0, _tl0 in _forced.items():
-            units[_u0] = list(units.get(_u0) or []) + list(_tl0)
+        _uindex = {}
+        if _UNIT_SPLIT_SRC.get("kind") == "marker":
+            for _uk in units:
+                _n = unit_num(_uk)
+                if _n is not None:
+                    _uindex.setdefault(_n, _uk)
+        _to_bldg = []          # 单元号判不出 / 图上无该号 → 楼栋级容器（登记交人）
+        for _un, _tl in _forced.items():
+            _tgt = _uindex.get(_un) if _un is not None else None
+            if _tgt is not None:
+                units[_tgt] = list(units.get(_tgt) or []) + list(_tl)
+            else:
+                _to_bldg.extend(_tl)
+        if _to_bldg:
+            if _uindex:
+                # 图上确有单元轴、但少数箱的单元号对不上任何单元容器：**不并回、不新建假单元**，
+                #   单开一个楼栋级容器承载它们并登记「需人工裁决」。该容器与楼层表不同键
+                #   是**刻意**的（下游 join 不上时看得见），不得当作已定案。
+                PENDING_NOTES.append({
+                    "对象": bldg,
+                    "事项": "%d 个箱的单元号在图上的单元轴里找不到对应容器，已单开楼栋级容器"
+                            "「%s」承载 —— 该容器与楼层表不同键，须人工裁决后才可进成品"
+                            % (len(_to_bldg), bldg),
+                    "说明": "图上单元轴容器：%s；落空箱数 %d"
+                            % ("/".join(sorted(_uindex.values())) or "(无)", len(_to_bldg)),
+                })
+                units[bldg] = list(_to_bldg)
+            else:
+                # 图上**没有**单元轴标注：沿用首修语义 —— 全部并回楼栋级容器，
+                #   保证箱与楼层表同键（此时该容器就是楼层表的唯一容器）。
+                _merged = []
+                for _u0, _tl0 in units.items():
+                    _merged.extend(_tl0)
+                units = {bldg: _merged + _to_bldg}
     result["楼栋"][bldg] = {"标题": titles[0] if titles else "", "单元": {}}
     for uname, unit_texts in units.items():
         floor_marks, fx_list, hu_count, cable_info, cable_names, others = parse_floor_info(unit_texts)

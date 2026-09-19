@@ -30,6 +30,16 @@ import os
 import re
 import sys
 
+# 控制台 UTF-8 兜底：中文 Windows 默认 GBK，print CJK 即崩；被替换的流则跳过。
+# （共享实现见 ftth_common.ensure_console_utf8；本文件仅函数内懒导入 ftth_common，故内联。）
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _rec = getattr(_s, "reconfigure", None)
+        if callable(_rec):
+            _rec(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description='箱位直读标注提取（N号楼M单元K层 → fx_locations.json）')

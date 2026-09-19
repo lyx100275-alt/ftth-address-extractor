@@ -51,8 +51,11 @@ import os
 import re
 import sys
 
-from ftth_common import (ToleranceEstimateError, estimate_titleblock_tolerances,
-                         filter_titleblock_units)
+from ftth_common import (ToleranceEstimateError, ensure_console_utf8,
+                         estimate_titleblock_tolerances, filter_titleblock_units,
+                         UNIT_RE_SRC)
+
+ensure_console_utf8()
 
 
 def _load_dxf_texts(path, layer):
@@ -466,7 +469,7 @@ def main(argv=None):
     ap.add_argument('--bldg-re', default=r'\d+\s*[#＃号]?\s*楼',
                     help=r'楼名正则，默认匹配 1#楼 / 1号楼 / 1楼')
     ap.add_argument('--lev-re', default=r'(\d+)层/(\d+)户')
-    ap.add_argument('--unit-re', default=r'\d+单元')
+    ap.add_argument('--unit-re', default=UNIT_RE_SRC)
     # 以下 6 个几何容差**与图纸坐标尺度绑定**（不同图纸可差几个数量级），故一律不设
     # 固定默认值；缺省时由 estimate_titleblock_tolerances 按本图量出，显式传入优先。
     _TOL_H = '（缺省时按图自适应；随图纸坐标尺度变化）'
