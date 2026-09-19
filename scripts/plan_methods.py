@@ -46,7 +46,8 @@ from ftth_common import (load_dxf, collect_texts, parse_bldg_nums_ex,
                           cluster_values_by_gap, measure_column_step,
                           home_box_kw, home_box_hit,
                           extract_geom, suggest_fx_symbol_layers,
-                          filter_titleblock_units)
+                          filter_titleblock_units,
+                          UNIT_RE_SRC)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -77,7 +78,7 @@ RE_FIBER_LEN_FORMS = [
 ]
 RE_COVER_ROW = re.compile(r"至\s*\d*\s*[#号]?\s*箱")             # 覆盖表行「…至NN#箱」
 RE_LEVEL_HH = re.compile(r"\d+\s*层\s*/\s*\d+\s*户")             # 图签「N层/M户」
-RE_UNIT = re.compile(r"\d+\s*单元")                              # 图签「N单元」
+RE_UNIT = re.compile(UNIT_RE_SRC)                                # 图签/系统图「N单元」（写法表见 ftth_common）
 # 图签**分离标注**形态「NF」+「M户/层」（两个独立文字实体，同行相邻）。
 # 生产脚本 read_titleblock_households.py 早有该 fallback（配对合成 N层/M户），
 # 画像侧长期未同步 ⇒ 该类图纸的 titleblock_annotation 恒判 variant、图签这条
