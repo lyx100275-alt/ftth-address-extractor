@@ -5,6 +5,35 @@
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
 > 归位记录（2026-09-17）：五十三~五十六 曾被追加到文件末尾且标题层级误为二级，已移至顶部并统一为三级；仅移动与改层级，正文逐字未动。
 
+### 2026-09-19（八十一·补）：采纳另一会话 8 文件 —— P0 静默失配修复 + 分带自动模式 + 权威文档
+   **背景**：工作区存有另一会话的 8 个未提交文件（4 脚本 + 4 文档），经用户 2026-09-19
+   09:21 授权评估后**全部采纳**入库。评估证据：4 脚本语法编译 OK；共享依赖
+   （normalize_bldg_name / judge_pending_scope / pending_items_from_rulings /
+   derive_plot_bands / is_bldg_title_text）在 HEAD ftth_common 全部在位；
+   **r4 管线产物（coverage.json 含 标注侧唯一箱位数/键未识别未比对/楼栋键区间歧义
+   等新代码特征字段）即由这批脚本端到端产出**；真机冒烟：split_bands --auto
+   （柳辛庄全图 plan 模式 rc=0，锚点识别与排除项逐条给因）、read_titleblock
+   （云峰 rc=3 申报制语义正确）。
+   **脚本（4）**：
+   - analyze_coverage.py（竖线法）：楼栋名**同源投票**（修 P0 静默失配——重建名
+     「N#楼」vs 对照表原文「N#配套楼」致裁决项关联不上、箱被静默放行）；
+     「已排除」类裁决项标 阻塞=False 不判 pending；待裁决范围判定收敛到
+     ftth_common.judge_pending_scope 唯一实现（修子串包含跨号误伤）。
+   - analyze_coverage_vshape.py（V 型法）：同上三项 + 楼号解析统一走
+     parse_bldg_nums_ex（不再自造正则）；键形态认不出**显式登记**（不再静默跳过）；
+     需人工裁决按内容保序去重。
+   - read_titleblock_households.py：「本图无图签形态」rc=1 → **rc=3**（申报制语义，
+     与 ftth.py 三十·补契约对齐）；量测到但排版矛盾仍 rc=1（两回事）。
+   - split_bands.py：新增 --auto（derive_plot_bands 唯一权威实现：地块锚点中点法
+     分带，方案先行 --yes 确认；排除项逐条给因；三项独立核对）；ent_y 收编共享模块。
+   **文档（4）**：measurement_architecture.md（地块锚点分带规则）、
+   operations_discipline.md（④类三道锁 / 5.6 底线3前提 / 5.7 来源数与校验分流 /
+   5.8 已确认≠已定案）、step2_selfcheck.md（C1~C10 十项名、C5 扩展、C10 详述，
+   另补八十一 C10 字段级口径一段）、titleblock_and_intake_table.md（层户粒度
+   栋级/单元级两形态，2026-09-18 用户裁定）。
+   **未直跑项**：analyze_coverage.py（竖线法）本轮无同参真机输入，仅有编译 +
+   依赖 + 与 V 型法同构 diff 审读；风险低但留痕。
+
 ### 2026-09-19（八十一）：C10 口径修复 —— 单侧不可读不得判矛盾；图标法层数回退
    **背景（真机实锤，非推演）**：柳辛庄 r4 pipeline 的 inspect.json 里 C10 FAIL
    「13 处不一致」，逐条拆解 = 9 假 + 4 真：图标法系统图（户数全空 → None）被当

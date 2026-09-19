@@ -42,7 +42,8 @@ from ftth_common import (
     DEFAULT_MERGE_TOL, DEFAULT_CONN_TOL,
     INF_COORD, NEG_INF_COORD,
     setup_logger, extract_bldg_name, bldg_num, floor_num_or_zero,
-    parse_bldg_nums, parse_bldg_nums_ex, first_group,
+    parse_bldg_nums, parse_bldg_nums_ex, first_group, normalize_bldg_name,
+    judge_pending_scope, pending_items_from_rulings,
     load_dxf, collect_texts, cluster_by_x, match_y_to_floor, assign_floor_by_interval,
     parse_floor_label, clean_text, is_floor_text, attrib_hit, require_params,
     cluster_values_by_gap, measure_column_step,
@@ -427,7 +428,24 @@ if FX_MAP:
         _lo, _hi = ranges[_bn]
         _ul = _by_num[_bn]
         _unames = sorted(_ul, key=_unit_ord)
-        _bname = f"{_bn}#楼"
+        # 楼栋名必须与其它产物同源（2026-09-18 实跑修复，P0）：
+        #   实测本图 `parse` / `fxmap` 都把配套楼写成「4#配套楼」，而此处一律重建为
+        #   「4#楼」→ 同一产物内部楼栋名与单元名（取自对照表原文「4#配套楼」）不同源；
+        #   更关键的是下游按楼栋名做关联会**静默失配**：裁决项按单元名登记
+        #   （「4#配套楼/FX22#」），pending 判定拿重建名（「4#楼」）去比 → 比不中 →
+        #   该箱被判 settled 并放行（实测 FX22#/FX23# 两个「安装楼层与总图冲突」箱
+        #   因此漏判，C9 报不出它们）。
+        # 取值优先级：对照表原文（保留「配套/商业/附属」修饰词，经 normalize_bldg_name
+        #   归一，与 parse 侧同一函数）→ 兜底 `N#楼`。同号多形态时取出现最多者。
+        _name_votes = {}
+        for _u0 in _unames:
+            for _i0 in _ul[_u0]:
+                _raw = (FX_MAP[_i0].get("楼栋") or "").strip()
+                if _raw:
+                    _nm = normalize_bldg_name(_raw, _bn)
+                    _name_votes[_nm] = _name_votes.get(_nm, 0) + 1
+        _bname = (max(_name_votes, key=_name_votes.get) if _name_votes
+                  else f"{_bn}#楼")
         _job = {"楼栋": _bname, "x_lo": _lo, "x_hi": _hi, "单元": []}
         for _u in _unames:
             _job["单元"].append({
@@ -1388,7 +1406,13 @@ for (_sx, _sy), _who in _sym_use.items():
 for _b, _bd in result["楼栋"].items():
     for _u, _ud in _bd.get("单元", {}).items():
         for _ft in _ud.get("疑似跨图带连续体", []):
+            # 阻塞=False（2026-09-18 实跑修复，P0）：本条自述「已按非断口处理」，属脚本
+            #   **已自行处置完毕**的提示 + 可选调参建议，不是「结论待裁决」；且同一信息
+            #   在单元级字段 `疑似跨图带连续体` 里已完整留存。登记于此只为可见性，
+            #   若据此判 pending，一个"已排除"的提示就能把整个单元的箱全部卡住
+            #   （实测 7#/8#/10#/11# 四单元因此无法出表）。
             _judge.append({"对象": judge_object_name(_b, _u), "事项": "疑似跨图带连续体（已排除）",
+                           "阻塞": False,
                            "说明": f"x≈{_ft['x']} 处下段 {_ft['下段']} 与上段 {_ft['上段']} 间距 {_ft['间距']}，"
                                    f"超过断口跨度上限，已按『非断口』处理（不同图带/不同单元）；"
                                    f"若实为同一根竖干被远距离断开，请调大 --max-break-span 后重跑"})
@@ -1431,16 +1455,45 @@ if not result.get("楼栋"):
 #   confirmation：本单元出现在「需人工裁决」中 ⇒ pending（待裁决，禁止进成品，
 #           由 inspect C9 拦下）；否则 settled。与 parse 侧「有客观依据即可定案」一致。
 # 此前本脚本从不产出这两字段 ⇒ C9 对本来源恒判「已提供但零字段」，这一半产物没核。
-_pend_objs = [str(_x.get("对象", "")) for _x in (result.get("需人工裁决") or [])]
+# 待裁决项的**作用范围**解析（2026-09-18 实跑修复，P0）：
+#   旧实现 `any((_bk in _o and _uk in _o) for _o in _pend_objs)` 是**子串包含**，两处会错：
+#   ① 楼栋名形态不同即失配 —— 楼栋键「4#楼」vs 单元名「4#配套楼」，`"4#楼" in "4#配套楼/FX22#"`
+#      为 False ⇒ 裁决项**关联不上、被静默放行**（实测 FX22#/FX23# 两个「安装楼层与总图冲突」
+#      箱据此判了 settled，C9 报不出它们）；
+#   ② 子串会跨号误伤 —— `7#楼` 是 `17#楼` 的子串、`1#楼` 是 `11#楼` 的子串，邻栋的问题会
+#      算到本栋头上。
+#   现改为按 `judge_object_name` 已确立的口径（**同一楼号即同一对象**）做精确范围匹配：
+#   · 对象不带箱号 → 单元级问题，作用于该单元全部箱；
+#   · 对象带箱号   → 箱级问题，仅作用于该箱。
+#   并引入 `阻塞` 语义：脚本**已自行处置完毕**的提示（事项名含「已排除」/显式 阻塞=False）
+#   只作可见性登记，不构成「结论待裁决」，不得据以判 pending。
+_pend_items = pending_items_from_rulings(result.get("需人工裁决"))
+
+
+def _pend_scope(objs, unit_name, box_id, bldg_key=None):
+    """兼容层 —— 范围判定已抽到 **ftth_common.judge_pending_scope**（2026-09-18 统一）。
+
+    两个覆盖脚本（竖线法 / V 型法）此前各写一份，已发生漂移：V 型法那份落后为
+    子串包含判据（`"4#楼" in "4#配套楼/FX22#"` 失配 ⇒ 裁决项静默放行；`7#楼` 命中
+    `17#楼` ⇒ 跨号误伤），且只认斜杠式对象串。现全技能只保留共享模块一份实现，
+    此处仅作薄封装，避免调用点大改。
+    """
+    return judge_pending_scope(objs, unit_name, box_id, bldg_key)
+
+
 _st_settled = _st_pending = 0
 for _bk, _bv in (result.get("楼栋") or {}).items():
     for _uk, _uv in ((_bv or {}).get("单元") or {}).items():
-        _unit_pend = any((_bk in _o and _uk in _o) for _o in _pend_objs)
+        _unit_pend = any(_pend_scope(_objs, _uk, None, _bk)[0]
+                         for _objs, _blk in _pend_items if _blk)
         for _bx in (_uv.get("分纤箱") or []):
             _cov = (_bx.get("覆盖范围线索") or {}).get("覆盖楼层") or []
             _bx["result_origin"] = "derived" if (_cov and _bx.get("安装楼层")) else "unresolved"
+            _box_pend = any(_pend_scope(_objs, _uk, _bx.get("编号"), _bk)[1]
+                            for _objs, _blk in _pend_items if _blk)
             _bx["result_confirmation"] = ("pending"
-                                          if (_unit_pend or _bx["result_origin"] == "unresolved")
+                                          if (_unit_pend or _box_pend
+                                              or _bx["result_origin"] == "unresolved")
                                           else "settled")
             _src = str(_bx.get("依据来源") or "")
             if not _src.startswith("E-DXF-"):
@@ -1455,7 +1508,8 @@ result["结果状态说明"] = {
     "origin 取值含义": "measured=图上直读/几何测量；derived=按规则算出（竖干断口+区间法对位）；unresolved=无解",
     "confirmation 取值含义": "settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）",
     "统计": {"settled": _st_settled, "pending": _st_pending},
-    "判 pending 的条件": "本单元出现在「需人工裁决」中",
+    "判 pending 的条件": ("本单元/本箱命中「需人工裁决」中**未标 阻塞=false** 的条目"
+                       "（范围判定走 ftth_common.judge_pending_scope 精确口径）"),
 }
 
 try:

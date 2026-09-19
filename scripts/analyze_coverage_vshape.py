@@ -64,10 +64,12 @@ import os
 import re
 import sys
 
+import ftth_common
 from ftth_common import (
-    clean_text, collect_texts, cluster_chain_mean, cluster_values_by_gap, floor_num,
-    floor_step_from_texts, first_group, load_dxf, median_text_height,
-    parse_bldg_nums, parse_floor_label, require_params, setup_logger,
+    clean_text, collect_texts, cluster_chain_mean, cluster_values_by_gap,
+    floor_num, floor_step_from_texts, first_group, judge_pending_scope,
+    load_dxf, median_text_height, parse_bldg_nums, parse_bldg_nums_ex,
+    parse_floor_label, pending_items_from_rulings, require_params, setup_logger,
 )
 
 log = setup_logger("analyze_coverage_vshape")
@@ -158,6 +160,21 @@ def fl_num(name):
     """
     v = floor_num(name, use_fullmatch=True)
     return v if v is not None else -9999
+
+
+def unit_no_from_key(key):
+    """单元键 → 单元号；取不出返回 None（调用方登记，不静默）。
+
+    兼容 `1单元` 与 `1#楼1单元`（楼名+单元并写）两种实测写法；`全部` 表示该楼
+    未拆分单元，按 1 单元对位。
+    """
+    s = str(key or '')
+    m = re.search(r'([0-9]+)单元', s)
+    if m:
+        return int(m.group(1))
+    if s.strip() in ('全部', '全楼'):
+        return 1
+    return None
 
 
 def find_valleys(ms):
@@ -1086,28 +1103,46 @@ def main():
         for _e in _fxl.get('唯一箱位') or []:
             _loc_idx.setdefault((_e['楼栋'], _e['单元']), set()).add(_e['安装层'])
         _xchk = {'来源': args.fx_locations, '比对总数': 0, '一致': 0, '不一致': 0,
-                 '无标注可校验': 0, '共享组跳过': 0}
+                 '无标注可校验': 0, '共享组跳过': 0,
+                 '标注侧唯一箱位数': len(_fxl.get('唯一箱位') or []),
+                 '键未识别未比对': [], '楼栋键区间歧义': []}
         result['自检_箱位直读标注交叉校验'] = _xchk
         for _bk, _b in (result['楼栋'] or {}).items():
-            _mb = re.match(r'(\d+)#楼', _bk)
-            if not _mb:
+            # 楼号一律走共享入口 parse_bldg_nums_ex（覆盖 `N#楼` / `N号楼` / `N#配套楼`
+            # / `N-M号楼` / `[共享]…` 等写法），**不再自造正则** —— 本脚本此前用
+            # `re.match(r'(\d+)#楼', _bk)` 只认一种写法，共享标题与配套楼被静默丢弃。
+            _bnos, _bamb = parse_bldg_nums_ex(_bk,
+                                              expand_ranges=ftth_common.EXPAND_BLDG_RANGES)
+            if not _bnos:
+                # 键形态认不出 ⇒ **显式登记**。旧实现在此直接 continue，
+                # 于是「一个都没比」被打印成「自检·交叉校验」而过关。
                 if any((u.get('分纤箱') or []) for u in (_b.get('单元') or {}).values()):
                     _xchk['共享组跳过'] += 1
+                _xchk['键未识别未比对'].append(str(_bk))
                 continue
-            _bno = int(_mb.group(1))
+            if _bamb:
+                # `N-M号楼` 连字符写法语义存疑（并列 vs 区间），**不得静默择一**：
+                # 按全局开关的字面值参与比对，并把歧义显式登记；用户确认后加
+                # --expand-bldg-ranges 才按区间展开 —— 与 parse/count 同口径。
+                _xchk['楼栋键区间歧义'].append({
+                    '键': str(_bk), '按字面取楼号': _bnos,
+                    '说明': '连字符写法语义存疑；未展开区间时中间楼栋不参与本项比对，'
+                            '须用户确认后加 --expand-bldg-ranges 重跑'})
             for _uk, _u in (_b.get('单元') or {}).items():
-                _mu = re.match(r'(\d+)单元', _uk)
-                if not _mu:
+                _uno = unit_no_from_key(_uk)
+                if _uno is None:
+                    _xchk['键未识别未比对'].append('%s/%s' % (_bk, _uk))
                     continue
-                _uno = int(_mu.group(1))
-                _ann = _loc_idx.get((_bno, _uno))
+                _ann = set()
+                for _bno in _bnos:
+                    _ann |= _loc_idx.get((_bno, _uno), set())
                 for _bx in (_u.get('分纤箱') or []):
                     _vf = fl_num(_bx.get('安装楼层') or '')
                     if _vf is None:
                         continue
                     _xchk['比对总数'] += 1
-                    _bx['证据']['直读标注安装层'] = sorted(_ann) if _ann else None
-                    if _ann is None:
+                    _bx.setdefault('证据', {})['直读标注安装层'] = sorted(_ann) if _ann else None
+                    if not _ann:
                         _xchk['无标注可校验'] += 1
                     elif _vf in _ann:
                         _xchk['一致'] += 1
@@ -1119,9 +1154,19 @@ def main():
                                     % (_bx.get('安装楼层'), '/'.join('%dF' % a2 for a2 in sorted(_ann))),
                             '说明': '两来源并列证据，均不自动优先——请对照原图裁定'
                                     '（直读标注可能笔误，V型谷底可能分带/配对错位）。'})
-        print('自检 · 箱位直读标注交叉校验: 比对 %d 项，一致 %d，不一致 %d，无标注 %d，共享组跳过 %d'
-              % (_xchk['比对总数'], _xchk['一致'], _xchk['不一致'],
-                 _xchk['无标注可校验'], _xchk['共享组跳过']))
+        print('自检 · 箱位直读标注交叉校验: 标注侧箱位 %d 个；本次比对 %d 项，一致 %d，'
+              '不一致 %d，无标注 %d，共享组跳过 %d'
+              % (_xchk['标注侧唯一箱位数'], _xchk['比对总数'], _xchk['一致'],
+                 _xchk['不一致'], _xchk['无标注可校验'], _xchk['共享组跳过']))
+        if _xchk['键未识别未比对']:
+            print('  ! 有 %d 个楼栋/单元键形态未识别 ⇒ **本次未参与比对**（≠ 已核过）：%s'
+                  % (len(_xchk['键未识别未比对']),
+                     '、'.join(_xchk['键未识别未比对'][:8])
+                     + ('…' if len(_xchk['键未识别未比对']) > 8 else '')))
+        if _xchk['比对总数'] == 0 and _xchk['标注侧唯一箱位数']:
+            print('  ! 本图给了 %d 个箱位直读标注，却没有任何一项完成比对 —— '
+                  '该第二来源**本轮等于未使用**，结论须照此标注'
+                  % _xchk['标注侧唯一箱位数'])
 
     # ============================================================
     # 结果状态契约（L1-C8）产出方落地 —— 两个维度正交，只登记、不改动任何数值与归属
@@ -1133,18 +1178,48 @@ def main():
     #   confirmation：本单元在「需人工裁决」中有条目、或偏差门禁判「不可信」⇒ pending
     #           （待裁决，禁止进成品，由 C9 拦下）；否则 settled。
     #           口径与 parse 侧一致：有客观依据（自检通过、几何归属成立）即可定案。
+    # ---- 待裁决清单去重（2026-09-18 实跑修复，P1）----
+    #   同一 (对象, 事项) 会在多个判据分支下被重复 append：实测某图 18 项里有 8 项
+    #   是同一句话的复制（「V 段数多于箱数」与「V段数与箱数不一致」各出现两遍）。
+    #   重复项不改变数值，但把「待裁决 N 项」虚高、稀释人工注意力，也让人误以为
+    #   有更多独立疑点。按内容 key 保序去重（不排序 —— 保持判据产出顺序可追溯）。
+    _raw_pend = result.get('需人工裁决') or []
+    _seen_pend = set()
+    _dedup = []
+    for _x in _raw_pend:
+        _k = json.dumps(_x, ensure_ascii=False, sort_keys=True)
+        if _k in _seen_pend:
+            continue
+        _seen_pend.add(_k)
+        _dedup.append(_x)
+    result['需人工裁决'] = _dedup
+    if len(_dedup) != len(_raw_pend):
+        print('  · 待裁决清单去重：%d → %d 项（重复项已合并）' % (len(_raw_pend), len(_dedup)))
+
     _dg_concl = (result.get('自检_偏差门禁') or {}).get('结论')
     _dg_ok = (_dg_concl == '可信')
-    _pend_objs = [str(_x.get('对象', '')) for _x in (result.get('需人工裁决') or [])]
+    # 裁决项的作用范围一律走共享口径 ftth_common.judge_pending_scope（与竖线法同源）。
+    #   本脚本此前用**子串包含** `(_bk in _o and _uk in _o)` 判，两处会错（实测）：
+    #   ① 楼栋名形态不同即失配 —— `"4#楼" in "4#配套楼/FX22#"` 为 False
+    #      ⇒ 裁决项关联不上、被静默放行；
+    #   ② 子串跨号误伤 —— `7#楼` 是 `17#楼` 的子串 ⇒ 邻栋问题算到本栋头上。
+    #   并**不判决 `阻塞: false` 的条目**：那是脚本已自行处置完毕的可见性登记
+    #   （如『疑似跨图带连续体（已排除）』），不构成「结论待裁决」。
+    _pend_items = pending_items_from_rulings(result.get('需人工裁决'))
     _st_settled = _st_pending = 0
     for _bk, _bv in (result.get('楼栋') or {}).items():
         for _uk, _uv in (_bv.get('单元') or {}).items():
-            _unit_pend = (not _dg_ok) or any((_bk in _o and _uk in _o) for _o in _pend_objs)
+            _unit_pend = (not _dg_ok) or any(
+                judge_pending_scope(_objs, _uk, None, _bk)[0]
+                for _objs, _blk in _pend_items if _blk)
             for _bx in (_uv.get('分纤箱') or []):
                 _cov = (_bx.get('覆盖范围线索') or {}).get('覆盖楼层') or []
                 _bx['result_origin'] = 'derived' if (_cov and _bx.get('安装楼层')) else 'unresolved'
+                _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk)[1]
+                                for _objs, _blk in _pend_items if _blk)
                 _bx['result_confirmation'] = ('pending'
-                                              if (_unit_pend or _bx['result_origin'] == 'unresolved')
+                                              if (_unit_pend or _box_pend
+                                                  or _bx['result_origin'] == 'unresolved')
                                               else 'settled')
                 _src = str(_bx.get('依据来源') or '')
                 if not _src.startswith('E-DXF-'):
@@ -1160,7 +1235,8 @@ def main():
         'origin 取值含义': 'measured=图上直读/几何测量；derived=按规则算出（V型谷底+区间法对位）；unresolved=无解',
         'confirmation 取值含义': 'settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）',
         '统计': {'settled': _st_settled, 'pending': _st_pending},
-        '判 pending 的条件': '本单元出现在「需人工裁决」中，或自检_偏差门禁结论非「可信」',
+        '判 pending 的条件': '本单元出现在「需人工裁决」中（**不含带 `阻塞: false` 的'
+                          '已排除项**），或自检_偏差门禁结论非「可信」',
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
