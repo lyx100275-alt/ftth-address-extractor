@@ -1020,7 +1020,6 @@ def bldg_range_evidence(texts, lo, hi, skip_text=None):
     return out
 
 
-
 def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
     """
     从文字列表中搜索楼栋标题，建立锚点。
@@ -1257,18 +1256,6 @@ _PLOT_BAND_RE = re.compile(
     r"^\s*(\d+(?:\s*[-–]\s*\d+)?)\s*(%s)\s*$" % "|".join(PLOT_BAND_WORDS))
 # 同编号锚点判为「同一处」的 y 容差（绝对，不随图幅缩放）
 _PLOT_ANCHOR_SAME_Y_TOL = 10.0
-
-
-def _txt_fields(t):
-    """兼容两种文字实体形态：collect_texts() 的 dict 与 dump_geom 的 [层,x,y,文] 四元组。"""
-    if isinstance(t, (list, tuple)):
-        if len(t) >= 4:
-            return str(t[0]), float(t[1]), float(t[2]), str(t[3])
-        return None, None, None, None
-    if isinstance(t, dict):
-        return (t.get("层"), t.get("x"), t.get("y"),
-                str(t.get("内容") if t.get("内容") is not None else t.get("text") or ""))
-    return None, None, None, None
 
 
 def find_plot_band_anchors(texts, max_len=16):
@@ -1546,15 +1533,25 @@ def normalize_bldg_name(name, num):
     return "%s#%s楼" % (n, m.group(1)) if m else "%s#楼" % n
 
 
+def bldg_num_or_none(bldg_name):
+    """从楼名提取数字（'1#楼'→1）；**失败返回 None**（不冒充 0）。
+
+    与 :func:`bldg_num`（失败返 0 的既有语义）是同一解析的两态出口；
+    需要区分「解析失败」与「真的是 0 号」时用本函数（2026-09-19 审查后统一：
+    此前 inspect_closure 有一份同名但失败返 None 的本地实现，属同名异义漂移）。
+    """
+    m = re.search(r"(\d+)", bldg_name)
+    return int(m.group(1)) if m else None
+
+
 def bldg_num(bldg_name):
     """从楼名提取数字（如 '1#楼'→1, '2号楼'→2），失败返回 0。
 
     注意：**失败返回 0 是本函数的既有语义**（调用点众多、依赖该行为），故保留不变；
-    新增代码若需要区分「解析失败」与「真的是 0 号」，请改用
-    :func:`parse_unit_key`（失败时返回 None，不冒充 0）。
+    需要区分「解析失败」时改用 :func:`bldg_num_or_none`。
     """
-    m = re.search(r"(\d+)", bldg_name)
-    return int(m.group(1)) if m else 0
+    n = bldg_num_or_none(bldg_name)
+    return n if n is not None else 0
 
 
 # ---------- 中文数字（2026-09-18 上提自 verify_coverage_truth.py，全技能唯一实现） ----------

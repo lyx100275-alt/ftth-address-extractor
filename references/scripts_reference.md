@@ -20,7 +20,7 @@ AIGC:
 | `plan_methods.py` | **图纸画像（Step 1a 产物）**：13 信号判定 + 选法 + 档案一致率对比 + 门禁评估 | `--dxf --out --probe --project-dir --text-layer --text-type --title-pattern --fx-pattern --wire-keywords --vert-dx` |
 | `dump_geom.py` | **全量几何转储（Step 1a 首步）**：文字/INSERT/线段 → `<DXF>.geom.json`；后续内联查询读此缓存，不回原图 | `--dxf --out` |
 | `ledger_elements.py` | **元素台账（几何侧独立出口）**：六类元素（分纤箱/家居箱/线缆/楼层线/数据标注/文字标注）带坐标枚举 + 楼栋单元边界（锚点 x,y / x范围 / y分带）+ 校验。箱柜层取**专用层**（`EQUIP-` 前缀含安防/消防等非分纤箱设备，不取）；线缆候选**剔除建筑电气**层（照明/动力/接地/消防/安防…）；无单元标注时只给 x 聚类线索不臆造边界 | `--dxf --out --geom --config --parse --text-layer --title-pattern --unit-pattern --fx-pattern --hu-pattern --cable-pattern --box-layer-kw --box-attr-re --wire-layer --floorline-layer --verbose`（**`--wire-layer` 建议显式传**） |
-| `parse_dxf_structured.py` | 结构化解析：楼栋/单元/分纤箱/楼层表/INSERT | `--text-layer --text-type --title-pattern --floor-pattern --hu-pattern --cable-pattern --cable-keywords --fx-pattern --unit-pattern --unit-cluster --unit-range --y-tol --insert-blocks --insert-attrib-tag --insert-attrib-val --title-band-tol --consensus-x-tol` |
+| `parse_dxf_structured.py` | 结构化解析：楼栋/单元/分纤箱/楼层表/INSERT；退出码 **4**=探查/解析产物写入失败 | `--text-layer --text-type --title-pattern --floor-pattern --hu-pattern --cable-pattern --cable-keywords --fx-pattern --unit-pattern --unit-cluster --unit-range --y-tol --insert-blocks --insert-attrib-tag --insert-attrib-val --title-band-tol --consensus-x-tol` |
 | `count_households.py` | 户数统计（皮线计数法：数皮线标注，系统图）——作为图标法的**对照口径**。同坐标重复绘制自动去重（键 `(x,y,内容)`）并报条数；楼层标注自洽性检查（同名多址 / 次序倒挂）；**出表守门**：尺度锚污染或全部皮线未归属时 rc≠0 | `--text-layer --text-type --title-pattern --floor-pattern --fiber-pattern --special-pattern --assign --match-tol --x-cluster --x-y-gap --probe --title-band-tol --max-unmatched-ratio --allow-lossy` |
 | `count_box_icons.py` | **户数统计（家居配线箱图标法：图标贴皮线末端）**——不依赖块名、不要求图上写 HD/HDD；自动把平面图同名图标分离为 C 级不计入；`*N`/`xN` 乘数标注只告警不自行相乘；刻度列配对偏移异常（与主偏移中位数差超倍数）显式告警；门禁拦截时打印"皮线没找对 vs 图标非户级"诊断；**归层失败门禁**：贴末端图标 > 0 但「归层后总户数 = 0」⇒ **rc=2 且不写产物**（典型为「每层一个箱 + xN 乘数」形态：图标数 = 层数×单元数 ≠ 户数） | `--wire-layer --wire-keys --wire-exclude --insert-blocks --include-square --square-min --square-max --tol --search-radius --strong-keys --weak-keys --floor-layer --scale-max-dx --scale-outlier-ratio --region-y --region-pad --col-x-tol --col-gap` |
 | `analyze_coverage.py` | 覆盖范围判定（竖干连续体 + 物理断口，输出线索非结论） | `--text-layer --text-type --title-pattern --floor-pattern --fx-pattern --unit-cluster --vert-dx --vert-dy --fx-window --merge-tol --conn-tol --wire-layer --insert-attrib-tag --insert-attrib-val --bldg-map --bldg-pad --title-band-tol --fx-symbol-layer --fx-symbol-cluster --fx-symbol-max-size --symbol-pair-tol --total-pad --break-floor-tol --max-break-span` |
@@ -510,9 +510,9 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
 |------|------|
 | `plan_methods.py` | **图纸画像（Step 1a 产物）**：信号判定 + 选法 + 档案一致率对比 + 门禁评估 |
 | `dump_geom.py` | **全量几何转储（Step 1a 首步）** → `<DXF>.geom.json`，后续查询读此缓存 |
-| `ledger_elements.py` | **元素台账（几何侧独立出口）**：六类元素带坐标枚举 + 楼栋/单元 x/y 边界与 y 分带 + 坐标/越界/重叠校验 |
+| `ledger_elements.py` | **元素台账（几何侧独立出口）**：六类元素带坐标枚举 + 楼栋/单元 x/y 边界与 y 分带 + 坐标/越界/重叠校验；退出码 **4**=几何缓存为空/台账写入失败 |
 | `ledger_state.py` | **状态台账（会话侧）**：理解快照 / 裁决台账 / 别名台账的读写与自检 —— 治「重启式梳理」与「裁决不跨通道」（`ledger_elements` 是图侧只读台账，两者勿混） |
-| `parse_dxf_structured.py` | 结构化解析：楼栋/单元/分纤箱/楼层表/INSERT |
+| `parse_dxf_structured.py` | 结构化解析：楼栋/单元/分纤箱/楼层表/INSERT；退出码 **4**=探查/解析产物写入失败 |
 | `count_households.py` | 户数统计（皮线计数法，对照口径）：同坐标去重、楼层标注自洽检查、出表守门 |
 | `count_box_icons.py` | **户数统计（家居配线箱图标法）**：图标贴皮线末端判据，平面图同名图标自动分离 |
 | `analyze_coverage.py` | 覆盖范围判定（竖干连续体 + 物理断口，输出线索非结论） |
