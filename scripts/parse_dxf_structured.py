@@ -1480,9 +1480,14 @@ if BDG_MAP:
             BDGMAP_UNRESOLVED.append("%s: 对照表楼栋=%r 未命中本图锚点（锚点：%s）"
                                      % (_no, _tb0, "/".join(sorted(bldg_ranges)[:8])))
             continue
-        # 单元名取对照表的「单元」字段（如 `1#楼1单元`，与 coverage 侧同源）；
+        # 单元粒度纪律（2026-09-19 补齐到 A 级对照表路径；此前只改了自证路径）：
+        #   箱只归到**楼栋**单元（与楼层表同键），不按对照表原文（`N号楼M单元`）凭空
+        #   创建单元键 —— 实测某图传对照表后楼层表留在「全部」、箱落到新建单元，
+        #   两容器脱节、下游 join 不上；且系统图区本无独立单元划分。
+        #   图上单元原文不丢：记入该箱的「图上单元」字段留痕（见下方 fx 循环）。
         # 缺该字段时退化为楼栋名，不自行编造单元号。
-        _tu = str(_cand[0].get("单元") or "").strip() or _tb
+        _tu_raw = str(_cand[0].get("单元") or "").strip()
+        _tu = _tb
         _FX_FORCE.setdefault(_tb, {}).setdefault(_tu, []).append(_t)
         # 配对到的对照表条目按文字实例记账（(编号, x) 为该实例的唯一键）——
         #   安装楼层须用**该实例自己**的条目，不能再用「编号→条目」查表（重号时查不出）。
@@ -1587,6 +1592,10 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
                 _ent1_is_dup = False
             else:
                 _ent1_is_dup = _ent1 is not None
+            if _ent1:
+                _eu_raw = str(_ent1.get("单元") or "").strip()
+                if _eu_raw and _eu_raw != str(_ent1.get("楼栋") or "").strip():
+                    fx["图上单元"] = _eu_raw
             if _ent1 and _ent1.get("安装楼层"):
                 fx["区间法参考值"] = fl_name
                 # 非有限距离（本单元无可用楼层行时 assign_floor_by_interval 返回 inf）
