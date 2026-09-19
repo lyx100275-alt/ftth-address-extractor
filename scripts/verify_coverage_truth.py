@@ -42,7 +42,9 @@ except ImportError:
 # 上提理由：该逻辑原先仅存在于本脚本，任何新脚本要用就只能再抄一份 ——
 # 「同一逻辑多份实现必然漂移，且漂移后没有任何东西会报错」是本技能反复踩过的坑。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ftth_common import cn2num  # noqa: E402
+from ftth_common import cn2num, ensure_console_utf8  # noqa: E402
+
+ensure_console_utf8()
 
 
 def norm_floor(name):

@@ -42,7 +42,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ftth_common  # noqa: E402
-from ftth_common import bldg_num, parse_unit_key, write_json  # noqa: E402
+from ftth_common import (bldg_num, ensure_console_utf8, parse_unit_key,  # noqa: E402
+                         write_json)  # noqa: E402
+
+ensure_console_utf8()
 
 
 def _load_json(path):

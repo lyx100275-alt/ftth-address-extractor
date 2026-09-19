@@ -19,6 +19,18 @@ DEFAULT_Y_TOL = 2.0           # 户数/皮线与楼层 y 坐标匹配容差
 DEFAULT_MATCH_TOL = 30.0      # 皮线归属楼层 y 容差
 DEFAULT_X_CLUSTER = 20.0      # 皮线 x 聚簇阈值
 DEFAULT_X_Y_GAP = 6.0         # 同层两户皮线的y间距参考
+# ---------- 「N单元」数字写法兼容表（全技能唯一权威定义，2026-09-19 立） ----------
+# 为什么必须是共享入口：实测同一张图上**两种写法并存** ——
+#   · `1单元`：图签（TK-图框）、对照表、箱位直读标注 `N号楼M单元K层`；
+#   · `一单元`：系统图单元轴的标注（TEL_TEXT，每个单元轴一条，y 在顶层刻度之上）。
+# 病灶（实测）：各检测点各自写死 `\d+单元`，于是**只认图签那一路**，系统图自带的
+#   单元划分整批落空；下游表现仅是「单元数=1 且单元名=楼栋名」，无任何告警，
+#   直到 C10 把它报成「图签与系统图矛盾」——**把解析漏洞误报成图面矛盾**。
+# 纪律：凡判「是否 N单元」一律引用本常量，禁止再写裸 `\d+单元`。
+UNIT_NUM_CN = "0-9一二三四五六七八九十"
+UNIT_TOKEN = "[%s]+" % UNIT_NUM_CN
+UNIT_RE_SRC = UNIT_TOKEN + r"\s*单元"
+
 DEFAULT_VERT_DX = 3.0         # 垂直线段 x 跨度阈值
 DEFAULT_VERT_DY = 3.0         # 垂直线段 y 跨度阈值
 DEFAULT_FX_WINDOW = 15.0      # 分纤箱 x 附近线段搜索半宽
@@ -65,6 +77,18 @@ def write_text(path, text, encoding="utf-8", log=None):
     with open(path, "w", encoding=encoding) as f:
         f.write(text)
     return path
+
+
+def auto_scaled(step, name, *, ratios, fallback):
+    """按图纸自身尺度还原几何阈值（2026-09-19 八十九上收，analyze_coverage /
+    count_box_icons 原先各存一份逐字相同的实现，相似度 1.00）。
+
+    ratios / fallback 仍由各调用方自带（两脚本的比率表键不同，不可合并）；
+    本函数只收敛那 4 行算式。ratios/fallback 强制关键字传参 —— 曾实测传参错位
+    类缺陷，位置传参在此处禁用。
+    """
+    v = ratios[name] * step if step else fallback[name]
+    return round(v, 6)
 
 
 def sanitize_nonfinite(obj, _path="", _hits=None):
@@ -384,6 +408,22 @@ def setup_logger(name="ftth", verbose=False):
         logger.addHandler(handler)
     logger.setLevel(level)
     return logger
+
+
+def ensure_console_utf8():
+    """控制台 UTF-8 兜底（幂等、无害）：中文 Windows 控制台默认 GBK，直接 print
+    CJK/特殊符号即 UnicodeEncodeError 崩溃（实测 tests/run_smoke.py T2 行）。
+    新代码统一走本函数；存量 `sys.stdout.reconfigure(encoding="utf-8")` 裸调用
+    保持不动（真实控制台下行为一致，不值得为统一而全量 churn）。
+    stdout/stderr 被替换（如管道/测试捕获、无 reconfigure 方法）时静默跳过。
+    """
+    for _s in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        try:
+            _rec = getattr(_s, "reconfigure", None)
+            if callable(_rec):
+                _rec(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 
 # ---------- DXF 加载 ----------
@@ -1564,6 +1604,25 @@ CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6
             "十八": 18, "十九": 19, "二十": 20, "二十一": 21, "二十二": 22}
 
 
+def unit_num(text):
+    """从「N单元」写法里取单元号（int），取不到返回 None —— **全技能唯一实现**。
+
+    接受 `1单元` / `一单元` / `十一单元` / `1#楼2单元` / `7#楼一单元`；
+    也接受**整串就是一个号码**的来源（`1` / `一`）—— 实测箱位直读证据
+    （`fx_locations.json`）与对照表的「单元」字段就是 int，图上写法则带「单元」二字，
+    两种都必须能取号，否则箱按单元号归位时会整批落到楼栋级容器（实测踩中）。
+
+    纪律：**不得用 0 冒充失败值** —— 单元号 0 与「没解析出来」语义不同，失败一律 None。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return None
+    m = _UNIT_TAIL_RE.search(s)
+    if m:
+        return cn2num(m.group(1)[:-2])      # 去掉尾部「单元」二字
+    return cn2num(s)                        # 纯号码来源；混合串（`1号楼`）由 cn2num 返 None
+
+
 def cn2num(s):
     """中文数字 → 整数（支持 一 / 十 / 十一 / 二十 / 二十一 …）；无法识别返回 None。
 
@@ -2646,8 +2705,22 @@ def build_fx_direct_evidence(texts, fx_re, max_len=24):
             fx_items.append((fx_re.search(c).group(0).strip(), t))
         elif DESC_POS_RE.fullmatch(c):
             desc_items.append(t)
-        elif UNIT_POS_RE.fullmatch(c):
-            unit_items.append(t)
+        else:
+            # B′ 级候选**必须带单元号**才收（2026-09-19 三次修正）。
+            #   理由：本级的唯一用途是回答「箱属于哪个**单元**」；原文里没有单元号时，
+            #   它连单元都给不出，对本级目标零贡献 —— 采纳它只会制造一个
+            #   「单元键 = 楼栋名」的**假容器**（与楼层表不同键、无楼层轴）。
+            #   实测（某图 8 个地块全量扫描）：无单元号的纯楼栋名标注最常出现在
+            #   **图框标题 / 分区名**（该图 12 条全在 `TK-图框` 层，x 坐标与系统图区
+            #   相差一个数量级），被本级采纳后会把**总图/箱表区**的箱编号认领过来
+            #   （最近距约是真箱位的 10 倍）。后果三连：① 箱落进无楼层轴的楼栋级容器
+            #   ⇒ 安装楼层恒为 null（C2/C9 FAIL）；② C10 把「1单元 + 楼栋名容器」
+            #   数成 2 个单元 ⇒ **把解析缺陷误报成『图签与系统图矛盾』**（人工按矛盾
+            #   去查图必然查不到）；③ 该容器与图签口径对不上 ⇒ 图签比对整条不可信。
+            #   收紧后此类箱回到「未采纳 → 登记交人」，符合『归无客观判据不进成品』。
+            _mu = UNIT_POS_RE.fullmatch(c)
+            if _mu and _mu.group(2):
+                unit_items.append(t)
     report = {"FX文字": len(fx_items), "A级箱位描述": len(desc_items),
               "B级单元标注": len(unit_items), "采纳": [], "未采纳": []}
     if not fx_items:
@@ -2691,6 +2764,10 @@ def build_fx_direct_evidence(texts, fx_re, max_len=24):
                 if not mu:
                     continue
                 bno, uno = mu.group(1), mu.group(2)
+                if not uno:
+                    # 防御性再判一次：无单元号的 B′ 候选已在候选收集期排除（见上），
+                    #   此处若仍出现说明上游被改回了宽松口径 —— 宁可漏采也不误采。
+                    continue
                 # 楼栋名保留**原文写法**（含「配套/商业/附属」等修饰词），只去掉尾部单元号。
                 #   若统一改写成「N号楼」，锚点是「4#配套楼」这类形态的楼会匹配不上，
                 #   配套楼的箱会被 silently 丢掉（实测某图 2 个配套楼箱因此无归属）。
