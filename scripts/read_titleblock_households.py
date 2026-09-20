@@ -305,7 +305,18 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
         if not cand:
             _unmatched_units.append([round(u[0], 1), round(u[1], 1), u[2]])
             continue
-        v = min(cand, key=lambda t: (abs(t[0] - u[0]), abs(t[1] - u[1])))
+        # 2026-09-20（柳辛庄 R1 实测 + 用户现场地面真值，升级 R4 预留判据）：
+        #   仍是「最近者胜」，度量从 (|dx|,|dy|) 改为 (|dy|,|dx|) ——
+        #   行身份由 y 决定：单元行与楼名行上下错层（本图单元行整体偏上/偏下
+        #   20~50k），同行格子 Δy 仅 ~400（同刻度线）；而单元列相对层户列在 x
+        #   上有系统性偏置（60~110k），x 最近 ≠ 同行。旧度量曾把 4#/5# 行的格子
+        #   划给 100k 开外的 1#/2# 列（band2），把 3# 行同线 2单元判给 6#
+        #   （band3，离 6# 另一格 108k）。只影响命中 ≥2 栋的歧义标注；
+        #   判给结果照旧逐条记入「单元归属歧义标注」，以此 diff 复核。
+        #   已验证：band3（3#=2/7#=2 系用户地面真值，4#保持1）＋ band2 下线
+        #   （列模型一致＋双像对称）＋ band9-2-11#（[2]→[1,2] 对上系统侧）。
+        #   已知转移：band3-6#（2→1）转成新 C10 待裁定——标签零和，无中生有不得。
+        v = min(cand, key=lambda t: (abs(t[1] - u[1]), abs(t[0] - u[0])))
         key = lvl_owner.get(id(v))
         if not key:
             _units_no_bldg += 1
