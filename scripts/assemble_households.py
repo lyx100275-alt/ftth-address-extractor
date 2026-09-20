@@ -195,15 +195,22 @@ if args.coverage:
             uk = norm_unit(ukey, bkey)
             tgt = out_data["楼栋"].get(bkey, {}).get("单元", {}).get(uk)
             if tgt is None:
-                # 归一后仍对不上：回退「1单元」——仅当该楼栋的 1单元 确实存在时
+                # 归一后仍对不上：回退「1单元」——仅单单元楼（该楼栋组装结果仅 1单元）。
                 # （单单元楼/配套楼的 coverage 单元键常写「X#配套楼」等非 N单元 形式）。
+                # 2026-09-20 收紧：此前只要 1单元 存在就并入，多单元楼的错键
+                # （如纯号码归一语义变化后的 N单元）会被静默并入 1单元致箱错位；
+                # 现多单元楼不再回退，记入未匹配清单交人判断（与下方告警抑制同条件）。
                 # 仍对不上则记入未匹配清单，不猜、不静默丢。
-                fb = out_data["楼栋"].get(bkey, {}).get("单元", {}).get("1单元")
-                if fb is not None:
+                _asm1 = out_data["楼栋"].get(bkey, {}).get("单元", {})
+                fb = _asm1.get("1单元")
+                if fb is not None and len(_asm1) == 1:
                     print(f"[assemble] 单元键回退：{bkey} 的 coverage 单元 {ukey!r} 归一为 {uk!r} 后无对应，"
                           f"已按单单元楼并入 1单元")
                     tgt = fb
                 else:
+                    if fb is not None:
+                        print(f"[assemble] 单元键未回退：{bkey} 的 coverage 单元 {ukey!r} 归一为 {uk!r} 后无对应，"
+                              f"但该楼栋有多单元 {sorted(_asm1)}，不并入 1单元，记入未匹配清单")
                     cov_warn_unmatched.append(f"{bkey}/{uk}")
                     continue
             boxes = []
@@ -216,7 +223,7 @@ if args.coverage:
             tgt["分纤箱"] = boxes
 
     # 覆盖里有、组装结果里没有的单元 → 显式列出（可能漏映射，交人判断）
-    # 解析规则与上方合并一致：归一键或 1单元 回退，任一命中即算已覆盖
+    # 解析规则与上方合并一致：归一键命中、或单单元楼 1单元 回退，任一成立即算已覆盖
     for bkey in bldg_source:
         if not isinstance(bldg_source.get(bkey), dict):
             continue
@@ -226,7 +233,9 @@ if args.coverage:
         asm_units = out_data.get("楼栋", {}).get(bkey, {}).get("单元", {})
         for ukey in units:
             uk = norm_unit(ukey, bkey)
-            if uk in asm_units or "1单元" in asm_units:
+            # 2026-09-20 收紧（与上方合并同条件）：仅单单元楼抑制告警；
+            # 多单元楼的未匹配键必须显式告警，不得以“有 1单元”一笔带过。
+            if uk in asm_units or (len(asm_units) == 1 and "1单元" in asm_units):
                 continue
             if f"{bkey}/{uk}" not in cov_warn_unmatched:
                 cov_warn_unmatched.append(f"{bkey}/{uk}")
