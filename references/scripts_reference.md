@@ -433,47 +433,9 @@ ODA 转换由用户完成。
 3. **归层失败必须 rc≠0** —— `贴末端图标 > 0 且 归层后总户数 == 0` 是「没测出来」，
    不是「0 户」。原实现会 rc=0 写出总户数 0，下游按成功消费即得空表。
 
-## 流水线 `pipeline`（2026-09-17 新增）
+## 流水线 `pipeline`（已外移 → [pipeline_details.md §18](pipeline_details.md)，2026-09-20）
 
-一条命令串跑 `geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → inspect`（以 `ftth.py` 的 `_PIPE_STAGES` 为准）。各阶段以子进程直调 `ftth.py`，
-**不再经 `ftth.cmd` / `_launch.py`**，固定启动开销只付一次。
-
-```bat
-ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项目目录>"
-```
-
-**为什么要它（实测依据，非设计偏好）**：经 `ftth.cmd` 逐条调用时，**每条命令**都要固定付一份启动开销 ——
-`cmd` 批处理 0.78s + 探测 `-c "import ezdxf"` 1.93s（裸解释器 0.62s ＋ import ezdxf 1.31s）
-+ `_launch.py` 1.13s + 调度层 `ftth.py` 0.65s ≈ **3.7s/条**，与图纸大小无关。
-实测某图 6 个阶段逐条调用 **38.74s** → 本命令 **18.37s**（冷缓存 24.99s）。
-
-| 参数 | 必需 | 含义 |
-|---|---|---|
-| `--dxf` | **必需** | 输入 DXF |
-| `--outdir` | **必需** | 产物目录；各阶段用固定文件名落在此处（`config.json` / `profile.json` / `titleblock.json` / `fxmap.json` / `fx_locations.json` / `unit_box_gaps.json` / `parsed.json` / `coverage.json` / `inspect.json`），**之后仍可单条命令接着跑，或重跑其中一段** |
-| `--project-dir` | 建议 | 透传给 `plan`，用于检测《楼宇信息采集表》。**不传会让 `intake_table` 留 `unknown`** |
-| `--profile` | 可选 | 复用指定画像；默认 `<outdir>/profile.json` |
-| `--stop-at` | 可选 | 跑到该阶段为止（`geom` / `probe` / `plan` / `titleblock` / `fxmap` / `fx_locations` / `unit_gaps` / `parse` / `coverage` / `inspect`，默认 `inspect`）；分阶段调试用 |
-| `--reuse-geom` | 可选 | 几何缓存比 DXF 新时直接复用，不重跑 `dump_geom` |
-| `--quiet` | 可选 | 各阶段输出写 `<outdir>/logs/<阶段>.log`，不刷屏 |
-
-> **`titleblock` 阶段 + 图层参数按子命令分派**（2026-09-18 实跑新增/修复）——
-> 前者产出 C10 的输入（`read_titleblock_households.py` → `<outdir>/titleblock.json`），
-> **非 0 退出不中止主链路**但 C10 随之判 SKIP；后者说明 `--wire-layer` / `--fx-symbol-layer` /
-> `--bldg-map` **只有 `coverage` 消费**，传给 `coverage-vshape` 一律 `unrecognized arguments`
-> **直接 rc=2**。细则见 [pipeline_details.md §17](pipeline_details.md)。
-
-**语义边界（刻意约束，勿放宽）**
-
-- **只解析、不做裁决，不含 `gen`** —— 出表必须等人工裁决（覆盖范围 / 安装楼层 / 待确认项），
-  流水线**不得替人拍板**。
-- **不静默续跑** —— 任一阶段 rc≠0 即停并**原样返回该 rc**；仅 **rc=3**（本图确实不提供该子任务数据，
-  申报制）不中止，记为该阶段「不适用」。
-- **覆盖方法由画像决定** —— 读 `handoff.②系统图选法.覆盖范围.脚本` 映射为 `coverage-vshape` / `coverage`，
-  **不在此处二次推断**；画像申报 `absent` 时该阶段合法缺席（rc=3）。
-- 耗时台账落 `<outdir>/pipeline_timing.json`（逐阶段 rc ＋ 秒数）—— **排障与优化都以它为准，不凭印象**。
-- **各阶段参数自洽**：`probe` 产物 `config.json` 同时作为 `--probe` 与 `--config` 传给 `plan`，
-  再传给 `parse` / `coverage*`，与手工逐条调用等价；**校验口径不因走流水线而放宽**。
+> 本节原在此处（2026-09-17 立）。因本文件 48,915 B 距硬上限仅剩 85 B，串跑入口、参数表与语义边界已外移至 [pipeline_details.md §18](pipeline_details.md)；依赖矩阵/可抄示例仍在本文件。
 
 
 ## 统一入口 `ftth.py` 与 `--config` 机制（外移自 SKILL.md，2026-09-17 第三次瘦身）

@@ -440,7 +440,7 @@ ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 | [splitter_rules.md](references/splitter_rules.md) | 分光方式线索呈现（DXF 直读项 vs 待确认项） |
 | [visual_model_lessons.md](references/visual_model_lessons.md) | 降级兜底规范与踩坑教训 |
 | [addressbook_template.md](references/addressbook_template.md) | 模板 24 列对照表 |
-| [pipeline_details.md](references/pipeline_details.md) | Step 1b 细则：脚本行为 / 参数细节 / 口径A 与回填实现 / `geom.json` schema 三坑 / 体量阈值依据 |
+| [pipeline_details.md](references/pipeline_details.md) | 流水线串跑入口 / Step 1b 细则：脚本行为 / 参数细节 / 口径A 与回填实现 / `geom.json` schema 三坑 / 体量阈值依据 |
 | [operations_discipline.md](references/operations_discipline.md) | 会话效率实测 / 断流处置 / 矛盾分级处置 / 三本台账口径 |
 
 ## 版本修订记录
