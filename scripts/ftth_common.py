@@ -71,14 +71,9 @@ def ensure_parent(path, log=None):
     return False
 
 
-def write_text(path, text, encoding="utf-8", log=None):
-    """安全写文本：先建父目录再写；**失败抛出、不吞**（由调用方决定退出码）。"""
-    ensure_parent(path, log=log)
-    with open(path, "w", encoding=encoding) as f:
-        f.write(text)
-    return path
-
-
+# 注（2026-09-20）：此处曾有 write_text（安全写文本）与 write_json 并列；
+# 全仓 import-aware 复核确认其零引用（跨文件 0、同文件 0，唯一真死码），已删除。
+# 需要写文本时用 open(path, "w", encoding="utf-8") + ensure_parent 组合。
 def auto_scaled(step, name, *, ratios, fallback):
     """按图纸自身尺度还原几何阈值（2026-09-19 八十九上收，analyze_coverage /
     count_box_icons 原先各存一份逐字相同的实现，相似度 1.00）。

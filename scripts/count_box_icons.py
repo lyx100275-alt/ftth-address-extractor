@@ -795,10 +795,13 @@ def main():
         for _k in sorted(col_scale_map):
             log("    列 x=%-11.1f  ->  刻度列 x=%.1f" % (_k, col_scale_map[_k]["x"]))
 
-    def pick_scale(x, y0, y1):
+    def pick_scale(x, y0, y1, _fb=None):
         """挑刻度列：优先① 人工显式映射（--col-scale-map）；否则② y 范围完全覆盖；
         再③ y 重叠最大的那批；同批里取 x 最近。全程只看 y 覆盖是否够、不看偏移大小
-        （区间法只用 y）——这正是它在「共用刻度列」图纸上会静默错配的根源。"""
+        （区间法只用 y）——这正是它在「共用刻度列」图纸上会静默错配的根源。
+        2026-09-20：无完全覆盖列而走 ③/兜底时，若传入 _fb 列表则记入
+        (列x, y0, y1)，由调用方统一打印——只加可见性，不改挑列结果
+        （真错配仍由偏移异常/共用刻度列两门禁 + 人工 --col-scale-map 裁决）。"""
         if col_scale_map:
             _sc = col_scale_map.get(round(x, 1))
             if _sc is not None:
@@ -806,6 +809,8 @@ def main():
             # 映射未覆盖的列：仍走自动配对（映射允许只覆盖一部分列）
         cov = [s for s in scales if s["y0"] <= y0 + 1 and s["y1"] >= y1 - 1]
         if not cov:
+            if _fb is not None:
+                _fb.append((x, y0, y1))
             ov = [s for s in scales if min(y1, s["y1"]) - max(y0, s["y0"]) > 0]
             if ov:
                 best = max(ov, key=lambda s: min(y1, s["y1"]) - max(y0, s["y0"]))
@@ -849,11 +854,12 @@ def main():
             % (dx_main, args.scale_period_tol * 100))
 
     results = []
+    _fb_cols = []  # 2026-09-20：走 ③/兜底（无 y 完全覆盖刻度列）的列，见 pick_scale
     for col in col_list:
         x = col["列x"]
         ys = [c["y"] for c in col["图标"]]
         y0, y1 = min(ys), max(ys)
-        sc, dx = pick_scale(x, y0, y1)
+        sc, dx = pick_scale(x, y0, y1, _fb=_fb_cols)
         if sc is not None and dx > max_dx:
             sc = None
         _out_why = None
@@ -961,6 +967,20 @@ def main():
         log("!    处置：人工核对归属后显式指定，例如：")
         log("!       --col-scale-map \"%s\""
             % ";".join("%.1f=%.1f" % (_v[0], _k) for _k, _v in sorted(shared_scale.items())))
+        log("!" * 74)
+
+    if _fb_cols:
+        # 2026-09-20：兜底挑列只看重叠/距离、不看方向，共用刻度列图纸上此处
+        # 最易静默错配。只报事实不改结果（是否真错配由人工裁决）。
+        log("")
+        log("!" * 74)
+        log("! %d 列**没有 y 完全覆盖的刻度列**，已走重叠最大/全候选兜底（结果未改，只提示）"
+            % len(_fb_cols))
+        for _fx, _fy0, _fy1 in _fb_cols:
+            _r = next((r for r in results if r["列x"] == _fx), None)
+            log("!   列 x=%-11.1f y[%.1f,%.1f] → 刻度列x=%s（请人工核对归属，必要时 --col-scale-map 显式指定）"
+                % (_fx, _fy0, _fy1, _r["刻度列x"] if _r else "?"))
+        log("!  → 兜底挑列不看方向，错配时偏移异常门禁未必触发，须人工看一眼。")
         log("!" * 74)
 
     if dup_end:
