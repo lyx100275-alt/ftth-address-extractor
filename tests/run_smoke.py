@@ -31,6 +31,8 @@ fails = []
 # 控制台 UTF-8 兜底：中文 Windows 默认 GBK，本文件含 CJK/∅ 输出，
 # 无此行则 T2 在 print 即崩（UnicodeEncodeError），后半截门禁全跳过。
 # （scripts 侧共享实现见 ftth_common.ensure_console_utf8；测试入口保持零依赖，故内联。）
+# 子进程一律 encoding='utf-8'：text=True 默认走 GBK 解码，子进程中文输出即炸
+# reader 线程（2026-09-20 实测三线程 UnicodeDecodeError），故 5 处 run 全显式指定。
 for _s in (sys.stdout, sys.stderr):
     try:
         _rec = getattr(_s, "reconfigure", None)
@@ -97,7 +99,7 @@ for _f in sorted(os.listdir(SC)):
 check('T0 全仓 py_compile', not _bad, '; '.join(_bad[:3]))
 
 # T4 体量闸门
-r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'budget'], capture_output=True, text=True)
+r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'budget'], capture_output=True, text=True, encoding='utf-8', errors='replace')
 check('T4 budget rc=0', r.returncode == 0, 'rc=%s' % r.returncode)
 
 # T5 语料冒烟（可选，需 ezdxf）
@@ -112,7 +114,7 @@ if '--with-dxf' in sys.argv:
         with tempfile.TemporaryDirectory() as td:
             out = os.path.join(td, 'probe.json')
             r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'probe', '--dxf', dxf, '--out', out],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
             ok = r.returncode == 0 and os.path.exists(out)
             check('T5 语料 probe rc=0', ok, 'rc=%s' % r.returncode)
             if ok:
@@ -147,7 +149,7 @@ with tempfile.TemporaryDirectory() as _td:
     _r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'assemble',
                          '--count', _cp, '--col-map', _T6_COLMAP,
                          '--coverage', _vp, '--out', _ap],
-                        capture_output=True, text=True)
+                        capture_output=True, text=True, encoding='utf-8', errors='replace')
     _ok = _r.returncode == 0 and os.path.exists(_ap)
     check('T6 assemble rc=0', _ok, 'rc=%s %s' % (_r.returncode, _r.stderr[-200:] if _r.stderr else ''))
     if _ok:
@@ -165,7 +167,7 @@ with tempfile.TemporaryDirectory() as _td:
         _pp = os.path.join(_td, 'ruled.json')
         _r2 = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'apply-ruling',
                               '--json', _ap, '--set', '3#楼/1单元/1F=5', '--out', _pp],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, encoding='utf-8', errors='replace')
         _ok2 = _r2.returncode == 0 and os.path.exists(_pp)
         check('T6 apply-ruling rc=0', _ok2, 'rc=%s' % _r2.returncode)
         if _ok2:
@@ -183,7 +185,7 @@ with tempfile.TemporaryDirectory() as _td:
                 _r3 = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'gen',
                                       '--parse', _pp, '--coverage', _vp,
                                       '--template', _tpl, '--out', _xp],
-                                     capture_output=True, text=True)
+                                     capture_output=True, text=True, encoding='utf-8', errors='replace')
                 _ok3 = _r3.returncode == 0 and os.path.exists(_xp)
                 check('T6 gen rc=0', _ok3, 'rc=%s' % _r3.returncode)
             else:
