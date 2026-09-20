@@ -137,7 +137,7 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 ## 17. `pipeline` 阶段细则：`titleblock` 与「图层参数按子命令分派」
 
 > 本条从 `scripts_reference.md` 外移（2026-09-18，该文件触 47,000 B 预警线）。
-> 阶段链与参数表仍在 `scripts_reference.md`；此处只放细则。
+> 串跑入口与参数表见本文件 §18（2026-09-20 外移）；依赖矩阵/可抄示例仍在 `scripts_reference.md`。
 
 ### 17.1 `titleblock` 阶段（2026-09-18 实跑新增）
 
@@ -178,3 +178,48 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 
 > **同类缺陷提示**：`--bldg-map` 那处早已按子命令分派，这两处却漏了 ——
 > **只修报出来的那一个，等于留哑弹**。改动图层/对照表参数的传递逻辑前，先 grep 全部同类参数。
+
+## 18. 流水线 `pipeline` 串跑入口（外移自 `scripts_reference.md`，2026-09-20）
+
+> 外移原因：`scripts_reference.md` 达 48,915 B、距硬上限仅剩 85 B（`ftth.py budget` 二次信号）。
+> 本节原文逐字搬入（2026-09-17 立）；依赖矩阵/可抄示例仍在 `scripts_reference.md`。
+
+一条命令串跑 `geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → inspect`（以 `ftth.py` 的 `_PIPE_STAGES` 为准）。各阶段以子进程直调 `ftth.py`，
+**不再经 `ftth.cmd` / `_launch.py`**，固定启动开销只付一次。
+
+```bat
+ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项目目录>"
+```
+
+**为什么要它（实测依据，非设计偏好）**：经 `ftth.cmd` 逐条调用时，**每条命令**都要固定付一份启动开销 ——
+`cmd` 批处理 0.78s + 探测 `-c "import ezdxf"` 1.93s（裸解释器 0.62s ＋ import ezdxf 1.31s）
++ `_launch.py` 1.13s + 调度层 `ftth.py` 0.65s ≈ **3.7s/条**，与图纸大小无关。
+实测某图 6 个阶段逐条调用 **38.74s** → 本命令 **18.37s**（冷缓存 24.99s）。
+
+| 参数 | 必需 | 含义 |
+|---|---|---|
+| `--dxf` | **必需** | 输入 DXF |
+| `--outdir` | **必需** | 产物目录；各阶段用固定文件名落在此处（`config.json` / `profile.json` / `titleblock.json` / `fxmap.json` / `fx_locations.json` / `unit_box_gaps.json` / `parsed.json` / `coverage.json` / `inspect.json`），**之后仍可单条命令接着跑，或重跑其中一段** |
+| `--project-dir` | 建议 | 透传给 `plan`，用于检测《楼宇信息采集表》。**不传会让 `intake_table` 留 `unknown`** |
+| `--profile` | 可选 | 复用指定画像；默认 `<outdir>/profile.json` |
+| `--stop-at` | 可选 | 跑到该阶段为止（`geom` / `probe` / `plan` / `titleblock` / `fxmap` / `fx_locations` / `unit_gaps` / `parse` / `coverage` / `inspect`，默认 `inspect`）；分阶段调试用 |
+| `--reuse-geom` | 可选 | 几何缓存比 DXF 新时直接复用，不重跑 `dump_geom` |
+| `--quiet` | 可选 | 各阶段输出写 `<outdir>/logs/<阶段>.log`，不刷屏 |
+
+> **`titleblock` 阶段 + 图层参数按子命令分派**（2026-09-18 实跑新增/修复）——
+> 前者产出 C10 的输入（`read_titleblock_households.py` → `<outdir>/titleblock.json`），
+> **非 0 退出不中止主链路**但 C10 随之判 SKIP；后者说明 `--wire-layer` / `--fx-symbol-layer` /
+> `--bldg-map` **只有 `coverage` 消费**，传给 `coverage-vshape` 一律 `unrecognized arguments`
+> **直接 rc=2**。细则见本文件 §17。
+
+**语义边界（刻意约束，勿放宽）**
+
+- **只解析、不做裁决，不含 `gen`** —— 出表必须等人工裁决（覆盖范围 / 安装楼层 / 待确认项），
+  流水线**不得替人拍板**。
+- **不静默续跑** —— 任一阶段 rc≠0 即停并**原样返回该 rc**；仅 **rc=3**（本图确实不提供该子任务数据，
+  申报制）不中止，记为该阶段「不适用」。
+- **覆盖方法由画像决定** —— 读 `handoff.②系统图选法.覆盖范围.脚本` 映射为 `coverage-vshape` / `coverage`，
+  **不在此处二次推断**；画像申报 `absent` 时该阶段合法缺席（rc=3）。
+- 耗时台账落 `<outdir>/pipeline_timing.json`（逐阶段 rc ＋ 秒数）—— **排障与优化都以它为准，不凭印象**。
+- **各阶段参数自洽**：`probe` 产物 `config.json` 同时作为 `--probe` 与 `--config` 传给 `plan`，
+  再传给 `parse` / `coverage*`，与手工逐条调用等价；**校验口径不因走流水线而放宽**。
