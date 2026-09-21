@@ -102,26 +102,29 @@ check('T0 全仓 py_compile', not _bad, '; '.join(_bad[:3]))
 r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'budget'], capture_output=True, text=True, encoding='utf-8', errors='replace')
 check('T4 budget rc=0', r.returncode == 0, 'rc=%s' % r.returncode)
 
-# T5 语料冒烟（可选，需 ezdxf）
+# T5 语料冒烟（可选；仓库公开后不再内置语料 DXF）
 if '--with-dxf' in sys.argv:
-    try:
-        import ezdxf  # noqa: F401
-        HAS = True
-    except ImportError:
-        HAS = False
-    if HAS:
-        dxf = os.path.join(HERE, 'corpus', 'a小区.dxf')
-        with tempfile.TemporaryDirectory() as td:
-            out = os.path.join(td, 'probe.json')
-            r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'probe', '--dxf', dxf, '--out', out],
-                               capture_output=True, text=True, encoding='utf-8', errors='replace')
-            ok = r.returncode == 0 and os.path.exists(out)
-            check('T5 语料 probe rc=0', ok, 'rc=%s' % r.returncode)
-            if ok:
-                d = __import__('json').load(io.open(out, encoding='utf-8'))
-                check('T5 probe 产物含建议参数', 'suggested_params' in d or 'signals' in d or len(d) > 0)
+    dxf = os.path.join(HERE, 'corpus', 'a小区.dxf')
+    if not os.path.exists(dxf):
+        print('[SKIP] T5（公开仓库不内置语料 DXF，可自行放置 tests/corpus/a小区.dxf 后启用）')
     else:
-        print('[SKIP] T5（缺 ezdxf）')
+        try:
+            import ezdxf  # noqa: F401
+            HAS = True
+        except ImportError:
+            HAS = False
+        if HAS:
+            with tempfile.TemporaryDirectory() as td:
+                out = os.path.join(td, 'probe.json')
+                r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'probe', '--dxf', dxf, '--out', out],
+                                   capture_output=True, text=True, encoding='utf-8', errors='replace')
+                ok = r.returncode == 0 and os.path.exists(out)
+                check('T5 语料 probe rc=0', ok, 'rc=%s' % r.returncode)
+                if ok:
+                    d = __import__('json').load(io.open(out, encoding='utf-8'))
+                    check('T5 probe 产物含建议参数', 'suggested_params' in d or 'signals' in d or len(d) > 0)
+        else:
+            print('[SKIP] T5（缺 ezdxf）')
 
 # T6 出表链黄金路径（合成料：3 列 / 全名单元键 / 中文单元 / 共享克隆）
 import json as _json
