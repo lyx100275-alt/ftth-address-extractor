@@ -65,7 +65,7 @@ $T  = "C:\...\.temp\<项目>"
 | `references/` | 细则文档（参数表 / 覆盖规则 / 选法 / 图签协议 / 流水线细则 / 操作纪律…） |
 | `methods/` | 图纸类型方法（楼-簇 / 共享混合 / 图签主导）+ 信号定义 |
 | `assets/` | 标准地址表模板 xlsx |
-| `tests/` | `run_smoke.py` + 语料 `corpus/a小区.dxf` |
+| `tests/` | `run_smoke.py` 冒烟自检（T5 语料 DXF 不随仓发布，缺失自动 SKIP，可自行放置脱敏语料启用） |
 | `SKILL_CHANGELOG.md` | 完整修订记录（中文序号，追加放顶部） |
 | `version.json` | 版本号 + 台账 schema 标识 + 体量阈值（minor 位 = 修订序号） |
 
