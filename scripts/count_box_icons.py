@@ -39,8 +39,8 @@ FTTH 系统图里每一户的入户端都画一个「家居配线箱」图标（
    - **C 级**：有文字但**不贴末端** —— 判为**非本图区**图标（典型：楼层平面图里
      一个户型一个的示意图标），默认**不计入户数**，但全部列出供人工核对
    - 其余（无文字、不贴末端）：丢弃
-5. **归层**：楼层刻度列 + 区间法（`y_i <= y < y_{i+1}` 归第 i 层），与
-   SKILL.md「区间法」口径完全一致；刻度列由图纸自身识别（同一 x 处成列的楼层标注）。
+5. **归层**：楼层刻度列 + 半开区间（每个图标按 y ∈ [ys[i], ys[i+1]) 归第 i 层，
+   与 SKILL.md「区间法」口径一致，逐图标直接判定、无聚组无中点）；刻度列由图纸自身识别（同一 x 处成列的楼层标注）。
 
 适用边界（与 SKILL.md 既有裁定一致）
 ------------------------------------
@@ -296,9 +296,18 @@ def _scales_from_rows(rows, min_floors=3):
 
 
 def band_of(sc, y):
-    for i in range(len(sc["ys"]) - 1):
-        if sc["ys"][i] <= y < sc["ys"][i + 1]:
-            return sc["names"][i]
+    """半开区间归层（2026-09-26 云峰 B1 误归根因修复 v3：回滚中点法）。
+
+    ``y ∈ [ys[i], ys[i+1]) 归第 i 层``；ys 含顶层上界哨兵（如 WF），故顶层带
+    为 [17F, WF) ，图标落入即归顶层。y 低于最低刻度线或高于最高刻度线（≥ys[-1]）
+    返回 None（未归属）；无刻度（空 ys）返回 None。
+    逐图标直接判定，无聚组、无中点分界。调用方不得再做组 y 中点。
+    """
+    ys = sc.get("ys") or []
+    names = sc.get("names") or []
+    for i in range(len(ys) - 1):
+        if ys[i] <= y < ys[i + 1]:
+            return names[i]
     return None
 
 
@@ -461,6 +470,37 @@ def period_dev(dx, base):
     return k, abs(base - k * dx) / (k * dx)
 
 
+def side_spectrum(dxs_side, side):
+    """同侧谱有效性判定（2026-09-26 左右分谱）。返回 (base, ok, skip_note)。
+
+    dxs_side = 该侧 |偏移| 集；side = "左"/"右"（仅用于 skip_note 前缀）。
+    ok 为 True 时 base 为该侧主偏移（最大显著簇中心），调用方用 period_dev
+    比对；ok 为 False 时该侧跳过校验（skip_note 已带左右侧前缀，显式留痕，
+    不判异常）。无主导谱判据：成员<2，或无显著簇（簇=相邻值相对差≤10%的组，
+    显著=成员≥2，与 mode_base 同口径），或最大显著簇未过半数——跨刻度列组的
+    偏移本就各不相同，无共识谱可比对时强行比对即制造误报。
+    """
+    n = len(dxs_side)
+    if n < 2:
+        return None, False, "%s侧仅 %d 列，无显著簇，跳过校验" % (side, n)
+    base = mode_base(dxs_side)
+    if not base:
+        return None, False, "%s侧仅 %d 列，无显著簇，跳过校验" % (side, n)
+    s = sorted(dxs_side)
+    _clusters = [[s[0]]]
+    for _v in s[1:]:
+        if abs(_v - _clusters[-1][-1]) <= 0.10 * _clusters[-1][-1]:
+            _clusters[-1].append(_v)
+        else:
+            _clusters.append([_v])
+    _sig = [c for c in _clusters if len(c) >= 2]
+    if not _sig:
+        return None, False, "%s侧 %d 列无显著簇，跳过校验" % (side, n)
+    if max(len(c) for c in _sig) <= n / 2:
+        return None, False, "%s侧 %d 列最大显著簇未过半数，无主导谱，跳过校验" % (side, n)
+    return base, True, None
+
+
 def parse_col_scale_map(spec, scales, col_list, tol, log):
     """解析 --col-scale-map "列x=刻度列x;列x=刻度列x;..."，返回 {列x(1位小数): 刻度列对象}。
 
@@ -532,9 +572,12 @@ def main():
     ap.add_argument("--scale-max-dx", type=float, default=None,
                     help="图标列到刻度列的最大 x 距离（默认自适应 p90×1.3）")
     ap.add_argument("--scale-period-tol", dest="scale_period_tol", type=float, default=0.07,
-                    help="刻度列**配对偏移异常**判据（0=关闭）：某列偏移与主偏移（最大簇中心）"
+                    help="刻度列**配对偏移异常**判据（0=关闭）：某列偏移与**同侧主偏移**"
+                         "（左谱/右谱各自的最大簇中心，列x<刻度列x为左、列x>刻度列x为右）"
                          "不成整数倍、且相对偏离 > 本值时标记异常。合法偏移 = k × 单元间距，"
-                         "天然呈整数谱；偏离即说明配到了别栋/别图区的刻度列。")
+                         "天然呈整数谱；偏离即说明配到了别栋/别图区的刻度列。"
+                         "同侧无主导谱（该侧列数<2，或无显著簇，或最大显著簇未过半数）时"
+                         "该侧跳过校验（跨组偏移各不相同，无共识谱可比对）。")
     ap.add_argument("--scale-outlier-ratio", type=float, default=None,
                     help="[已弃用] 旧判据（偏移 > 中位数 × 本值）。中位数隐含「全体列偏移"
                          "同分布」假设，在「一条刻度列服务本栋多个图标列」形态下会同时"
@@ -798,10 +841,13 @@ def main():
     def pick_scale(x, y0, y1, _fb=None):
         """挑刻度列：优先① 人工显式映射（--col-scale-map）；否则② y 范围完全覆盖；
         再③ y 重叠最大的那批；同批里取 x 最近。全程只看 y 覆盖是否够、不看偏移大小
-        （区间法只用 y）——这正是它在「共用刻度列」图纸上会静默错配的根源。
+        （区间法只用 y）。
         2026-09-20：无完全覆盖列而走 ③/兜底时，若传入 _fb 列表则记入
         (列x, y0, y1)，由调用方统一打印——只加可见性，不改挑列结果
-        （真错配仍由偏移异常/共用刻度列两门禁 + 人工 --col-scale-map 裁决）。"""
+        （真错配仍由偏移异常/共用刻度列两门禁 + 人工 --col-scale-map 裁决）。
+        2026-09-26 v3（云峰 3#楼2单元根因）：两栋楼的刻度列都 y 覆盖某列且 x 距离
+        接近时（如列4到5#楼刻度 207.8、到本楼刻度 233.4，仅差 25.6），本函数会静默
+        选到邻楼。见下方的 _fix_shared_scale 自动修正（模糊列复用邻列刻度列）。"""
         if col_scale_map:
             _sc = col_scale_map.get(round(x, 1))
             if _sc is not None:
@@ -824,12 +870,154 @@ def main():
         sc = min(cov, key=lambda s: abs(s["x"] - x))
         return sc, abs(sc["x"] - x)
 
-    dxs = []
+    def _fix_shared_scale(init_pairs):
+        """同楼相邻列共享刻度列修正（2026-09-26 v3，云峰列4根因修复）。
+
+        背景：3#楼1单元列（x=25820.8）与2单元列（x=25939.8）共享同一刻度列
+        （x=25706.4），但2单元列到5#楼刻度列（x=26147.6）x 距离更近（207.8 <
+        233.4，仅差 25.6），pick_scale 按 x 最近静默配到邻楼，导致 B1 虚增 2 户、
+        17F 并到 16F，而偏移异常门禁因左谱无主导谱跳过校验，全程零告警。
+        判据（保守，仅修模糊列，不动明确列）：
+        ① 模糊：该列有 ≥2 个 y 完全覆盖候选，且次近与最近的 x 距离差 <
+           层高×1.5（图纸自身尺度，禁写死绝对值；云峰 30×1.5=45，列4差 25.6
+           落入；明确列如 25611 差 133.8 不落入）；
+        ② 备选是 x 相邻列（排序后前/后一列）初配的刻度列、且该邻列自身配对明确
+           （非模糊，可信锚点），备选同样 y 完全覆盖本列且偏移在 max_dx 内；
+        ③ 整数谱校验：备选偏移与备选侧主偏移成整数倍（dev ≤ --scale-period-tol），
+           而当前配对在同侧无主导谱（skip）或偏离超容差——即当前配对无谱支撑、
+           备选有谱支撑时才切换；两者都有谱支撑时保留最近（不动）。
+        显式 --col-scale-map 指定的列永不参与自动修正。
+        返回 {col_idx: (新sc, 新dx, 说明)}；无修正返回 {}。
+        """
+        fix = {}
+        if not scales or not init_pairs:
+            return fix
+        _pitch = _pitch_of(scales)
+        _fuzzy_thr = (_pitch * 1.5) if _pitch else 50.0
+        _tol = args.scale_period_tol or 0.07
+        # 初配表：idx -> (sc, dx)
+        _init = {i: init_pairs[i] for i in range(len(init_pairs))}
+        # 邻列可信度：先算每列的模糊度（是否明确）
+        _is_fuzzy = {}
+        _cands = {}
+        for i, col in enumerate(col_list):
+            ys = [c["y"] for c in col["图标"]]
+            y0, y1 = min(ys), max(ys)
+            cov = [s for s in scales if s["y0"] <= y0 + 1 and s["y1"] >= y1 - 1]
+            if len(cov) < 2:
+                _is_fuzzy[i] = False
+                _cands[i] = sorted(cov, key=lambda s: abs(s["x"] - col["列x"]))
+                continue
+            _rank = sorted(cov, key=lambda s: abs(s["x"] - col["列x"]))
+            _cands[i] = _rank
+            _is_fuzzy[i] = (abs(_rank[1]["x"] - col["列x"])
+                             - abs(_rank[0]["x"] - col["列x"]) < _fuzzy_thr)
+        for i, col in enumerate(col_list):
+            if not _is_fuzzy.get(i):
+                continue
+            if col_scale_map and round(col["列x"], 1) in col_scale_map:
+                continue  # 显式指定的列不自动修正
+            _sc0, _dx0 = _init[i]
+            if _sc0 is None:
+                continue
+            # 候选备选 = 覆盖候选中除当前之外的列（只看完全覆盖批，不碰兜底）
+            for _alt in (_cands[i] or []):
+                if _alt["x"] == _sc0["x"]:
+                    continue
+                _adx = abs(_alt["x"] - col["列x"])
+                if _adx > max_dx:
+                    continue
+                # 备选须是相邻列的可信（非模糊）初配刻度列
+                _nbr_ok, _nbr_why = False, ""
+                for _j in (i - 1, i + 1):
+                    if 0 <= _j < len(col_list) and not _is_fuzzy.get(_j, True):
+                        _nsc, _ndx = _init[_j]
+                        if _nsc is not None and _nsc["x"] == _alt["x"]:
+                            _nbr_ok = True
+                            _nbr_why = ("相邻列 x=%.1f 初配刻度列 x=%.1f（明确列）"
+                                        % (col_list[_j]["列x"], _alt["x"]))
+                            break
+                if not _nbr_ok:
+                    continue
+                # 整数谱校验：同侧谱按初配全局计算（含本列——单点错配只会把本侧推向
+                # “无主导谱·跳过”（如云峰左谱 4 列无共识），此时当前配对无谱支撑；
+                # 而正确列的偏移本就落在主导簇内，含自身不影响其支撑结论。备选侧天然
+                # 不含本列，无污染。)
+                def _side_of(_cx, _sx):
+                    if _cx < _sx:
+                        return "左"
+                    if _cx > _sx:
+                        return "右"
+                    return "同位"
+                _cur_side = _side_of(col["列x"], _sc0["x"])
+                _alt_side = _side_of(col["列x"], _alt["x"])
+                _cur_set, _alt_set = [], []
+                for _k, (_ksc, _kdx) in _init.items():
+                    if _ksc is None or _kdx is None:
+                        continue
+                    _s = _side_of(col_list[_k]["列x"], _ksc["x"])
+                    if _s == _cur_side:
+                        _cur_set.append(_kdx)
+                    if _s == _alt_side:
+                        _alt_set.append(_kdx)
+                _alt_base, _alt_ok, _ = side_spectrum(_alt_set, _alt_side)
+                if not _alt_ok or not _alt_base:
+                    continue
+                _, _adev = period_dev(_adx, _alt_base)
+                if _adev is None or _adev > _tol:
+                    continue  # 备选无谱支撑，不切换
+                _cur_base, _cur_ok, _ = side_spectrum(_cur_set, _cur_side)
+                _switch = False
+                if not _cur_ok or not _cur_base:
+                    _switch = True  # 当前侧无主导谱（云峰列4情形：左谱跳过）
+                else:
+                    _, _cdev = period_dev(_dx0, _cur_base)
+                    if _cdev is not None and _cdev > _tol:
+                        _switch = True  # 当前偏离谱线
+                if _switch:
+                    fix[i] = (_alt, _adx,
+                              "复用%s；偏移 %.1f→%.1f（%s侧谱 %.1f，整数倍偏离 %.0f%%≤%.0f%%）"
+                              % (_nbr_why, _dx0, _adx, _alt_side, _alt_base,
+                                 _adev * 100, _tol * 100))
+                    break  # 每列只修一次（首个有谱支撑的邻列备选）
+        return fix
+
+    _init_pairs = []
     for col in col_list:
         ys = [c["y"] for c in col["图标"]]
-        _, dx = pick_scale(col["列x"], min(ys), max(ys))
+        _sc0, dx = pick_scale(col["列x"], min(ys), max(ys))
+        _init_pairs.append((_sc0, dx))
+    max_dx = args.scale_max_dx
+    if max_dx is None:
+        _dx_all = sorted(dx for _, dx in _init_pairs if dx is not None)
+        if _dx_all:
+            max_dx = max(10.0, min(_dx_all[int(len(_dx_all) * 0.9)] * 1.3, 400.0))
+        else:
+            max_dx = 1e9
+
+    # 同楼共享刻度列自动修正（v3 根因修复；显式映射列不参与，见 _fix_shared_scale）
+    _scale_fix = _fix_shared_scale(_init_pairs)
+    _fixed_pairs = []
+    for _i, (_s0, _d0) in enumerate(_init_pairs):
+        if _i in _scale_fix:
+            _ns, _nd, _why = _scale_fix[_i]
+            log("列 x=%-11.1f 自动配对修正：刻度列 %.1f → %.1f（%s）"
+                % (col_list[_i]["列x"], _s0["x"], _ns["x"], _why))
+            _fixed_pairs.append((_ns, _nd))
+        else:
+            _fixed_pairs.append((_s0, _d0))
+
+    dxs = []
+    dxs_left = []   # 列x < 刻度列x：图标在刻度线左边（左谱）
+    dxs_right = []  # 列x > 刻度列x：图标在刻度线右边（右谱）
+    for col, (_sc0, dx) in zip(col_list, _fixed_pairs):
         if dx is not None:
             dxs.append(dx)
+            if _sc0 is not None:
+                if col["列x"] < _sc0["x"]:
+                    dxs_left.append(dx)
+                elif col["列x"] > _sc0["x"]:
+                    dxs_right.append(dx)
     max_dx = args.scale_max_dx
     if max_dx is None:
         if dxs:
@@ -838,7 +1026,7 @@ def main():
         else:
             max_dx = 1e9
 
-    # 刻度列**偏移异常**检测（2026-09-16 立，2026-09-19 判据重做）：
+    # 刻度列**偏移异常**检测（2026-09-16 立，2026-09-19 判据重做，2026-09-26 左右分谱）：
     #   根因：pick_scale 只按「y 覆盖是否够 + 同批里 x 最近」挑刻度列，**不看偏移大小**
     #   （见其 docstring）。当本楼栋的刻度列不在候选批里时，它会安静地配到
     #   **相邻楼栋/图区**的刻度列上，B1/1F 归属整体错位，而全程**零告警**。
@@ -847,31 +1035,65 @@ def main():
     #   中位数只落在其中一档 ⇒ **别的档全部误报，而真错配偏离谱线却不报**
     #   （实测同一图既淹真阳性又放真阴性）。改法：以**最大簇中心**为主偏移，
     #   偏移与之不成整数倍且偏离超容差者标为异常，JSON 与控制台显式列出。
-    #   **仍不静默改结果**——归层是否重算交人工裁决（遵循「不自行择一」原则）。
-    dx_main = mode_base(dxs)
-    if dx_main and args.scale_period_tol:
-        log("刻度列偏移：主偏移（最大簇中心）= %.1f，整数倍容差 = %.0f%%"
-            % (dx_main, args.scale_period_tol * 100))
+    #   2026-09-26 左右分谱（R013）：共用刻度列组形态下，一条刻度线服务左右两栋楼，
+    #   左右两侧偏移是**两套不同的几何**（左侧楼栋画在刻度线左边某处、右侧画在右边
+    #   某处，间距不必相等），全体列取单一主偏移会把左侧正常列全部误报（云峰实测
+    #   左侧 4 列偏移 95.4/207.8/76.9/101.3 vs 右侧主偏移 114.4 全被误报，而配对与
+    #   归层全部正确）。改法：按偏移方向（列x<刻度列x=左，列x>刻度列x=右）分别建谱、
+    #   各取最大显著簇中心为该侧主偏移，每列只与**同侧谱**比对；同侧无主导谱
+    #   （成员<2，或无显著簇，或最大显著簇未过半数——跨刻度列组的偏移本就各不相同，
+    #   无共识谱可比对时强行比对即制造误报）时该侧跳过校验（显式留痕，不判异常）。
+    #   同一侧内偏离该侧谱仍判异常，真错配照样拦住。
+    #   2026-09-26 v3：在上游加 _fix_shared_scale 自动修正（模糊列复用邻列刻度列，
+    #   仅当备选有整数谱支撑而当前无支撑时切换；明确列不动、显式映射列不参与），
+    #   故此处谱按修正后配对重算；修正动作已在控制台显式打印一行，不静默。
+    dx_main = mode_base(dxs)  # 保留：全体主偏移（仅兼容旧产物比对，不参与判定）
+
+    dx_main_left, _left_ok, _left_skip = side_spectrum(dxs_left, "左")
+    dx_main_right, _right_ok, _right_skip = side_spectrum(dxs_right, "右")
+    if args.scale_period_tol:
+        log("刻度列偏移：左谱（列在刻度线左，n=%d）= %s，右谱（列在刻度线右，n=%d）= %s，"
+            "整数倍容差 = %.0f%%（每列只与同侧谱比对；无主导谱的侧跳过）"
+            % (len(dxs_left), ("%.1f" % dx_main_left) if _left_ok else "无(" + (_left_skip or "") + ")",
+               len(dxs_right), ("%.1f" % dx_main_right) if _right_ok else "无(" + (_right_skip or "") + ")",
+               args.scale_period_tol * 100))
 
     results = []
     _fb_cols = []  # 2026-09-20：走 ③/兜底（无 y 完全覆盖刻度列）的列，见 pick_scale
-    for col in col_list:
+    for _ci, col in enumerate(col_list):
         x = col["列x"]
         ys = [c["y"] for c in col["图标"]]
         y0, y1 = min(ys), max(ys)
-        sc, dx = pick_scale(x, y0, y1, _fb=_fb_cols)
-        if sc is not None and dx > max_dx:
+        # _fb  bookkeeping 沿用 pick_scale 口径（只记录无完全覆盖的列，不改结果）
+        pick_scale(x, y0, y1, _fb=_fb_cols)
+        sc, dx = _fixed_pairs[_ci]
+        if sc is not None and dx is not None and dx > max_dx:
             sc = None
         _out_why = None
-        if sc is not None and dx is not None and dx_main and args.scale_period_tol:
-            _pk, _pdev = period_dev(dx, dx_main)
+        _skip_note = None
+        _side = None
+        _side_base = None
+        if sc is not None and dx is not None:
+            if x < sc["x"]:
+                _side, _side_base = "左", (dx_main_left if _left_ok else None)
+                if not _left_ok:
+                    _skip_note = _left_skip or "左侧无显著簇，跳过校验"
+            elif x > sc["x"]:
+                _side, _side_base = "右", (dx_main_right if _right_ok else None)
+                if not _right_ok:
+                    _skip_note = _right_skip or "右侧无显著簇，跳过校验"
+            else:
+                _side = "同位"
+        if sc is not None and dx is not None and _side_base and args.scale_period_tol:
+            _pk, _pdev = period_dev(dx, _side_base)
             if _pdev is not None and _pdev > args.scale_period_tol:
-                _out_why = ("偏移 %.1f 与主偏移 %.1f 不成整数倍（最近 %d×，偏离 %.0f%% > "
+                _out_why = ("偏移 %.1f 与%s侧主偏移 %.1f 不成整数倍（最近 %d×，偏离 %.0f%% > "
                             "%.0f%% 容差）——疑似本楼栋刻度列缺失、配到了相邻楼栋/图区的"
                             "刻度列，该列归层结果不可信"
-                            % (dx, dx_main, _pk, _pdev * 100, args.scale_period_tol * 100))
+                            % (dx, _side, _side_base, _pk, _pdev * 100, args.scale_period_tol * 100))
         per, un = Counter(), []
         if sc:
+            # 半开区间逐图标归层（v3 回滚：删除中点法的聚组逻辑，恢复旧产物口径）。
             for c in col["图标"]:
                 b = band_of(sc, c["y"])
                 if b is None:
@@ -891,8 +1113,9 @@ def main():
             "y范围": [round(y0, 2), round(y1, 2)],
             "刻度列x": sc["x"] if sc else None,
             "刻度偏移": round(dx, 2) if dx is not None else None,
+            "偏移方向": _side,
             "刻度偏移异常": bool(_out_why),
-            "偏移异常说明": _out_why,
+            "偏移异常说明": _out_why if _out_why else _skip_note,
             "列内Δy众数": col["Δy众数"], "列内Δy众数占比": col["Δy占比"],
             "级别": dict(lvc), "逐层": ordered,
             "合计": sum(per.values()) if sc else 0, "未归属y": un,
@@ -948,8 +1171,11 @@ def main():
     if scale_outliers:
         log("")
         log("!" * 74)
-        log("! 刻度列配对**偏移异常** = %d 列（主偏移 %.1f · 整数倍容差 %.0f%%）"
-            % (len(scale_outliers), dx_main or 0, (args.scale_period_tol or 0) * 100))
+        log("! 刻度列配对**偏移异常** = %d 列（左谱 %s · 右谱 %s · 整数倍容差 %.0f%%，每列只与同侧谱比对）"
+            % (len(scale_outliers),
+               ("%.1f" % dx_main_left) if _left_ok else "无",
+               ("%.1f" % dx_main_right) if _right_ok else "无",
+               (args.scale_period_tol or 0) * 100))
         for _o in scale_outliers:
             log("!   列 x=%-11.1f 偏移=%-8s %s" % (_o["列x"], _o["刻度偏移"], _o["说明"]))
         log("!  → 这些列的归层结果**不可信**（可能整体错位到邻栋/邻图区）。")
@@ -1019,7 +1245,11 @@ def main():
             "含小方块候选": bool(args.include_square),
             "刻度max_dx": round(max_dx, 2) if max_dx < 1e8 else None,
             "刻度偏移主偏移": round(dx_main, 2) if dx_main else None,
-            "主偏移定义": "最大簇中心（合法偏移 = k × 单元间距，天然呈整数谱）",
+            "刻度偏移左谱": round(dx_main_left, 2) if _left_ok and dx_main_left else None,
+            "刻度偏移右谱": round(dx_main_right, 2) if _right_ok and dx_main_right else None,
+            "主偏移定义": "左右分谱：列x<刻度列x为左、列x>刻度列x为右，各自最大显著簇中心"
+                         "（合法偏移 = k × 单元间距，天然呈整数谱）；每列只与同侧谱比对，"
+                         "无主导谱的侧跳过（刻度偏移主偏移为全体旧口径，仅兼容比对）",
             "整数倍容差": args.scale_period_tol,
             "显式列刻度映射": {("%.1f" % k): v["x"] for k, v in sorted(col_scale_map.items())},
         },

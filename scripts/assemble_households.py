@@ -240,6 +240,104 @@ if args.coverage:
             if f"{bkey}/{uk}" not in cov_warn_unmatched:
                 cov_warn_unmatched.append(f"{bkey}/{uk}")
 
+# ---------- 同配置展开（2026-09-26）：coverage 有箱但 col-map 无列的楼栋补入 ----------
+# 动因：云峰 9#楼 2 单元（各 10 层×2 户=40 户）在系统图区无独立图标列，
+#   col-map 未映射 → 产物缺 9#楼 → 出表丢 40 户，而旧逻辑只告警不补入。
+# 规则：仅当 coverage 有覆盖楼层、且已组装楼栋中有覆盖楼层集合完全一致的
+#   模板单元时，才复制模板楼层表补入（result_origin=derived，非直读）。
+#   无模板 / 无覆盖楼层信息时不编造，保持告警不补入。无 coverage 时不展开。
+if args.coverage and cov_warn_unmatched:
+    def _cov_floor_set(fx_list):
+        s = set()
+        if isinstance(fx_list, list):
+            for fx in fx_list:
+                if not isinstance(fx, dict):
+                    continue
+                clue = fx.get("覆盖范围线索") or {}
+                if not isinstance(clue, dict):
+                    continue
+                for fl in (clue.get("覆盖楼层") or []):
+                    s.add(str(fl).strip())
+        return s
+
+    # 模板索引：已组装且楼层表非空、且有覆盖楼层信息的单元
+    _tmpl = []  # [(楼栋, 单元, frozenset(覆盖楼层))]
+    for _tb, _bv in (out_data.get("楼栋") or {}).items():
+        _us = (_bv or {}).get("单元") or {}
+        for _tu, _ud in _us.items():
+            if not isinstance(_ud, dict):
+                continue
+            if not (_ud.get("楼层表") or {}):
+                continue
+            _fs = _cov_floor_set(_ud.get("分纤箱") or [])
+            if not _fs:
+                continue
+            _tmpl.append((_tb, _tu, frozenset(_fs)))
+    _tmpl.sort(key=lambda t: (len(t[0]), t[0], t[1]))
+
+    _expanded = []
+    for _entry in list(cov_warn_unmatched):
+        if "/" in _entry:
+            _eb, _eu = _entry.split("/", 1)
+        else:
+            _eb, _eu = _entry, "1单元"
+        # 取该缺列单元的 coverage 覆盖楼层 + 原始分纤箱
+        _cov_boxes = []
+        _cov_floors = set()
+        _src_units = {}
+        try:
+            _src_b = bldg_source.get(_eb)
+            if isinstance(_src_b, dict):
+                _src_units = _src_b.get("单元", _src_b)
+        except Exception:
+            _src_units = {}
+        if isinstance(_src_units, dict):
+            for _ok, _ov in _src_units.items():
+                if not isinstance(_ov, dict):
+                    continue
+                if norm_unit(_ok, _eb) != _eu:
+                    continue
+                _bl = _ov.get("分纤箱") or []
+                if isinstance(_bl, list):
+                    _cov_boxes.extend(_bl)
+            _cov_floors = _cov_floor_set(_cov_boxes)
+        if not _cov_floors:
+            print(f"[assemble] ⚠ 同配置展开：{_eb}/{_eu} 无图标列，且无覆盖楼层信息或无同配置模板"
+                  f"（覆盖楼层：{sorted(_cov_floors) if _cov_floors else '未知'}），需人工补入，不编造户数")
+            continue
+        _cands = [(tb, tu) for (tb, tu, fs) in _tmpl if fs == frozenset(_cov_floors)]
+        if not _cands:
+            print(f"[assemble] ⚠ 同配置展开：{_eb}/{_eu} 无图标列，且无同配置模板"
+                  f"（覆盖楼层：{sorted(_cov_floors)}），需人工补入，不编造户数")
+            continue
+        _tb, _tu = _cands[0]
+        _tpl_floors = out_data["楼栋"][_tb]["单元"][_tu]["楼层表"]
+        _new_floors = {}
+        for _fl, _fv in _tpl_floors.items():
+            _hu = int((_fv or {}).get("户数") or 0)
+            _new_floors[_fl] = {"户数": _hu, "result_origin": "derived"}
+        _tgt = out_data["楼栋"].setdefault(_eb, {"单元": {}})["单元"].setdefault(
+            _eu, {"楼层表": {}, "分纤箱": []})
+        _tgt["楼层表"] = _new_floors
+        if _cov_boxes:
+            _tgt["分纤箱"] = [dict(fx) if isinstance(fx, dict) else fx for fx in _cov_boxes]
+        _n = len(_new_floors)
+        _tot = sum(int(v.get("户数") or 0) for v in _new_floors.values())
+        _per_vals = sorted(set(int(v.get("户数") or 0) for v in _new_floors.values()))
+        _per_detail = "、".join(f"{fl}:{_new_floors[fl].get('户数')}"
+                                for fl in sorted(_new_floors))
+        if len(_per_vals) == 1:
+            _hu_txt = f"{_n} 层 × {_per_vals[0]} 户 = {_tot} 户"
+        else:
+            _hu_txt = f"{_n} 层共 {_tot} 户（每层户数：{_per_detail}）"
+        print(f"[assemble] ⚠ 同配置展开：{_eb}/{_eu} 无图标列，按 {_tb}/{_tu} 同配置展开 {_hu_txt}"
+              f"（覆盖楼层一致：{sorted(_cov_floors)}；模板每层户数：{_per_detail}；"
+              f"result_origin=derived，非直读，请核对）")
+        _expanded.append(_entry)
+    for _e in _expanded:
+        if _e in cov_warn_unmatched:
+            cov_warn_unmatched.remove(_e)
+
 # ---------- 守恒统计 ----------
 print("[assemble] 逐单元户数：")
 total = 0
