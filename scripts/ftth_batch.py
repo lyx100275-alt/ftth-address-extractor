@@ -9,7 +9,7 @@ FTTH 多图批量编排入口（多张 DXF / 多地块场景）。
 
 用法一（快路径：所有图共用同一组参数）：
 
-    ftth.cmd ftth_batch.py --dxf 图A.dxf --dxf 图B.dxf --out-dir batch_out ^
+    python ftth_launcher.py ftth_batch.py --dxf 图A.dxf --dxf 图B.dxf --out-dir batch_out ^
         --title-pattern "(\\d+)#.*?系统图" --text-layer 文字
 
     末尾透传参数与 ftth.py 子命令同名。脚本先跑 `ftth.py <子命令> --help`
@@ -18,7 +18,7 @@ FTTH 多图批量编排入口（多张 DXF / 多地块场景）。
 
 用法二（清单模式：每图独立参数）：
 
-    ftth.cmd ftth_batch.py --plan batch.json
+    python ftth_launcher.py ftth_batch.py --plan batch.json
 
     batch.json 结构（顶层键均可省略）：
     {
@@ -106,7 +106,7 @@ class Batch(object):
                 Batch.err_exit(
                     "无法获取 ftth.py %s 的参数表（rc=%d）\n%s"
                     % (sub, r.returncode, ((r.stderr or "") + (r.stdout or ""))[-800:]),
-                    example='& "<技能目录>\\scripts\\ftth.cmd" %s --help' % sub)
+                    example='python "<技能目录>\\scripts\\ftth_launcher.py" %s --help' % sub)
             flags = {}
             # argparse 帮助形如 "--title-pattern TITLE_PATTERN"；store_true 无 metavar
             for m in re.finditer(r"(--[A-Za-z0-9][\w-]*)(?:\s+([A-Z][A-Z0-9_]*))?",
@@ -124,7 +124,7 @@ class Batch(object):
             tok = argv[i]
             if not tok.startswith("--"):
                 Batch.err_exit("无法识别的位置参数: %r（透传参数必须以 -- 开头）" % tok,
-                               example="ftth.cmd ftth_batch.py --dxf 图A.dxf --text-layer 文字")
+                               example="python ftth_launcher.py ftth_batch.py --dxf 图A.dxf --text-layer 文字")
             if "=" in tok:
                 f, v = tok.split("=", 1)
                 pairs.append((f, v))
@@ -144,12 +144,12 @@ class Batch(object):
             if flag in ("--out", "--out-dir"):
                 self.err_exit("透传参数含 %s —— 输出路径由 ftth_batch 统一管理，请删除"
                               % flag,
-                              example="ftth.cmd ftth_batch.py --dxf 图A.dxf --out-dir batch_out")
+                              example="python ftth_launcher.py ftth_batch.py --dxf 图A.dxf --out-dir batch_out")
             dest = [s for s in STEPS_ALL if flag in vocab[s]]
             if not dest:
                 self.err_exit("透传参数 %s（来自%s）不被 probe/parse/coverage 任何"
                               "子命令接受（拼写错误？）" % (flag, source),
-                              example="ftth.cmd ftth.py parse --help  # 查看合法参数")
+                              example="python ftth_launcher.py ftth.py parse --help  # 查看合法参数")
             if len(dest) < len(STEPS_ALL):
                 self.log("  参数路由(%s): %s -> %s" % (source, flag, "/".join(dest)))
             for s in dest:
@@ -281,8 +281,7 @@ class Batch(object):
 
         if not args.plan and not args.dxf:
             self.err_exit("需要 --plan <batch.json> 或至少一个 --dxf <图纸.dxf>",
-                          example='& "<技能目录>\\scripts\\ftth.cmd" ftth_batch.py '
-                                  "--dxf 图A.dxf --dxf 图B.dxf --out-dir batch_out")
+                          example='python "<技能目录>\\scripts\\ftth_launcher.py" ftth_batch.py ' "--dxf 图A.dxf --dxf 图B.dxf --out-dir batch_out")
         if args.plan and args.dxf:
             self.err_exit("--plan 与 --dxf 互斥，请二选一")
         steps = [s.strip() for s in args.steps.split(",") if s.strip()]

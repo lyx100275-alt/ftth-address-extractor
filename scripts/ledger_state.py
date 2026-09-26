@@ -27,6 +27,8 @@
   python scripts/ledger_state.py snapshot-set --project-dir D --key K --value V --source S [--status 已确认]
   python scripts/ledger_state.py snapshot-get --project-dir D [--key K]
   python scripts/ledger_state.py ruling-add   --project-dir D --question Q --ruling R --by X [--scope S] [--key K]
+  python scripts/ledger_state.py ruling-add   --project-dir D --by X --from-json rulings.json
+      （批量：rulings.json = [{"question":…, "ruling":…, "by":…, "scope":…, "key":…}, …]）
   python scripts/ledger_state.py alias-add    --project-dir D --canonical C --raw r1,r2 --evidence E [--status 已确认]
   python scripts/ledger_state.py pending      --project-dir D [--md OUT.md]
   python scripts/ledger_state.py check        --project-dir D
@@ -139,7 +141,10 @@ def _save(path, obj):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = path + ".tmp"
     with io.open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=False)
+        # 2026-09-25（评审 P2-13）：sort_keys=True 固定键序，消除非内容变更导致的
+        #   md5 漂移（此前 sort_keys=False 两次写同内容 md5 也必变）。时间戳仍是
+        #   唯一变量字段，对比时忽略「更新时间」即可判定内容确定性。
+        json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp, path)
     return path
@@ -258,50 +263,86 @@ def cmd_snapshot_get(a):
 
 
 # --------------------------------------------------------------- ruling
-def cmd_ruling_add(a):
-    p = _paths(a.project_dir)
-    obj = _require(_load(p["rule"], RULE_SCHEMA, a.project), "ruling-add", "--project-dir %s" % a.project_dir)
+def _append_ruling(p, obj, a, project, question, ruling, by, scope, key):
+    """落盘一条裁决（含快照联动）。返回 0/3。调用方负责已加载的 obj 与保存时机。"""
     entries = _pick_entries(obj)
     if not isinstance(entries, list):
         _err("[结构异常] 裁决台账的 条目 应为列表。")
         return 3
-    if not a.by:
-        _err("[参数错误] --by 必填（裁决人）。没有裁决人的「裁决」不算落盘，")
+    if not by:
+        _err("[参数错误] 裁决人（--by 或条目内 by）必填。没有裁决人的「裁决」不算落盘，")
         _err("           无法在返工复核时追溯是谁定的。")
         return 3
     rid = "R%03d" % (len(entries) + 1)
     entries.append({
         "id": rid,
-        "问题": a.question,
-        "裁决原文": a.ruling,
-        "裁决人": a.by,
+        "问题": question,
+        "裁决原文": ruling,
+        "裁决人": by,
         "时间": _now(),
-        "适用范围": a.scope or "",
+        "适用范围": scope or "",
     })
     obj["条目"] = entries
     _save(p["rule"], obj)
-    _out("[裁决已落盘] %s  裁决人=%s" % (rid, a.by))
-    _out("  问题：%s" % a.question)
-    _out("  裁决：%s" % a.ruling)
-    if a.scope:
-        _out("  适用范围：%s" % a.scope)
-    # 显式给了 --key 才联动快照；不猜、不自动匹配（避免静默改状态）
-    if a.key:
-        snap = _load(p["snap"], SNAP_SCHEMA, a.project)
+    _out("[裁决已落盘] %s  裁决人=%s" % (rid, by))
+    _out("  问题：%s" % question)
+    _out("  裁决：%s" % ruling)
+    if scope:
+        _out("  适用范围：%s" % scope)
+    # 显式给了 key 才联动快照；不猜、不自动匹配（避免静默改状态）
+    if key:
+        snap = _load(p["snap"], SNAP_SCHEMA, project)
         if snap is None:
-            _out("[提示] --key %r 未联动：理解快照尚未初始化。" % a.key)
+            _out("[提示] --key %r 未联动：理解快照尚未初始化。" % key)
         else:
             se = _pick_entries(snap)
-            it = se.get(a.key)
+            it = se.get(key)
             if it is None:
-                _out("[提示] --key %r 未联动：快照无此项（不自动新建）。" % a.key)
+                _out("[提示] --key %r 未联动：快照无此项（不自动新建）。" % key)
             else:
                 it["状态"] = ST_RULED
-                it["裁决人"] = a.by
+                it["裁决人"] = by
                 it["更新时间"] = _now()
                 _save(p["snap"], snap)
-                _out("[已联动] 快照项 %r 状态 → %s（裁决人 %s）" % (a.key, ST_RULED, a.by))
+                _out("[已联动] 快照项 %r 状态 → %s（裁决人 %s）" % (key, ST_RULED, by))
     return 0
+
+
+def cmd_ruling_add(a):
+    p = _paths(a.project_dir)
+    obj = _require(_load(p["rule"], RULE_SCHEMA, a.project), "ruling-add", "--project-dir %s" % a.project_dir)
+    # 批量入口：--from-json <file>，文件为 JSON 数组，元素 {question, ruling, by, scope?, key?}
+    # 实测动因（2026-09-25）：本机每次启动器调用探测成本 25~120s，N 条裁决逐条
+    # 调用 = N 次探测；批量一次落盘是效率纪律「裁决项集中提交」的机械落地。
+    if a.from_json:
+        try:
+            import json as _json
+            with open(a.from_json, "r", encoding="utf-8") as f:
+                items = _json.load(f)
+        except (OSError, ValueError) as e:
+            _err("[参数错误] --from-json 读取失败：%s" % e)
+            return 3
+        if not isinstance(items, list) or not items:
+            _err("[参数错误] --from-json 内容须为非空 JSON 数组。")
+            return 3
+        rc = 0
+        for i, it in enumerate(items):
+            if not isinstance(it, dict) or not it.get("question") or not it.get("ruling"):
+                _err("[参数错误] 第 %d 条缺 question/ruling（by 可用 --by 兜底）。" % (i + 1))
+                rc = 3
+                continue
+            if _append_ruling(p, obj, a, a.project,
+                              it["question"], it["ruling"],
+                              it.get("by") or a.by,
+                              it.get("scope"), it.get("key")) != 0:
+                rc = 3
+        return rc
+    # 单条入口
+    if not a.question or not a.ruling:
+        _err("[参数错误] 单条模式需 --question 与 --ruling（批量请用 --from-json）。")
+        return 3
+    return _append_ruling(p, obj, a, a.project,
+                          a.question, a.ruling, a.by, a.scope, a.key)
 
 
 # ---------------------------------------------------------------- alias
@@ -500,12 +541,15 @@ def main(argv=None):
     g.add_argument("--key", default=None, help="只读某一项；不给则全量分组打印")
     g.set_defaults(func=cmd_snapshot_get)
 
-    r = sub.add_parser("ruling-add", parents=[common], help="追加一条人工裁决")
-    r.add_argument("--question", required=True, help="被裁决的问题")
-    r.add_argument("--ruling", required=True, help="裁决原文（用户原话）")
-    r.add_argument("--by", required=True, help="裁决人")
+    r = sub.add_parser("ruling-add", parents=[common], help="追加一条人工裁决（支持 --from-json 批量）")
+    r.add_argument("--question", required=False, help="被裁决的问题（单条模式必填）")
+    r.add_argument("--ruling", required=False, help="裁决原文（用户原话，单条模式必填）")
+    r.add_argument("--by", required=True, help="裁决人（批量模式作为条目缺省，条目内 by 优先）")
     r.add_argument("--scope", default=None, help="适用范围")
     r.add_argument("--key", default=None, help="可选：联动同名的快照项状态 → 已裁决")
+    r.add_argument("--from-json", dest="from_json", default=None,
+                   help="批量模式：JSON 数组文件，元素 {question, ruling, by?, scope?, key?}；"
+                        "实测多条裁决逐条调用时每次都要付解释器探测开销，批量一次落盘")
     r.set_defaults(func=cmd_ruling_add)
 
     al = sub.add_parser("alias-add", parents=[common], help="追加一条别名归组（归一化映射）")

@@ -71,17 +71,23 @@ ap.add_argument("--floor-format", default="auto", choices=["auto", "chinese", "r
 ap.add_argument("--door-format", default="auto", choices=["auto", "int", "str"],
                 help="户号列格式：auto=按模板示例行自动判定（原行为）；int=101；str=101室。")
 ap.add_argument("--fx-prefix-map", default=None,
-                help="分纤箱编号前缀归一化映射（可选）\"旧前缀=新前缀;旧前缀2=新前缀2\"，"
-                     "作用于编号开头。多图幅/多地块图纸上同一物理箱常在各图幅各有一个"
-                     "带前缀编号，不归一会同箱多行。映射须人工确认后显式传入，"
-                     "逐条改写都会打印留痕（2026-09-16，12坑复核·坑10）")
+                 help="分纤箱编号前缀归一化映射（可选）\"旧前缀=新前缀;旧前缀2=新前缀2\"，"
+                      "作用于编号开头。多图幅/多地块图纸上同一物理箱常在各图幅各有一个"
+                      "带前缀编号，不归一会同箱多行。映射须人工确认后显式传入，"
+                      "逐条改写都会打印留痕（2026-09-16，12坑复核·坑10）")
+ap.add_argument("--fx-prefix", default=None,
+                 help="分纤箱编号统一前缀（可选）：P 列每行编号统一前置该字符串，"
+                      "已带该前缀的不重复叠加，空值/“未分配”不加。"
+                      "与 --fx-prefix-map 并用时先归一（map）后加统一前缀（prefix）。"
+                      "不从 --addr 第 5 级自动推导（小区名≠验收前缀时自动加会引入歧义，"
+                      "且属用户裁决口径，须显式传入；见 2026-09-26 一百零四）。")
 ap.add_argument("--floor-pattern", default=None, help="楼层标注正则。默认 None＝内置统一解析（支持 3F/17F/-1F/B1/B2/WF）。**不要再用 (-?\\d+)F 覆盖**，否则 B1 整层住户会被静默丢弃")
 ap.add_argument("--allow-lossy", action="store_true", help="允许在丢弃楼层的情况下继续出表（默认关闭：一旦有楼层被丢弃即中止，防止静默少户）")
 args = ap.parse_args()
 
 if not os.path.exists(args.dxf_json):
     log.error(f"解析JSON不存在: {args.dxf_json}")
-    sys.exit(1)
+    sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
 
 # ---------- 读取 DXF 解析结果 ----------
 try:
@@ -89,7 +95,7 @@ try:
         data = json.load(f)
 except (IOError, json.JSONDecodeError) as e:
     log.error(f"无法读取解析JSON: {args.dxf_json}\n{e}")
-    sys.exit(1)
+    sys.exit(2)  # 2026-09-25（opencode 审核）：同上
 
 # ---------- 读取用户裁决的覆盖范围 ----------
 # 2026-09-14（P0-4）：兼容两种覆盖 JSON 格式：
@@ -143,6 +149,33 @@ def _norm_fx(_fid):
     return _fid
 
 
+# 2026-09-26（一百零四·问题 11）：分纤箱编号统一前缀（可选，显式传入才生效）。
+#   顺序：先归一（_norm_fx / map）后加统一前缀（prefix）—— map 解决“同箱多写法”
+#   的归一，prefix 解决“验收口径要求统一前置小区名”的表达层归一化；顺序反了则
+#   map 的旧前缀匹配不上已加前缀的编号。
+#   去重语义：已带该前缀的不重复叠加；空值/空白/“未分配”（含模板尾行之类非箱行）
+#   不加。模板示例行不受影响（本脚本只取表头与格式，不复制示例数据）。
+#   不从 --addr 第 5 级自动推导：小区名≠验收前缀是实测常态（如前缀“绿城凤鸣朝阳”
+#   与 addr 第 5 级可能一致也可能不同），自动加=把用户裁决口径变成脚本推断，
+#   违反“须显式传入”的 L0 纪律；gen 只做机械执行。
+_fx_uniform_prefix = (args.fx_prefix.strip() if isinstance(args.fx_prefix, str) else "") or ""
+
+
+def _with_fx_prefix(_fid):
+    if not _fx_uniform_prefix:
+        return _fid
+    if _fid is None:
+        return _fid
+    _s = str(_fid)
+    if not _s.strip():
+        return _fid
+    if _s.strip() == "未分配":
+        return _fid
+    if _s.startswith(_fx_uniform_prefix):
+        return _fid
+    return _fx_uniform_prefix + _s
+
+
 coverage = {}
 if args.coverage_json:
     try:
@@ -150,7 +183,7 @@ if args.coverage_json:
             raw_cov = json.load(f)
     except (IOError, json.JSONDecodeError) as e:
         log.error(f"无法读取覆盖范围JSON: {args.coverage_json}\n{e}")
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
     # 自动检测格式并转换
     # 2026-09-14（P0-4a）：coverage-vshape 的输出顶层含元数据（DXF文件/方法/参数/自检等），
     #   楼栋数据嵌在 raw_cov["楼栋"] 下；扁平格式则楼栋直接是顶层 key。
@@ -203,6 +236,24 @@ if args.coverage_json:
                     _nd[_nf] = _fl
                 coverage[_b][_u] = _nd
         log.info("编号前缀归一完成：%d 条改写（映射 %s）" % (_ren, _fx_pmap))
+
+    # 统一前缀（先归一后加前缀；去重/空值语义见 _with_fx_prefix 定义处注释）。
+    if _fx_uniform_prefix:
+        _prn = 0
+        for _b, _bd in coverage.items():
+            for _u, _ud in _bd.items():
+                _nd = {}
+                for _fid, _fl in _ud.items():
+                    _nf = _with_fx_prefix(_fid)
+                    if _nf != _fid:
+                        _prn += 1
+                    if _nf in _nd and _nd[_nf] != _fl:
+                        log.warning("  [统一前缀] 加前缀后编号冲突：%s（%s/%s）两侧覆盖范围不同，需人工裁决"
+                                    % (_nf, _b, _u))
+                    _nd[_nf] = _fl
+                coverage[_b][_u] = _nd
+        log.info("编号统一前缀完成：%d 条加前缀（前缀 %r；已带前缀/空值/未分配跳过）"
+                 % (_prn, _fx_uniform_prefix))
 
     # 2026-09-16（P0-接口键）：**键失配自检**。
     #   实测失配形态：产出端单元键为全名（`1#楼1单元`）、消费端按扁平（`1单元`）索引，
@@ -445,7 +496,7 @@ def gen_unit_rows(bldg_name, unit_name, unit_data):
 
     # 单箱单元：全部分配给该箱
     if len(boxes) == 1:
-        box_id = _norm_fx(boxes[0].get("编号", "未分配"))
+        box_id = _with_fx_prefix(_norm_fx(boxes[0].get("编号", "未分配")))
         for fl, info in sorted(floors.items(), key=fl_sort_key):
             n_hu = info.get("户数")
             if not n_hu:
@@ -462,7 +513,7 @@ def gen_unit_rows(bldg_name, unit_name, unit_data):
     floor_to_box = {}
     for box_id, floor_list in cov_map.items():
         for fl in floor_list:
-            floor_to_box[fl] = box_id
+            floor_to_box[fl] = _with_fx_prefix(box_id)
 
     for fl, info in sorted(floors.items(), key=fl_sort_key):
         n_hu = info.get("户数")
@@ -699,3 +750,9 @@ except Exception as e:
 if _rb_fail:
     log.error(f"回读校验不通过（{'、'.join(_rb_fail)}）—— L1-C6：不通过即视为未交付。")
     sys.exit(3)
+else:
+    # 交付提示：宿主对 .xlsx 会自动追加 AIGC 水印行（实测：生成时 N+2 行 →
+    # 复制到桌面后 N+4 行），属系统预期行为，不是数据错误。详见
+    # references/addressbook_template.md §回读校验与 AIGC 水印行。
+    log.info("交付提示：宿主可能在产物末尾追加 AIGC 水印行（生成时行数恒等式以本输出为准；"
+             "复制/落盘后行数若多出 1~2 行水印属正常，统计户数请按「楼栋列非空」过滤")

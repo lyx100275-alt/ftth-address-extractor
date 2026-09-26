@@ -8,10 +8,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '5c117a39-c96f-481f-b780-d787deab8ead'
-  PropagateID: '5c117a39-c96f-481f-b780-d787deab8ead'
-  ReservedCode1: '56ee68de-74af-426a-be97-a83000e6bc39'
-  ReservedCode2: '56ee68de-74af-426a-be97-a83000e6bc39'
+  ProduceID: '408aa368-509f-4693-aaef-11069f5524fc'
+  PropagateID: '408aa368-509f-4693-aaef-11069f5524fc'
+  ReservedCode1: 'af3f8661-ce95-4b2a-bf91-34df45ce5ab1'
+  ReservedCode2: 'af3f8661-ce95-4b2a-bf91-34df45ce5ab1'
 ---
 
 # FTTH标准地址表提取
@@ -164,18 +164,18 @@ Step 1a 向解析阶段传递画像，**至少**回答两项：**① 编号↔�
 - **表头**：必须取自项目已定稿的表（`gen_9level_addressbook.py --header-xlsx`），**禁止自造**。两种形态**不可互替**。
 - **回读校验**：出表后必须回读复核上列三项，**不通过即视为未交付**。
 
-> 24 列对照表见 [addressbook_template.md](references/addressbook_template.md)；九级填写规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)。Step 2 门禁与 Step 4 实现均引用本条，**不再复述公式**。
+> 24 列对照表见 [addressbook_template.md](references/addressbook_template.md) §回读校验与 AIGC 水印行；九级填写规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)。Step 2 门禁与 Step 4 实现均引用本条，**不再复述公式**。
 
 ### C7 调用契约：路径、解释器与命令纪律
 
 | 项 | 规则 |
 |---|---|
 | **脚本路径** | 技能脚本一律从本技能 `scripts/` 目录（即 SKILL.md 所在目录）调用；**禁止猜测或拼造其他用户目录 / 技能副本路径**（按不存在的目录试跑单次白耗分钟级） |
-| **解释器** | 一律走启动器 `& "<技能目录>\scripts\ftth.cmd" <子命令或.py脚本>`（首参以 `.py` 结尾即转发该脚本；环境变量 `FTTH_PYTHON` 指定解释器绝对路径）。手写命令时用**绝对路径**解释器，**禁止裸 `python`**（宿主 runtime 常劫持且无 ezdxf，实测每个新会话必踩） |
+| **解释器** | 一律走启动器 `python "<技能目录>\scripts\ftth_launcher.py" <子命令或.py脚本>`（首参以 `.py` 结尾即转发该脚本；启动器内部真实探测带 ezdxf 的解释器，环境变量 `FTTH_PYTHON` 指定解释器绝对路径）。入口 `python` **无需带 ezdxf**（只负责启动启动器本身），业务脚本一律由启动器选中的解释器执行；**禁止绕过启动器直调业务脚本**（宿主 runtime 常劫持 PATH 且无 ezdxf，实测每个新会话必踩） |
 | **禁内联** | **禁止内联多行 `python -c "…"`**（引号被 shell 吃掉）；分析脚本一律先落盘再执行（同 L0-I6 探查纪律） |
 | **禁 pip** | **不要用 `pip` 补装依赖**——镜像不可达时报错会伪装成「包不存在」 |
 
-> 解释器候选清单、`exit /b 9` 语义、探测细节见 [scripts_reference.md](references/scripts_reference.md) §解释器契约。
+> 解释器候选清单、退出码 9 语义、探测细节见 [scripts_reference.md](references/scripts_reference.md) §解释器契约。
 
 ### C8 结果状态契约：两字段正交（2026-09-18 立）
 
@@ -275,7 +275,7 @@ P列(某层某户) = 该层所属分纤箱编号
 | **读取标注** | 图上明确写了的量：编号、楼层、户数、米数、芯数等（含图签形态栋级 `N层/M户`+`N单元`） | 直读文字标注内容与坐标 |
 | **区间法**（楼层带归属） | ① 每层户数（皮线标注/家居配线箱图标落带）；② 分纤箱安装楼层 | 楼层线切 y 轴成带，`y_i ≤ y < y_{i+1}` 归属第 i 层 |
 | **竖线法**（端点直推） | 分纤箱覆盖楼层（需干净竖干连线） | 沿竖干追踪，断头端点定覆盖分界 |
-| **V型计算** | 分纤箱覆盖楼层（需皮线米数标注；写法不固定，检测器与生产脚本须全兼容） | 米数 V 形：谷底=安装层，相邻谷底中位=分界 |
+| **V型计算** | 分纤箱覆盖楼层（需皮线米数标注；写法不固定，检测器与生产脚本须全兼容） | 米数 V 形：谷底=安装层，相邻谷底间米数最大行=分界（该行归下段） |
 
 **每层户数实体优先级（2026-09-16 用户裁决）**：`X户` 直读最高 → 其次家居配线箱图标（每户一个、贴皮线末端；零重复，皮线须先按 `(x,y,内容)` 去重）→ 再次皮线标注。图标不可用的三种情形（无图标 /「每单元每层一个」示意画法配 `xN` 乘数 / rc=2）回落皮线。**选法与图标法可用性前置见 L1-C1**；`*N`/`xN` 乘数一律列待裁决、**不得自行相乘**。
 
@@ -324,7 +324,7 @@ P列(某层某户) = 该层所属分纤箱编号
 **首步：生成全量几何缓存（一次成本换全程秒查）**
 
 ```
-& "<技能目录>\scripts\ftth.cmd" dump_geom.py --dxf 图纸.dxf
+python "<技能目录>\scripts\ftth_launcher.py" dump_geom.py --dxf 图纸.dxf
 ```
 
 产出图纸同目录 `<DXF>.geom.json`（文字/INSERT/线段/图层统计/包围盒，含 `closed` 标记）。下方探查清单第 1 项的全部几何统计，以及本会话后续任何内联临时查询，**读该 JSON 即可，不再回原图解析**。
@@ -354,9 +354,9 @@ ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 
 #### Step 1b: 结构化解析
 
-探查确定参数后，用 ezdxf 提取全部 FTTH 信息。脚本清单与职责（27 个文件）见 [scripts_reference.md](references/scripts_reference.md) §脚本清单与职责，**调用一律走 `ftth.cmd` 启动器**（见 **L1-C7**）。
+探查确定参数后，用 ezdxf 提取全部 FTTH 信息。脚本清单与职责（30 个文件）见 [scripts_reference.md](references/scripts_reference.md) §脚本清单与职责，**调用一律走 `ftth_launcher.py` 启动器**（见 **L1-C7**）。
 
-**入口**：统一入口 `ftth.py`（子命令 `pipeline` / `probe` / `plan` / `parse` / `coverage` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box` / `gen` / `budget` / `transitions` 等）；参数三级优先：命令行显式 > `--config` > 脚本默认值；**`ftth.py pipeline` 串跑 `geom → probe → plan → fxmap → parse → coverage → inspect`（只解析、不出表）**。子命令清单、依赖矩阵、可抄示例、批量编排见 [scripts_reference.md](references/scripts_reference.md)。**口径**：`count` = 皮线计数法、`count-box` = 家居配线箱图标法（旧名 `count-hdd`），同属区间法口径。
+**入口**：统一入口 `ftth.py`（16 子命令：`pipeline` / `probe` / `plan` / `parse` / `coverage` / `coverage-vshape` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box` / `gen` / `budget` / `transitions` / `split-band` / `verify-truth`）；参数三级优先：命令行显式 > `--config` > 脚本默认值；**`ftth.py pipeline` 串跑 11 阶段（以 `_PIPE_STAGES` 为准，完整链见 [pipeline_details.md](references/pipeline_details.md) §11；只解析、不出表）**。子命令清单、依赖矩阵、可抄示例、批量编排见 [scripts_reference.md](references/scripts_reference.md)。**口径**：`count` = 皮线计数法、`count-box` = 家居配线箱图标法（旧名 `count-hdd`），同属区间法口径。
 
 **必传参数**：完整参数表与三个高频坑见 [scripts_reference.md](references/scripts_reference.md)；最易踩的是 `--floor-pattern` **不得显式传 `(-?\d+)F`**——会让 `B1` 整层静默消失。**默认值仅供参考，换图先按 Step 1a 探查结果覆盖**。
 
@@ -442,6 +442,7 @@ ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 | [addressbook_template.md](references/addressbook_template.md) | 模板 24 列对照表 |
 | [pipeline_details.md](references/pipeline_details.md) | 流水线串跑入口 / Step 1b 细则：脚本行为 / 参数细节 / 口径A 与回填实现 / `geom.json` schema 三坑 / 体量阈值依据 |
 | [operations_discipline.md](references/operations_discipline.md) | 会话效率实测 / 断流处置 / 矛盾分级处置 / 三本台账口径 |
+| [dxf_parsing_benchmark.md](references/dxf_parsing_benchmark.md) | GitHub DXF 解析生态对标调研：8 项可借鉴改进候选（待用户裁决、未实施）+ 6 项明确不借鉴 |
 
 ## 版本修订记录
 > 本文档不再保留条目正文；**完整修订记录见 [SKILL_CHANGELOG.md](SKILL_CHANGELOG.md)**。

@@ -86,7 +86,7 @@ def main(argv=None):
                          '（图层筛选=%s）。若 probe 信号 fx_location_annotation=present，'
                          '请核对 --text-layer 或用 --pattern 覆盖内置正则。\n'
                          % (a.text_layer or '全部图层'))
-        return 1
+        return 2  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
 
     # 唯一箱位：按 (楼,单元,层) 聚合实例（重复绘制不静默丢弃，登记实例数）
     by_loc = collections.defaultdict(list)

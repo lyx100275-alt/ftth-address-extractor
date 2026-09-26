@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: '461bf042-9199-48d2-ba5b-b0fb58d9d662'
-  PropagateID: '461bf042-9199-48d2-ba5b-b0fb58d9d662'
-  ReservedCode1: '956e46c1-10b4-4d11-984a-2a1a86c3a51e'
-  ReservedCode2: '956e46c1-10b4-4d11-984a-2a1a86c3a51e'
+  ProduceID: 'dcfec248-40da-4558-9835-5bfd88aab620'
+  PropagateID: 'dcfec248-40da-4558-9835-5bfd88aab620'
+  ReservedCode1: '117841bf-dcf3-493e-84c3-26243c3ea12b'
+  ReservedCode2: '117841bf-dcf3-493e-84c3-26243c3ea12b'
 ---
 
 # 覆盖范围：判定规则
@@ -151,7 +151,7 @@ AIGC:
 
 ```
 # 以下为示例值，实际图层名/正则以 Step 1a 探查结果为准
-& "<技能目录>\scripts\ftth.cmd" analyze_coverage_vshape.py <dxf> <out.json> \
+python "<技能目录>\scripts\ftth_launcher.py" analyze_coverage_vshape.py <dxf> <out.json> \
     --text-layer <标注图层> \
     --title-pattern "<标题正则>" \
     --fx-pattern "<编号正则>" \
@@ -161,7 +161,7 @@ AIGC:
 实测要点：
 
 - **只读文字标注，不依赖任何线段图层** —— 连线混层（画在图层 `0`、与建筑/暖通/监控线同层）时仍可用，这是它相对方法一的核心价值
-- 谷底（米数**局部极小**）= 该箱安装层；覆盖分界取**相邻两谷底之间的中位行**（对称 V 下等价于两曲线交点）
+- 谷底（米数**局部极小**）= 该箱安装层；覆盖分界取**相邻两谷底之间米数最大的行**（该行归下段/下箱）
 - 一个米数列含 N 个谷底 ⇒ 该单元有 N 个分纤箱
 - 覆盖范围 = 本段米数行对应的楼层。V型计算的数据来源是米数列标注，覆盖范围的每一项都必须来自米数列实际存在的行——地下层在米数列无标注行，其覆盖范围不得由本方法给出。旧实现把全局最低段下方的地下层自动并入覆盖，结果中出现了米数列数据来源无法支撑的楼层，2026-09-12 用户裁决修正。如确需地下层覆盖，加 `--include-basement` 开关
 - 自检：谷底对应楼层线 y 与箱号文字 y 的偏差 —— 两个独立来源互证，偏差应恒定

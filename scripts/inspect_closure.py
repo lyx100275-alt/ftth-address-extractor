@@ -40,6 +40,8 @@
 """
 import argparse
 from ftth_common import bldg_num_or_none  # 楼号提取：失败返 None（勿与 bldg_num 失败返 0 混用）
+from ftth_common import is_bldg_level_container  # 楼栋级兜底容器判据（全技能唯一实现）
+from ftth_common import floor_num  # 楼层归一统一入口（B1/B2/WF/3F/-1F），2026-09-25 P1-10
 import json
 import os
 import re
@@ -50,16 +52,25 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 
 def norm_floor(v):
-    """楼层名归一化 → 整数（5F/5层/5 → 5；B1/地下一层 → -1）。无法识别返回 None。"""
+    """楼层名归一化 → 整数。无法识别返回 None。
+
+    2026-09-25（评审 P1-10）：删本地漂移版，改调 ftth_common.floor_num 统一入口
+    （支持 3F/-1F/B1/B2/WF），加「N层」后缀回退（parse_floor_label 不认中文后缀）。
+    """
     if v is None:
         return None
     t = str(v).replace("　", "").replace(" ", "").strip()
+    # 先走共享统一入口（B1/B2/WF/3F/-1F 等）
+    n = floor_num(t, use_fullmatch=True)
+    if n is not None:
+        return n
+    # 共享版不认的「N层」后缀在此回退（与 gen_addressbook 收口范本同则）
+    m = re.fullmatch(r"(-?\d+)(?:层|F)", t)
+    if m:
+        return int(m.group(1))
     m = re.fullmatch(r"[Bb](\d+)(?:层|F)?", t)
     if m:
         return -int(m.group(1))
-    m = re.fullmatch(r"(-?\d+)\s*(?:[Ff]|层)?", t)
-    if m:
-        return int(m.group(1))
     return None
 
 
@@ -114,6 +125,31 @@ def count_box_summary(K):
     return "；".join(parts)
 
 
+def _c7_one_line(it):
+    """C7「需人工裁决」单条压成一行（对象｜事项｜说明）。
+
+    2026-09-25（云峰实跑 + opencode 审核返工）：原实现把整条 json.dumps 后 [:80]
+    截断进 warns（inspect.json 机读出口）——80 字符恰把残差/阈值/「需人工裁决」
+    结论切在 JSON 字符串中间，用户裁决失去关键信息（coverage.json 里明明是全文）。
+    格式纪律：**展示层可截（防刷屏）、机读层不截**；非 dict 条目回退全量 json.dumps
+    （老产物/异构字段不因结构化取值而丢内容）。
+    """
+    if isinstance(it, dict):
+        # 2026-09-26（一百零二·评估项 7）：「对象」可为列表（同形态合并后的图级汇总，
+        #   承载全部单元对象串；judge_pending_scope 逐个匹配，机读不受影响）—— 展示层
+        #   join 显示。仅展示层改动，机读层（warns 全量）不动。
+        _obj = it.get("对象")
+        if isinstance(_obj, (list, tuple)):
+            obj = "、".join(str(o) for o in _obj)
+        else:
+            obj = str(_obj or "").strip()
+        task = str(it.get("事项") or "").strip()
+        note = str(it.get("说明") or "").strip()
+        if obj or task or note:
+            return "对象=%s｜事项=%s｜说明=%s" % (obj or "?", task or "?", note or "?")
+    return json.dumps(it, ensure_ascii=False)
+
+
 # bldg_num 已上收：ftth_common.bldg_num_or_none（失败返 None，原语义一致）
 
 
@@ -154,25 +190,27 @@ def main():
             print("[inspect] --fx-pattern 未显式给出，自 parse 产物取: %s" % _fp)
 
     R = Report()
+    # 2026-09-25（评审 P0-4）：以下输入类错误按 L1-C2 应为 rc=2（补探查/须修），
+    #   不是 rc=1（会被读成「脚本坏了」）。全部 return 1 → return 2。
     try:
         P = json.load(open(args.parse_json, encoding="utf-8"))
     except Exception as e:
         print("parse JSON 读取失败：%s" % e)
-        return 1
+        return 2
     C = None
     if args.coverage_json:
         try:
             C = json.load(open(args.coverage_json, encoding="utf-8"))
         except Exception as e:
             print("coverage JSON 读取失败：%s" % e)
-            return 1
+            return 2
     G = None
     if args.geom_json:
         try:
             G = json.load(open(args.geom_json, encoding="utf-8"))
         except Exception as e:
             print("geom JSON 读取失败：%s" % e)
-            return 1
+            return 2
     K = None
     if args.count_box_json:
         try:
@@ -183,12 +221,12 @@ def main():
             print("count-box JSON 打不开：%s" % e)
             print("  常见原因：count_box_icons.py 在门禁处中止（rc=2）时不写产物 ——")
             print("  先单独跑 `ftth.py count-box`，确认其 rc 与门禁信息，再决定是否传本参数。")
-            return 1
+            return 2
         try:
             K = json.load(_cbf)
         except Exception as e:
             print("count-box JSON 解析失败：%s" % e)
-            return 1
+            return 2
         finally:
             _cbf.close()
 
@@ -206,7 +244,7 @@ def main():
     R.emit("=" * 72)
     R.emit("出表前一体化闭合核查")
     R.emit("parse    : %s" % args.parse_json)
-    R.emit("coverage : %s" % (args.coverage_json or "（未提供，C3/C6 跳过）"))
+    R.emit("coverage : %s" % (args.coverage_json or "（未提供，C3 跳过；C6 按覆盖零产出判 FAIL）"))
     R.emit("geom     : %s" % (args.geom_json or "（未提供，C4 跳过）"))
     R.emit("count-box: %s" % (args.count_box_json or "（未提供）"))
     R.emit("=" * 72)
@@ -243,9 +281,17 @@ def main():
     nums = sorted(n for n in (bldg_num_or_none(b) for b in buildings) if n is not None)
     for blk in sorted(buildings, key=lambda b: (bldg_num_or_none(b) is None, bldg_num_or_none(b) or 0)):
         bv = buildings[blk]
-        ulist = list((bv.get("单元") or {}).keys())
-        nfx = sum(len((bv.get("单元") or {})[u].get("分纤箱") or []) for u in ulist)
-        R.emit("  %-6s 单元 %d 个（%s） 分纤箱 %d 个" % (blk, len(ulist), "/".join(ulist), nfx))
+        _uk = list((bv.get("单元") or {}).keys())
+        # 楼栋级兜底容器**不计入「单元」**（判据见 ftth_common.is_bldg_level_container）：
+        #   它是 parse 侧为「单元号在图上单元轴里找不到容器」的箱单开的承载容器，
+        #   键就是楼栋名，与楼层表不同键、已登记需人工裁决 —— 不是图上画出的单元。
+        _fb = [u for u in _uk if is_bldg_level_container(u, blk)]
+        ulist = [u for u in _uk if u not in _fb]
+        nfx = sum(len((bv.get("单元") or {})[u].get("分纤箱") or []) for u in _uk)
+        _note = ("（另有楼栋级兜底容器「%s」：承载单元号对不上的箱，已登记需人工裁决，"
+                 "不计入单元数）" % "/".join(_fb)) if _fb else ""
+        R.emit("  %-6s 单元 %d 个（%s） 分纤箱 %d 个%s"
+               % (blk, len(ulist), "/".join(ulist) or "无", nfx, _note))
     gap = []
     if nums:
         full = set(range(min(nums), max(nums) + 1))
@@ -464,6 +510,64 @@ def main():
         else:
             R.check("C5", "楼层表直读清单", "INFO", _c5_note)
 
+    # ---------- C5·count-box 质量透传（2026-09-25 云峰实跑 + opencode 审核返工）----------
+    # 为什么放 C5：C5 的语义就是「每层户数从哪来、可信吗」。云峰实测 parse 楼层表
+    #   全空 → C5 SKIP 说「户数须由图标法提供」，但 count_box.json 里的四类质量告警
+    #   （待裁决乘数 / 刻度偏移异常 / 共用刻度列 / 同一端点多候选）此前没有任何
+    #   inspect 出口——复用轮连 count_box.log 都不打印，*16 这类 P5 强制裁决项会
+    #   静默漏网。扩展 C5 而非新增检查 ID：SKILL.md 的 C1~C10 名目不能扩（体量红线）。
+    # 级别（opencode 审定）：乘数未裁决 → FAIL（P5 禁区 + C9「未定案不得出表」哲学：
+    #   带未裁决乘数出表 = 编造户数倍数）；其余三类 → WARN（须复核不阻塞，避免把
+    #   历史绿灯图批量变红）。C2 的 parse-0-箱分支另有偏移异常 FAIL，此处覆盖
+    #   parse 有箱的常规路径（云峰即此），不构成双闸。
+    # 格式纪律（与 C7 同一标准）：计数 + 单条不截断 + 明细指针 count_box.json。
+    if K is not None:
+        _cb_m = K.get("待裁决_乘数标注") or []
+        _cb_o = K.get("刻度偏移异常列") or []
+        _cb_s = K.get("共用刻度列组") or []
+        _cb_d = K.get("同一端点多候选") or []
+        _cb_u = K.get("未归属图标数") or 0
+        if _cb_m or _cb_o or _cb_s or _cb_d or _cb_u:
+            R.emit()
+            R.emit("  count-box（图标法）质量告警：乘数 %d / 偏移异常列 %d / 共用刻度列组 %d / "
+                   "多候选 %d / 未归属 %d；归层后总户数 %s"
+                   % (len(_cb_m), len(_cb_o), len(_cb_s), len(_cb_d), _cb_u,
+                      K.get("归层后总户数")))
+            for _x in _cb_m[:20]:
+                R.emit("    ! 乘数标注：%s @(%s, %s) 图层=%s —— P5：不得自行相乘，"
+                       "含义与落层口径须人工裁决" % (_x.get("标注"), _x.get("x"),
+                                                     _x.get("y"), _x.get("图层")))
+            for _x in _cb_o[:20]:
+                R.emit("    ! 偏移异常列：列x=%s 偏移=%s —— %s"
+                       % (_x.get("列x"), _x.get("刻度偏移"), _x.get("说明")))
+            for _x in _cb_s[:20]:
+                R.emit("    ! 共用刻度列：刻度列x=%s ← 图标列 %s"
+                       % (_x.get("刻度列x"), "、".join(str(v) for v in (_x.get("图标列x") or []))))
+            if len(_cb_m) > 20:
+                R.emit("    ... 另有 %d 处乘数未列出（明细见 count_box.json）" % (len(_cb_m) - 20))
+            if len(_cb_o) > 20:
+                R.emit("    ... 另有 %d 列偏移异常未列出（明细见 count_box.json）" % (len(_cb_o) - 20))
+            if _cb_m:
+                R.fail("C5", "图标法含待裁决乘数标注 %d 处（如 %s）—— 按 L0-P5 须人工"
+                       "裁决含义与落层口径后改数，未裁决不得出表"
+                       % (len(_cb_m), "、".join(str(x.get("标注")) for x in _cb_m[:4])))
+            if _cb_o:
+                R.warn("C5", "图标法刻度偏移异常列 %d 个（列x=%s）—— 该列归层不可信，须人工"
+                       "核对后重跑（可显式 --col-scale-map / --scale-max-dx）"
+                       % (len(_cb_o), "、".join(str(x.get("列x")) for x in _cb_o[:8])))
+            if _cb_s:
+                R.warn("C5", "图标法共用刻度列组 %d 组 —— 「一条刻度列服务多个图标列」形态下"
+                       "几何最近配对不可靠，须人工核对归属" % len(_cb_s))
+            if _cb_d:
+                R.warn("C5", "图标法同一端点多候选 %d 处 —— 须人工复核是否重复绘制" % len(_cb_d))
+            if _cb_u:
+                R.warn("C5", "图标法未归属图标 %d 个 —— 不计入任何列，已登记待确认" % _cb_u)
+            R.check("C5", "楼层表直读清单", "FAIL" if _cb_m else "WARN",
+                    "图标法质量告警：乘数%d/偏移异常%d/共用刻度%d/多候选%d/未归属%d；"
+                    "归层后总户数 %s；明细见 count_box.json"
+                    % (len(_cb_m), len(_cb_o), len(_cb_s), len(_cb_d), _cb_u,
+                       K.get("归层后总户数")))
+
     # ---------- C8 同单元跨层户数一致性（2026-09-17 新增） ----------
     # 为什么要它（实测依据）：
     #   某图 1#楼/1单元 的楼层表里，2F~10F 每层 2 户，唯独 1F 是 1 户。该形态当时
@@ -530,7 +634,17 @@ def main():
     R.emit()
     R.emit("--- C6 覆盖闭合（parse × coverage） ---")
     if C is None:
-        R.check("C6", "覆盖闭合", "SKIP", "未提供 coverage JSON")
+        # 2026-09-25（一百零一，问题 2 方案 B）：覆盖判定是解析阶段的独立必做步骤
+        #   （SKILL.md 测量方式架构；L1-C8 静默放行禁令）—— parse 有箱而 coverage
+        #   未提供 ⇒ 覆盖零产出，不得 SKIP 放行，判 FAIL 拦下（rc=2 输入不足/须修，
+        #   非 rc=3 合法缺席）。boxes 为空时无对象可判，沿用 SKIP（C0/_nobox 另有门禁）。
+        if boxes:
+            R.check("C6", "覆盖闭合", "FAIL",
+                    "未提供 coverage JSON，但 parse 侧 %d 个箱的覆盖范围无任何结论 —— "
+                    "覆盖判定独立必做步骤未产出（L1-C8 静默放行禁令）；须补做覆盖判定或列待确认项"
+                    % len(boxes))
+        else:
+            R.check("C6", "覆盖闭合", "SKIP", "未提供 coverage JSON")
     else:
         n_ok = n_noclue = n_outof = 0
         # 2026-09-19 修复（与 C3 同一条件、同一处置）：coverage 提供了 JSON，但**箱级
@@ -540,58 +654,61 @@ def main():
         #   「[PASS] 覆盖闭合 —— 闭合 0 / 缺线索 0 / 安装层越界 0」。
         #   这是**空集合判 PASS**：实测柳辛庄 1-4 地块四带全部命中，
         #   把「本图 0 个箱有任何覆盖线索」伪装成「覆盖全部闭合」——最隐蔽的一类静默丢数。
-        #   处置与 C3 一致：报 SKIP + WARN，**明示不可核**，绝不判 PASS。
+        #   2026-09-25（一百零一，问题 1 + 问题 2 方案 B）：本分支改为判 FAIL 并短路
+        #   （else 结构保证单记录，不再落到末尾兜底行；此前 SKIP + WARN 后不短路，
+        #   又追加一条「闭合 0/0/0」PASS——机读方按末条/存在 PASS 消费即把零覆盖读成
+        #   闭合，正是 09-19 修复注释点名要防的形态）。零产出按 L1-C8 静默放行禁令
+        #   判 FAIL（rc=2），不再是 SKIP。
         _cmap_n = 0
         for _blk0, _bv0 in (C.get("楼栋") or {}).items():
             for _un0, _uv0 in (_bv0.get("单元") or {}).items():
                 _cmap_n += len(_uv0.get("分纤箱") or [])
         if boxes and _cmap_n == 0:
-            R.check("C6", "覆盖闭合", "SKIP",
+            R.check("C6", "覆盖闭合", "FAIL",
                     "coverage 提供了 JSON 但其箱级记录为 0 —— 覆盖闭合**无对象可核**"
                     "（空集合不得判 PASS）；parse 侧 %d 个箱的覆盖范围本图未产出，"
-                    "覆盖判定须补做或列待确认项" % len(boxes))
-            R.warn("C6", "覆盖判定本图未产出任何箱级覆盖范围（parse 侧 %d 个箱全部无法闭合）"
-                   "—— 不得读作覆盖已闭合" % len(boxes))
-        # 同单元覆盖楼层完全相同 → WARN
-        for blk, bv in (C.get("楼栋") or {}).items():
-            for un, uv in (bv.get("单元") or {}).items():
-                seen = {}
-                for fx in (uv.get("分纤箱") or []):
-                    clue = tuple((fx.get("覆盖范围线索") or {}).get("覆盖楼层") or [])
-                    if clue:
-                        seen.setdefault(clue, []).append(fx.get("编号"))
-                for clue, ids in seen.items():
-                    if len(ids) > 1:
-                        R.emit("  ! %s/%s 箱 %s 覆盖楼层完全相同（%d 层）——须复核（Step 2 覆盖范围重复检测）" % (
-                            blk, un, "/".join(ids), len(clue)))
-                        R.warn("C6", "%s/%s %s 覆盖楼层完全相同" % (blk, un, ids))
-        for blk, un, fid, fl, caliber, err, y in boxes:
-            recs = cmap.get(fid) if C is not None else None
-            if not recs:
-                continue  # C3 已报
-            clue_sets = [set(r[3] or []) for r in recs]
-            if not any(clue_sets):
-                R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
-                R.fail("C6", "%s 缺覆盖范围线索" % fid)
-                n_noclue += 1
-                continue
-            fln = norm_floor(fl)
-            covered = any(fln in {norm_floor(x) for x in cs} for cs in clue_sets if cs)
-            if fln is not None and not covered:
-                R.emit("  ✗ %s（%s/%s）安装楼层 %s 不在覆盖楼层集合 %s 内" % (
-                    fid, blk, un, fl, [sorted(cs) for cs in clue_sets]))
-                R.fail("C6", "%s 安装楼层不在覆盖集合内" % fid)
-                n_outof += 1
-            else:
-                n_ok += 1
-        # 2026-09-16 修复 P0-4：boxes 为空时循环体一次不进，三个计数全 0 → 原判据 PASS。
-        if _nobox:
-            R.check("C6", "覆盖闭合", "FAIL",
-                    "parse 侧 0 箱，覆盖闭合无对象可核（空集合不得判 PASS）")
+                    "覆盖判定须补做或列待确认项（L1-C8 静默放行禁令）" % len(boxes))
         else:
-            st = "PASS" if (n_noclue == 0 and n_outof == 0) else "FAIL"
-            R.check("C6", "覆盖闭合", st,
-                    "闭合 %d / 缺线索 %d / 安装层越界 %d" % (n_ok, n_noclue, n_outof))
+            # 同单元覆盖楼层完全相同 → WARN
+            for blk, bv in (C.get("楼栋") or {}).items():
+                for un, uv in (bv.get("单元") or {}).items():
+                    seen = {}
+                    for fx in (uv.get("分纤箱") or []):
+                        clue = tuple((fx.get("覆盖范围线索") or {}).get("覆盖楼层") or [])
+                        if clue:
+                            seen.setdefault(clue, []).append(fx.get("编号"))
+                    for clue, ids in seen.items():
+                        if len(ids) > 1:
+                            R.emit("  ! %s/%s 箱 %s 覆盖楼层完全相同（%d 层）——须复核（Step 2 覆盖范围重复检测）" % (
+                                blk, un, "/".join(ids), len(clue)))
+                            R.warn("C6", "%s/%s %s 覆盖楼层完全相同" % (blk, un, ids))
+            for blk, un, fid, fl, caliber, err, y in boxes:
+                recs = cmap.get(fid) if C is not None else None
+                if not recs:
+                    continue  # C3 已报
+                clue_sets = [set(r[3] or []) for r in recs]
+                if not any(clue_sets):
+                    R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
+                    R.fail("C6", "%s 缺覆盖范围线索" % fid)
+                    n_noclue += 1
+                    continue
+                fln = norm_floor(fl)
+                covered = any(fln in {norm_floor(x) for x in cs} for cs in clue_sets if cs)
+                if fln is not None and not covered:
+                    R.emit("  ✗ %s（%s/%s）安装楼层 %s 不在覆盖楼层集合 %s 内" % (
+                        fid, blk, un, fl, [sorted(cs) for cs in clue_sets]))
+                    R.fail("C6", "%s 安装楼层不在覆盖集合内" % fid)
+                    n_outof += 1
+                else:
+                    n_ok += 1
+            # 2026-09-16 修复 P0-4：boxes 为空时循环体一次不进，三个计数全 0 → 原判据 PASS。
+            if _nobox:
+                R.check("C6", "覆盖闭合", "FAIL",
+                        "parse 侧 0 箱，覆盖闭合无对象可核（空集合不得判 PASS）")
+            else:
+                st = "PASS" if (n_noclue == 0 and n_outof == 0) else "FAIL"
+                R.check("C6", "覆盖闭合", st,
+                        "闭合 %d / 缺线索 %d / 安装层越界 %d" % (n_ok, n_noclue, n_outof))
 
     # ---------- C7 覆盖自检透传 ----------
     R.emit()
@@ -606,9 +723,12 @@ def main():
         if pend:
             R.emit("  需人工裁决 %d 项：" % len(pend))
             for it in pend:
-                R.emit("    ! %s" % json.dumps(it, ensure_ascii=False)[:140])
-                R.warn("C7", "需人工裁决：%s" % json.dumps(it, ensure_ascii=False)[:80])
-            R.check("C7", "覆盖自检透传", "WARN", "需人工裁决 %d 项" % len(pend))
+                _full = _c7_one_line(it)
+                # 展示层可截（防刷屏，放宽到 300）；机读层（warns → inspect.json）不截断
+                R.emit("    ! %s" % _full[:300])
+                R.warn("C7", "需人工裁决：%s" % _full)
+            R.check("C7", "覆盖自检透传", "WARN",
+                    "需人工裁决 %d 项（明细见 warns，全量未截断）" % len(pend))
         else:
             R.check("C7", "覆盖自检透传", "PASS", "无需人工裁决项")
 
@@ -652,9 +772,23 @@ def main():
     _rs_scope = "已提供来源：%s；其中有字段：%s" % (
         "、".join(_rs_src_ok + _rs_src_empty) or "无",
         "、".join(_rs_src_ok) or "无")
-    if _rs_src_empty:
-        R.emit("  ! 已提供但零字段的来源：%s —— 该来源未被本闸门覆盖"
-               % "、".join(_rs_src_empty))
+    # 2026-09-26（一百零三，问题 9）：明细行与 warn 分支逻辑对齐 ——
+    #   此处旧文案「零字段、未被闸门覆盖」是问题 3 修复漏改残留；coverage「零对象」
+    #   形态（箱级 0 条，无对象可挂字段）须与下文 warn 同语义输出，不得暗示漏写。
+    _cov_box_n = 0
+    if C is not None:
+        for _cblk, _cbv in (C.get("楼栋") or {}).items():
+            for _cun, _cuv in ((_cbv or {}).get("单元") or {}).items():
+                _cov_box_n += len((_cuv or {}).get("分纤箱") or [])
+    _zero_obj = [s for s in _rs_src_empty
+                 if s == "coverage" and boxes and _cov_box_n == 0]
+    _zero_fld = [s for s in _rs_src_empty if s not in _zero_obj]
+    if _zero_obj:
+        R.emit("  ! 来源 coverage 已提供但箱级记录为 0 —— 无对象可挂结果状态字段"
+               "（非字段漏写；覆盖零产出见 C6 FAIL）")
+    if _zero_fld:
+        R.emit("  ! 来源 %s 已提供但零字段 —— 未被结果状态闸门覆盖，不得视为已核"
+               % "、".join(_zero_fld))
     if not _rs_items:
         R.check("C9", "结果状态闭合", "SKIP",
                 "产物未携带 result_origin / result_confirmation 字段"
@@ -688,11 +822,29 @@ def main():
                     "%d/%d 项结果未定案或字段值非法；%s"
                     % (len(_rs_bad), len(_rs_items), _rs_scope))
         elif _rs_src_empty:
-            R.warn("C9", "来源 %s 已提供但零字段 —— 未被结果状态闸门覆盖，不得视为已核"
-                   % "、".join(_rs_src_empty))
+            # 2026-09-25（一百零一，问题 3）：区分「产物没有对象」与「产物没写字段」——
+            #   两者处置完全不同：前者（coverage 箱级记录为 0，无对象可挂字段，非字段漏写；
+            #   V 型法窗口内无箱号锚形态）是覆盖零产出，已由 C6 判 FAIL 拦下，此处只解释、
+            #   不重复拦下（避免双闸矛盾）；后者（有箱级对象却无字段）才是产出方未落
+            #   L1-C8 字段，仍按原口径 WARN 点名。C6/C9 联动见 C6 一百零一注释。
+            #   2026-09-26（一百零三，问题 9）：_cov_box_n/_zero_obj/_zero_fld 已在上文
+            #   明细行处一次算出，此处复用（单源，与明细行恒一致），不再重复计算。
+            if _zero_obj:
+                R.warn("C9", "来源 coverage 已提供但箱级记录为 0 —— 无对象可挂结果状态字段"
+                       "（非字段漏写）；覆盖零产出已由 C6 判 FAIL 拦下（L1-C8），此处不重复拦下")
+            if _zero_fld:
+                R.warn("C9", "来源 %s 已提供但零字段 —— 未被结果状态闸门覆盖，不得视为已核"
+                       % "、".join(_zero_fld))
+            _miss_parts = []
+            if _zero_obj:
+                _miss_parts.append("来源 coverage 箱级记录为 0（无对象可挂字段，非字段漏写；"
+                                   "覆盖零产出见 C6 FAIL）")
+            if _zero_fld:
+                _miss_parts.append("**未覆盖**来源 %s（有对象无字段，产出方未落 L1-C8 字段）"
+                                   % "、".join(_zero_fld))
             R.check("C9", "结果状态闭合", "WARN",
-                    "%d 项结果均已定案（settled），但**未覆盖**来源 %s —— %s"
-                    % (len(_rs_items), "、".join(_rs_src_empty), _rs_scope))
+                    "%d 项结果均已定案（settled），但%s —— %s"
+                    % (len(_rs_items), "；".join(_miss_parts), _rs_scope))
         else:
             R.check("C9", "结果状态闭合", "PASS",
                     "%d 项结果均已定案（settled）；%s" % (len(_rs_items), _rs_scope))
@@ -733,11 +885,25 @@ def main():
                                  "层数": (_bv or {}).get("层数"),
                                  "每层户数": (_bv or {}).get("每层户数")}
         _p_b = {}
+        _fb_notes = []
         for _bn, _bv in buildings.items():
             _k = bldg_num_or_none(_bn)
             if _k is None:
                 continue
-            _u = _bv.get("单元") or {}
+            # 楼栋级兜底容器不计入单元数（判据见 ftth_common.is_bldg_level_container）。
+            #   实测（柳辛庄 band4）：3#楼 = `1单元` + 兜底容器 `3#楼` 被数成 2 个单元，
+            #   与图签 1 个单元对不上 —— 却因图签侧同缺陷也虚增 1 而**假一致**，缺陷被藏住。
+            _u_all = _bv.get("单元") or {}
+            _fbk = [k for k in _u_all if is_bldg_level_container(k, _bn)]
+            _u = {k: v for k, v in _u_all.items() if k not in _fbk}
+            if not _u:
+                _u = _u_all     # 全是兜底容器时不可抹平成 0（此时图上本无单元轴依据）
+            elif _fbk:
+                _fb_notes.append(
+                    "楼%s：系统图侧楼栋级兜底容器 %s 不计入单元数（承载 %d 个单元号对不上的箱，"
+                    "已在 parse 侧登记需人工裁决）"
+                    % (_k, "/".join("「%s」" % x for x in _fbk),
+                       sum(len((_u_all[x] or {}).get("分纤箱") or []) for x in _fbk)))
             _best, _fc, _best_alt = None, [], None
             for _un, _uv in _u.items():
                 # 「层数」只数**户数非空**的层：地下刻度行（户数 null）不计入，
@@ -801,6 +967,8 @@ def main():
                 R.emit("  ! " + _d)
             for _d in _unver[:15]:
                 R.emit("  ? " + _d + " —— 单侧不可读，无法比对（不计矛盾）")
+            for _d in _fb_notes[:10]:
+                R.emit("  i " + _d)
             if _diff:
                 _note = ("；另有 %d 处单侧不可读未核" % len(_unver)) if _unver else ""
                 R.check("C10", "图签第二来源逐栋比对", "FAIL",

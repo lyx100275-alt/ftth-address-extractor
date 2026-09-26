@@ -788,6 +788,28 @@ def _fiber_len_columns(hits, min_n=3, even_lo=3.0):
         med = statistics.median(dys_p) or min(dys_p)
         if all(med / even_lo <= d <= med * even_lo for d in dys_p):
             cols.append(v)
+            continue
+        # 2026-09-23（柳辛庄band5实测）：同一x列上下堆叠多栋楼的米数段，
+        #   段间大间隙（楼栋间距）会拉大整体Δy方差，导致整列被判“间距不均”。
+        #   按大间隙先分段，每段≥min_n且段内均匀即算一列（属测量切分，不推断含义）。
+        run, runs = [ys[0]], []
+        for i, d in enumerate(dys_p):
+            if d > med * even_lo:
+                runs.append(run)
+                run = [ys[i + 1]]
+            else:
+                run.append(ys[i + 1])
+        runs.append(run)
+        for r in runs:
+            if len(r) < min_n:
+                continue
+            dd = [r[i + 1] - r[i] for i in range(len(r) - 1)]
+            dd_p = [d for d in dd if d > 0]
+            if not dd_p:
+                continue
+            m2 = statistics.median(dd_p) or min(dd_p)
+            if all(m2 / even_lo <= d <= m2 * even_lo for d in dd_p):
+                cols.append([t for t in v if float(t.get("y", 0.0)) in set(r)])
     return cols
 
 

@@ -39,8 +39,9 @@ ap.add_argument("--probe", action="store_true", help="探查模式：列出含FX
 ap.add_argument("--config", default=None,
                 help="probe 输出的 config.json（suggested_params）；正则类参数优先从此读。"
                      "**强烈建议用它替代命令行传 --fx-pattern/--bldg-pattern/--unit-pattern**："
-                     "本脚本经 ftth.cmd(cmd.exe) 调用时，正则里的 `|` 会被 cmd 当管道符解析"
-                     "（实测报『此时不应有 …』rc=1），反斜杠亦有被吃掉的风险")
+                     "旧版 ftth.cmd(cmd.exe) 调用时正则里的 `|` 会被 cmd 当管道符解析"
+                     "（曾报『此时不应有 …』rc=1），反斜杠亦有被吃掉的风险；"
+                     "新版 ftth_launcher.py 以 subprocess 直传 argv（不经 shell），已无此坑")
 ap.add_argument("--text-layer", default=None, help="文字所在图层，逗号分隔（必填，由探查提供）")
 ap.add_argument("--text-type", default="MTEXT,TEXT", help="文字实体类型，逗号分隔")
 ap.add_argument("--fx-pattern", default=None, help="分纤箱编号正则（必填，由探查提供）")
@@ -59,8 +60,9 @@ args = ap.parse_args()
 
 # ---- --config 回填（2026-09-18）----
 # 本脚本曾是本工具链里唯一「正则类参数只能走命令行」的入口：--fx-pattern /
-#   --bldg-pattern / --unit-pattern 经 ftth.cmd -> cmd.exe 时，`|` 被当管道符解析
-#   （实测 rc=1，cmd 报「此时不应有 号楼。」），反斜杠亦有被吃风险。
+#   --bldg-pattern / --unit-pattern 经旧版 ftth.cmd -> cmd.exe 时，`|` 被当管道符解析
+#   （实测 rc=1，cmd 报「此时不应有 号楼。」），反斜杠亦有被吃风险。新版 ftth_launcher.py
+#   以 subprocess 直接传 argv（不经 shell），不再有此坑。
 #   现与其它子命令对齐：命令行显式 > --config 的 suggested_params > 内置默认。
 if args.config:
     try:

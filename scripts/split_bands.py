@@ -39,6 +39,17 @@ from ftth_common import (load_dxf, collect_texts, derive_plot_bands, ent_y,
 import ezdxf
 
 
+def _fail(msg):
+    """参数/输入类错误统一出口（2026-09-25，opencode 三审 SystemExit 家族清查）。
+
+    原实现用 raise SystemExit("字符串")——Python 对字符串参数隐式取 rc=1，
+    与 L1-C2（rc=2=输入不足/须修）不符；本技能全仓 rc 语义统一后，
+    参数类错误一律 2（消息仍打 stderr，行为与原 SystemExit 一致）。
+    """
+    sys.stderr.write(str(msg) + "\n")
+    sys.exit(2)
+
+
 def parse_bands(specs):
     """解析 "名称:ymin:ymax"（列表/逗号混合），校验数值与区间合法性。"""
     items = []
@@ -49,19 +60,19 @@ def parse_bands(specs):
                 continue
             parts = piece.rsplit(":", 2)
             if len(parts) != 3:
-                raise SystemExit("[split-band] --band 格式应为 名称:ymin:ymax，收到: %r" % piece)
+                _fail("[split-band] --band 格式应为 名称:ymin:ymax，收到: %r" % piece)
             name, ymin, ymax = parts[0].strip(), parts[1], parts[2]
             try:
                 ymin, ymax = float(ymin), float(ymax)
             except ValueError:
-                raise SystemExit("[split-band] --band 的 ymin/ymax 必须是数字: %r" % piece)
+                _fail("[split-band] --band 的 ymin/ymax 必须是数字: %r" % piece)
             if not name:
-                raise SystemExit("[split-band] --band 名称不能为空: %r" % piece)
+                _fail("[split-band] --band 名称不能为空: %r" % piece)
             if ymin >= ymax:
-                raise SystemExit("[split-band] --band 要求 ymin < ymax: %r" % piece)
+                _fail("[split-band] --band 要求 ymin < ymax: %r" % piece)
             items.append((name, ymin, ymax))
     if not items:
-        raise SystemExit("[split-band] 未收到任何有效 --band")
+        _fail("[split-band] 未收到任何有效 --band")
     # 重叠检测：重叠区实体会进两个子图 → 逐带统计重复计数
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
@@ -80,7 +91,7 @@ def _cfg_text_layer(cfg_path):
     if not cfg_path:
         return tl, tp
     if not os.path.isfile(cfg_path):
-        raise SystemExit("[split-band] --config 不存在: %s" % cfg_path)
+        _fail("[split-band] --config 不存在: %s" % cfg_path)
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
     sp = cfg.get("suggested_params") or {}
@@ -165,9 +176,9 @@ def main():
     args = ap.parse_args()
 
     if not os.path.exists(args.dxf):
-        raise SystemExit("[split-band] 输入 DXF 不存在: %s" % args.dxf)
+        _fail("[split-band] 输入 DXF 不存在: %s" % args.dxf)
     if args.auto and args.band:
-        raise SystemExit("[split-band] --auto 与 --band 互斥：自动分带不接受人工边界")
+        _fail("[split-band] --auto 与 --band 互斥：自动分带不接受人工边界")
 
     cfg_tl, cfg_tp = _cfg_text_layer(args.config)
 
@@ -184,12 +195,12 @@ def main():
             print("[plan] 以上仅为方案，未写任何文件。核对无误后加 --yes 执行。")
             return
         if not args.out_dir:
-            raise SystemExit("[split-band] --yes 执行必须给 --out-dir")
+            _fail("[split-band] --yes 执行必须给 --out-dir")
     else:
         if not args.band:
-            raise SystemExit("[split-band] 需给 --band 或 --auto（人工边界 / 实测锚点自动）")
+            _fail("[split-band] 需给 --band 或 --auto（人工边界 / 实测锚点自动）")
         if not args.out_dir:
-            raise SystemExit("[split-band] --band 模式必须给 --out-dir")
+            _fail("[split-band] --band 模式必须给 --out-dir")
         bands = parse_bands(args.band)
 
     os.makedirs(args.out_dir, exist_ok=True)

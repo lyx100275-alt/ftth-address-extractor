@@ -167,7 +167,9 @@ def main(argv=None):
 
     base5 = tuple(x.strip() for x in a.addr.split(','))
     if len(base5) != 5:
-        raise SystemExit('[参数错误] --addr 必须是 5 个逗号分隔值：分公司,一级,二级,三级,四级')
+        print('[参数错误] --addr 必须是 5 个逗号分隔值：分公司,一级,二级,三级,四级',
+              file=sys.stderr)
+        return 2  # 2026-09-25（opencode 三审 SystemExit 家族清查）：参数类错误 rc=1 → rc=2
 
     with io.open(a.site_json, encoding='utf-8') as f:
         raw = json.load(f)

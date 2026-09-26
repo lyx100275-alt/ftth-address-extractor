@@ -188,6 +188,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="探查期「单元 × 箱清单」交叉清点（无箱单元预检）")
     ap.add_argument("--titleblock", default=None, help="titleblock.json（骨架来源）")
+    ap.add_argument("--titleblock-note", default="",
+                    help="调用方提供的骨架缺席成因（如 pipeline 的 titleblock 阶段"
+                         "跳过原因）；仅当未传 --titleblock 时用于 unresolved 文案，"
+                         "不参与判定")
     ap.add_argument("--fx-locations", default=None, help="fx_locations.json（箱清单来源之一）")
     ap.add_argument("--fx-map", default=None, help="fxmap.json（箱清单来源之一，读其「FX映射表」）")
     ap.add_argument("--out", required=True)
@@ -198,6 +202,12 @@ def main(argv=None):
     skel, skel_detail, skel_note = (set(), [], "")
     if tb_state == "present":
         skel, skel_detail, skel_note = _skeleton_units(tb)
+    elif not a.titleblock and (a.titleblock_note or "").strip():
+        # 2026-09-25（云峰实跑 + opencode 审核返工）：调用方说明了为什么不传
+        # --titleblock —— 用真实成因替换通用文案「未提供该输入路径」，避免被
+        # 误读成「忘了传参」。传了路径但读不了/不存在时仍用 _load_json 的错误
+        # 详情（那才是该修的东西）。仅文案，unresolved 判定不变。
+        skel_note = a.titleblock_note.strip()
     else:
         skel_note = tb_err or "骨架来源未提供"
 

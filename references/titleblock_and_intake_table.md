@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: 'ac647c0c-6f70-405b-8b26-78debc27af48'
+  PropagateID: 'ac647c0c-6f70-405b-8b26-78debc27af48'
+  ReservedCode1: '6fc98291-1bce-4ad4-b189-2650b5a65163'
+  ReservedCode2: '6fc98291-1bce-4ad4-b189-2650b5a65163'
+---
+
 # 读取标注（图签形态）+ 楼宇信息采集表对照 + 九级地址树出表
 
 > 本文记录一套与「皮线标注 / 区间法」互补的入户规模测量路径。
@@ -207,14 +218,14 @@ read_titleblock（读图分段） → --patch（人工裁定） → --site-name�
 ```
 # 0) 量测 6 个几何容差（输出建议值与实测证据；可选，不跑也行——下一步缺省时会自适应）
 #    多地块图建议带上 --band：脚本会逐段交叉校验，若某段窗口落在全图之外会告警。
-& "<技能目录>\scripts\ftth.cmd" probe_titleblock_tolerances.py --dxf 施工图.dxf --layer <图签层> \
+python "<技能目录>\scripts\ftth_launcher.py" probe_titleblock_tolerances.py --dxf 施工图.dxf --layer <图签层> \
   --band 地块A:<ymin>:<ymax> --band 地块B:<ymin>:<ymax>
 
 # 1) 读取标注（图签形态）+ 逐栋比对 + 人工裁定 + 地块归并
 #    6 个几何容差可省略：缺省时脚本按本图自适应，并把推定值与依据写进结果 JSON 的【几何容差】字段。
 #    要覆盖推定值或复现历史结果，再显式传
 #      --dx-tol / --dy-lo / --dy-hi / --unit-dx / --unit-dy-lo / --unit-dy-hi。
-& "<技能目录>\scripts\ftth.cmd" read_titleblock_households.py \
+python "<技能目录>\scripts\ftth_launcher.py" read_titleblock_households.py \
   --dxf 施工图.dxf --floor-layer <图签层> \
   --band 地块A:<ymin>:<ymax> --band 地块B:<ymin>:<ymax> \
   --site-name "地块A=XX小区A;地块B=XX小区B" \
@@ -224,7 +235,7 @@ read_titleblock（读图分段） → --patch（人工裁定） → --site-name�
   --out households.json
 
 # 2) 出九级地址树
-& "<技能目录>\scripts\ftth.cmd" gen_9level_addressbook.py \
+python "<技能目录>\scripts\ftth_launcher.py" gen_9level_addressbook.py \
   --site-json households.json \
   --header-xlsx 已定稿的标准地址.xlsx --header-sheet <已定稿sheet名> \
   --addr "<分公司>,<一级>,<二级>,<三级>,<四级>" \

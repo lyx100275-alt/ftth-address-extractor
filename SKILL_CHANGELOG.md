@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: '15293d4c-478a-4bed-9d1a-be7dd5856479'
+  PropagateID: '15293d4c-478a-4bed-9d1a-be7dd5856479'
+  ReservedCode1: '4959067c-760d-41de-8c2b-79887f396925'
+  ReservedCode2: '4959067c-760d-41de-8c2b-79887f396925'
+---
+
 # SKILL 修订记录（完整版）
 
 > 本文件自 `SKILL.md` 外移（三十一）：SKILL.md 只保留最近两条，本文件保存全部历史。（三十九起 SKILL.md 不再保留条目正文，统一指向本文件。）
@@ -5,6 +16,464 @@
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
 > 归位记录（2026-09-17）：五十三~五十六 曾被追加到文件末尾且标题层级误为二级，已移至顶部并统一为三级；仅移动与改层级，正文逐字未动。
 
+### 2026-09-26（一百零七）：merge_json 冲突来源可溯源 + 跨轮一致性扫描（多带合并链路 1 主修 + 1 评估）
+
+**实测动因**：一百零六的冲突即停在柳辛庄 8 带合跑中发现来源标识只记 basename——8 输入全叫 `parsed.json`，`merged_v2_conflict.json` 里 `conflicts["1#楼"]` 7 个元素来源全是 `"parsed.json"`，控制台 FAIL 行与 `--allow-overwrite` WARNING 行同样无法区分哪一带，「冲突即停交人裁决」的溯源价值被削弱。
+
+| # | 问题 | 改动 | 文件 |
+|---|---|---|---|
+| 16（P2） | merge_json 冲突/覆盖留痕来源只记 basename，同名输入无法溯源 | 来源登记改存**完整路径**（abspath；`conflict.json` 可溯源），控制台显示**父目录+basename**短格式（`band1块地/parsed.json`，可读）：新增 `_src_full/_src_short`，三处 `_register` 调用传完整路径，`处理/无法识别格式`行与 FAIL/WARNING 汇总行显示短格式（`detail` 构造时 `_src_short` 转换，`conflicts` 原样存完整路径）；格式 2/3 的楼栋名提取仍用 basename（正则/后缀逻辑不变） | `scripts/merge_json.py` |
+| 评估 17（不修，给理由） | 跨轮改动累积一致性扫描（第 2/6/7/8 轮相互作用复查） | **未发现新断链**，不改代码：① 第 2 轮 parse 溯源标签（口径A′/B′、`E-DXF-TEXT:图上箱位直写…`）只改 `安装楼层口径/依据来源` 文本，gen（`gen_addressbook.py` L207~251 按 `编号` 建键、`_norm_fx` 只归一编号）与 verify-truth（L162 按 `编号` 取箱）键匹配不变，C9 只认 `result_origin/result_confirmation` 枚举（`inspect_closure.py` L747）——标签文本不参与匹配；② C7「单元明细」兼容：`pending_items_from_rulings` 原生收列表对象（`ftth_common.py` L817）、`judge_pending_scope` 逐个匹配、`inspect _c7_one_line` 已处理列表对象（L141~143），`check_transitions.py` 不消费 `需人工裁决`——机读/展示均兼容；③ merge rc=2 对 batch：`ftth_batch.py` L431~437 已按非零计 fail 并截尾输出，无依赖 rc=0 分支（与任务书 L420-437 一致）——冲突会正确拦下批次，符合预期 | 无（评估结论落本条目） |
+
+**文档同步说明**：`references/scripts_reference.md` 46982 B、距预警线仅 18 B，本轮未在该文件加来源字段注记（加即超预警线，按任务书体量红线先外移——注记落本条目：`conflict.json` 的 `来源`=输入文件完整路径，控制台 FAIL/WARNING 行=`父目录/basename` 短格式，同源两种显示）。
+
+**验证**：
+- 合成复现（4 带同名 `parsed.json` 各含 `1#楼`，箱数 4/3/2/2）：不传参 → rc=2 + 不写 `--out`（仅 `_conflict.json`）+ FAIL 行显示 `band1块地/parsed.json；band2块地/parsed.json；…` 可区分 + `conflict.json` 来源为 4 条完整路径；传 `--allow-overwrite` → rc=0 + WARNING 行短格式 + 保留末见版本（3 箱，与旧行为一致）
+- 零回归：楼号全局唯一两输入（`1#楼`/`2#楼`）→ rc=0 正常合并 2 栋
+- 编译：`merge_json.py` 及关联 7 脚本 `py_compile` 全绿；`budget` 改前改后 rc=0（SKILL.md 46814 B 未动；scripts_reference.md 46982 B 未动）；冒烟 `tests/run_smoke.py --with-dxf` ALL PASS（T0~T13 失败 0 项）
+- 三项目 pipeline 主链：本环境无柳辛庄/云峰/凤鸣朝阳实战数据目录，仅以冒烟 + 合成 merge 实测 + 楼号唯一回归覆盖；改动面限 merge 来源显示（不碰合并判定/排序/键），零回归风险已隔离
+
+- **版本**：`version.json` 0.106.0 → **0.107.0**（minor 位对应修订序号一百零七）。
+
+### 2026-09-26（一百零六）：merge_json 跨输入同名楼栋冲突即停 + --allow-overwrite（多带合并链路 1 主修 + 1 评估）
+
+**实测动因**：检验面拓宽到 merge_json 多带合并链路（柳辛庄 8 带合一实跑）：8 带箱前缀各不同但楼栋名跨带重复（band1 的 1#楼与 band9-1 的 1#楼为不同物理楼），`merge_json.py` 对同名楼栋 `warning + 覆盖`（后输入覆盖先输入），band1 的 1#楼 4 箱被 band9-1 的 2 箱静默覆盖，合并产物 13 栋/28 箱而 8 带合计 140 箱文字实例；34 条 WARNING 反复触发但不阻止。跨输入同名楼栋本质是数据冲突（同名异楼 vs 同楼跨图），按 L0-I4 须矛盾即停，不得自动覆盖。
+
+| # | 问题 | 改动 | 文件 |
+|---|---|---|---|
+| 15（P1） | merge_json 对跨输入同名楼栋静默覆盖（warning+覆盖），违反 L0-I4 矛盾即停——多地块合并场景箱级数据整栋丢失 | `merge_json.py` 默认行为改为**冲突即停**：跨输入同名楼栋登记来源（来源文件+各单元数/箱数），循环后按楼名一条汇总报 `[FAIL]`（列出所有来源），写 `<out>_conflict.json` 备查，不写 `--out`，退出码 2；新增 `--allow-overwrite` 显式放行（用户裁定同一物理楼时覆盖，保留 warning 留痕，按 L0-I5-A）。三种输入格式（楼栋/楼层户数表/单元）统一经 `_register` 登记，WARNING 噪音合并为按楼名一条 | `scripts/merge_json.py` + `references/scripts_reference.md`（merge_json 参数行） |
+| 评估（不实现，仅给方案） | 是否提供 `--prefix-by-source`（楼栋名加来源前缀）作多地块合并推荐路径 | **不实现，给理由**：① 楼栋名是法定地址要素（进 gen 的 xlsx 楼栋列），自动加前缀会污染成品地址（`band1/1#楼` 进表即错）；② gen 按楼栋键组装，前缀改变键匹配面，牵动下游；③ 消歧须人工确认地块归属（哪两栋同名异楼），脚本自动前缀仍是自动取舍。推荐路径：冲突即停后人工改名消歧再合并 | 无（评估结论落本条目） |
+
+**验证**：
+- 合成复现（band1 的 1#楼 4 箱 + band9-1 的 1#楼 2 箱）：不传参 → rc=2 + 冲突详情（含双方来源/箱数）+ 不生成 merged.json（仅 _conflict.json）；传 `--allow-overwrite` → rc=0 生成 merged.json（末见版本 2 箱，与旧行为一致）+ 覆盖留痕 warning 一条
+- 零回归：两无同名楼输入合并 → rc=0 正常合并
+- 编译：`merge_json.py` `py_compile` 过；`budget` rc=0；冒烟 `tests/run_smoke.py --with-dxf` ALL PASS（见下）
+
+- **版本**：`version.json` 0.105.0 → **0.106.0**（minor 位对应修订序号一百零六）。
+
+### 2026-09-26（一百零五）：verify-truth 与 gen --fx-prefix 对称 + 前缀形态误导报文提示（跨轮断链 1 主修）
+
+**实测动因**：一百零四给 gen 加了 `--fx-prefix`（P 列统一前置验收前缀）后，本轮复跑发现该修复与 verify-truth 存在跨轮相互作用断链 —— 定稿表 P 列「绿城凤鸣朝阳FL01-FX01」（带前缀）vs coverage 线索「FL01-FX01」（裸编号），`verify_coverage_truth.py` 按全等匹配，凤鸣朝阳 17/17 全失配（一致 0 / 不一致 17，rc=2），且反报「线索里有真值表没有的箱」（误导方向：以为表缺箱，实际是编号形态不匹配）。该断链历史上隐性存在（成品表一直带前缀，反查从未通过），前缀正式化为 gen 参数后成为必然 100% 复现的技能缺陷；verify-truth 是「有真值表必跑反查」的回归验收门禁，断链即门禁失效。
+
+| # | 问题 | 改动 | 文件 |
+|---|---|---|---|
+| 14（P0） | verify-truth 无法匹配带统一前缀的 P 列：gen --fx-prefix 出的定稿表反查全部失配 | `verify_coverage_truth.py` 新增 `--fx-prefix`（与 gen 对称）：比对前对表列值剥前缀（`startswith` 才剥，语义与 gen 侧 `_with_fx_prefix` 镜像；空值/空白/「未分配」天然不受影响），剥完再全等匹配；未传时聚合路径逐字不变。`ftth.py verify-truth` 同步注册该参数（`build_cmd` 自动透传，分发段无需另改）。另修误导报文：未传 `--fx-prefix` 且全部行失配时，检测表列是否为「公共前缀 + 线索编号」形态（长串优先防短串误配；各行前缀一致才点名），是则打印一条「可用 --fx-prefix 重跑」提示；只提示、不自动剥（多小区合并表自动剥有误配风险）。退出码语义不变 | `scripts/verify_coverage_truth.py` + `scripts/ftth.py` + `references/scripts_reference.md`（verify 参数行）+ `references/step2_selfcheck.md`（必跑反查条目补前缀注记一行） |
+
+**验证**：
+- 凤鸣朝阳定稿表 + iter07 coverage.json，带 `--fx-prefix "绿城凤鸣朝阳"` 重跑 → 一致 17 / 不一致 0、rc=0（见下）
+- 零回归：裸编号形态（定稿表剥前缀副本，不传 `--fx-prefix`）→ 一致 17 / 不一致 0、rc=0；不传前缀跑原带前缀表 → 仍 0/17 rc=2 + 新增前缀形态提示行（行为差异仅提示行）
+- 编译：`verify_coverage_truth.py` / `ftth.py` `py_compile` 全绿
+- `budget` rc=0（SKILL.md 未动；scripts_reference.md / step2_selfcheck.md 增量在预警线内）
+- 冒烟：`tests/run_smoke.py --with-dxf` ALL PASS（见下）
+
+- **版本**：`version.json` 0.104.0 → **0.105.0**（minor 位对应修订序号一百零五）。
+
+### 2026-09-26（一百零四）：gen 分纤箱统一前缀 + fails 机读纪律 + C6 成因分流（下游出表链路 1 主修 + 2 评估）
+
+**实测动因**：pipeline 主链收敛后把检验面拓宽到下游出表链路，从凤鸣朝阳历史实战数据挖出 1 实锤 + 2 评估项，直接改代码（评估项不成立、未改代码）并自验证：
+
+| # | 问题 | 改动 | 文件 |
+|---|---|---|---|
+| 11（P1） | gen 缺「分纤箱编号统一前缀」能力：验收口径要求 P 列带小区前缀（凤鸣朝阳成品 17 箱全带「绿城凤鸣朝阳」），但 gen 只有逐箱 `--fx-prefix-map`（17 箱写 17 条、柳辛庄 140 箱写 140 条，不可扩展），实战被迫手写 openpyxl 临时脚本手改 xlsx（pipeline_details.md §4 明文禁止的同类形态），且 gen_raw 与成品成两份不一致交付物 | `gen_addressbook.py` 新增 `--fx-prefix <统一前缀>`：P 列每行统一前置，去重（已带不叠加）、空值/空白/「未分配」不加；与 map 并用时**先归一后加前缀**（顺序反了 map 的旧前缀匹配不上）；模板示例行不受影响（只取表头格式不复制数据）。**不从 `--addr` 第 5 级自动推导**：小区名≠验收前缀是实测常态，自动加=把用户裁决口径变脚本推断，违 L0 纪律；gen 只做机械执行，须显式传入（显式参数不违反 P1，属表达层归一化）。`ftth.py` gen 子命令同步注册（`build_cmd` 自动透传，分发段无需另改） | `scripts/gen_addressbook.py` + `scripts/ftth.py` + `references/scripts_reference.md`（gen 参数表） |
+| 12（评估·不成立，未改代码） | inspect.json fails 数组混存检查项汇总与明细行（band9-1：C10 出现 3 次=1 汇总+2 明细），机读方难区分 | **维持现状，给理由**：`Report.check()` 已按 cid 去重保证每检查项一条汇总，`R.fail()` 明细行是逐条定位，两者并存是设计（汇总计数与逐行结论自洽）；机读方应读 `checks` 结构化记录。改 fails 形态（加 ID 前缀/拆分）会破坏历史 grep 消费兼容，收益小于风险。文档已在 `step2_selfcheck.md` 明确「fails 仅人类可读摘要、机读读 checks」 | 无（评估结论落本条目 + `references/step2_selfcheck.md` 机读纪律注） |
+| 13（评估·不成立，未改代码） | C6 FAIL 在「vshape 窗口无箱锚」（band9-1：提供了 JSON 但箱级 0 条）与「画像申报三法全缺」（band5：未提供 coverage JSON）两类成因下 detail 不区分三法细节，人工处置不同 | **暂不实现，给可行结论**：inspect 输入仅 parse/coverage/geom（无画像），拿不到三法申报，加 `--profile` 取画像违最小改动（要动 inspect + pipeline 两处 CLI 面）。且两类 detail 首句**已区分**（提供但 0 记录 vs 未提供），可据此分流；三法细节在 `profile.json` 覆盖范围 `阻塞原因` + `logs/pipeline.log` coverage rc=3 行已有。文档已在 `step2_selfcheck.md` 加成因分流指引 | 无（评估结论落本条目 + `references/step2_selfcheck.md` 分流指引注） |
+
+**验证**：
+- 编译：`gen_addressbook.py` / `ftth.py` `py_compile` 全绿
+- `budget` rc=0（SKILL.md 未动；scripts_reference.md 增量在预警线内；step2_selfcheck.md 余量充足）
+- 冒烟：`tests/run_smoke.py --with-dxf` ALL PASS（见下）
+- 问题 11 凤鸣朝阳实测（`.temp/iter05/凤鸣朝阳/parsed.json` + `coverage.json` + `assets/标准地址表模板.xlsx`，`--addr 河北,石家庄,桥东区,胜利西街,绿城凤鸣朝阳 --branch 石家庄 --fx-prefix 绿城凤鸣朝阳`）：P 列 313/313 全带前缀、无双重前缀、尾行未加；行数恒等式不变（315==315）；非 P 列零差异；与桌面成品逐行 P 列全等（313 行、17 箱集合全等；成品 317=313 数据+1 表头+1 模板尾+2 宿主水印，行对齐按数据行顺序比对）；组合语义 `--fx-prefix-map FL01=FL99` + `--fx-prefix` 得 `绿城凤鸣朝阳FL99-FX01`（先归一后加前缀生效）
+- 零回归：gen 不在 pipeline 内；fails/C6 零代码改动
+
+- **版本**：`version.json` 0.103.0 → **0.104.0**（minor 位对应修订序号一百零四）。
+
+### 2026-09-26（一百零三）：C9 明细行旧文案与 warn 新语义对齐 + inspect 裁决感知评估（第 3 轮实跑 1 主修 + 1 评估）
+
+**实测动因**：第 3 轮三项目复跑零回归后又一轮实跑发现 1 实锤 + 1 评估项，直接改代码（评估项不成立、未改代码）并自验证：
+
+| # | 问题 | 改动 | 文件 |
+|---|---|---|---|
+| 9（P2） | C9 明细行（R.emit）仍是旧文案「已提供但零字段的来源：coverage —— 该来源未被本闸门覆盖」，与同检查项 warns 汇总行新语义「箱级记录为 0、无对象可挂字段、非字段漏写」自相矛盾。根因：一百零一问题 3 只改了 warn 两类拆分分支，L776 明细行漏同步 | 明细行与 warn 分支**单源对齐**：`_cov_box_n/_zero_obj/_zero_fld` 上移至明细行处一次算出（判据逐字复用问题 3：`coverage` + parse 非空 + 箱级 0 条 ⇒ 零对象），零对象形态输出「来源 coverage 已提供但箱级记录为 0 —— 无对象可挂结果状态字段（非字段漏写；覆盖零产出见 C6 FAIL）」、有对象无字段形态输出「来源 X 已提供但零字段 —— 未被结果状态闸门覆盖，不得视为已核」，下文 warn 分支复用同一组变量不再重复计算；grep 确认无第三处同类残留（其余命中均为注释/他脚本说明文字） | `scripts/inspect_closure.py` |
+| 10（评估·不成立，未改代码） | inspect 每轮全量重复已裁决告警（凤鸣朝阳 C1/C5/C8、云峰 6 FAIL/10 WARN），提案给 inspect 加 `--ruling-ledger/--project-dir` 对已裁决告警追加「已裁决（见台账 Rxxx）」标注 | **不成立：匹配歧义风险大于收益**，不实现。① 台账无稳定键：schema 仅 `问题/裁决原文/裁决人/适用范围` 自由文本（`ledger_state.py`），实测凤鸣 R001「C1 楼号1-8缺4#」vs 告警「楼号序列 1~8 缺 4#」为改写非原文，R002/R003 `适用范围` 为空，云峰 R001 一条适用范围覆盖三箱三项 C9 pending（多对多）、R004/R005 同一 *16 事项两条裁决先后补充（R005 修正 R004「8+3 列」误读），R004~R006（地址前缀/保存位置）根本无对应告警——文本/键匹配皆不可靠，易错配；② 架构逆序：inspect 是出表前纯核查器（输入仅 parse/coverage/geom，无 `--project-dir`），裁决消化位在 assemble/apply-ruling，闸门前标注闸门后状态即使用户视角省事、也会把「已裁决未消化」读成「已闭合」，与 L0-I4 矛盾即停语义暗冲突（虽不抑制、仍弱化停下效力）；③ 末尾静态提示同样不加：同属无输入无真相的展示层承诺（同输入不同输出，破坏复现性），且 inspect 何时传 project-dir 无调用契约。替代：本结论即文档（本条目），操作侧已由 `transitions --project-dir` 承载裁决核对，不新增 CLI 面 | 无（评估结论落本条目） |
+
+**验证**：
+- 编译：`scripts/inspect_closure.py` `py_compile` 过；全仓编译由冒烟 T0 覆盖
+- `budget` rc=0（SKILL.md 未动；references 无 C9 文案引用，无需同步；SKILL.md 距预警线仅 186 B，文档只落本文件符合体量纪律）
+- 冒烟：`tests/run_smoke.py --with-dxf` ALL PASS（T0~T13 失败 0 项；T13 为多栋合并楼名登记，与 C9 无关；全仓 grep 确认 tests 无 C9 文案断言，无需同步）
+- 定向：`.temp/iter03/柳辛庄5-9/band9-1块地/` 真实产物（parsed.json + coverage.json + geom + titleblock）复跑 inspect 单命令，C9 明细行已为「箱级记录为 0、无对象可挂字段」新语义，与 warns 汇总行一致，退出码语义不变
+- 零回归：改动仅 C9 展示行（emit 文案 + 变量上移复用），C6/C3 等门禁逻辑未触；云峰/凤鸣朝阳路径为 present/有覆盖形态，走 `_zero_fld`/PASS 分支不受影响
+
+- **版本**：`version.json` 0.102.0 → **0.103.0**（minor 位对应修订序号一百零三）。
+
+### 2026-09-26（一百零二）：absent 溯源标签失真 + quiet 日志丢失 + 改派计数含糊 + C7 同形态合并 + probe 块定义去重（第 2 轮实跑 4 主修 + 2 评估）
+
+**实测动因**：第 2 轮 8 带实跑（柳辛庄 band9-1 absent / 云峰 present / 凤鸣朝阳）暴露 4 项 P1~P2 + 2 评估项，全部直接改代码并自验证：
+
+| # | 问题 | 改动 | 文件 |
+|---|---|---|---|
+| 4（P1） | absent 下箱级溯源标签失真：走图上箱位直写证据（②）却硬标 `fxmap对照表` / `E-DXF-TEXT:总图对照表`，指向不存在的 fxmap.json，与同产物 `BDGMAP归属.来源=图上箱位直写自证` 自相矛盾 | `BDG_MAP` 双源（① `--bldg-map` 文件 / ② `build_fx_direct_evidence` 直写）按 `_DESC_ADDED_SET` 逐箱区分：② 标 `箱位直写标注（fx_locations）` / `E-DXF-TEXT:图上箱位直写标注（N号楼M单元K层，…）` / `口径A′:图上箱位直写标注（…）`，B′ 落区间分支时依据来源同样标直写；① 标签逐字不变。数值/误差/result 字段不动 | `parse_dxf_structured.py` + `pipeline_details.md §9` |
+| 5（P2） | `--quiet` 下 ftth.py 阶段级输出（rc=3 跳过原因/gate 处置/串号提示/告警）零落盘：rc=3 阶段连 log 文件都不存在 | stdout tee 双写 `logs/pipeline.log`（零调用点改动；quiet 与非 quiet 同行为）；恢复点选 `_dump`（全部出口经此收敛已核对）。rc=3 跳过原因并入 pipeline.log | `ftth.py` + `pipeline_details.md` 参数表 |
+| 6（P2） | `BDGMAP归属.改派条数=47` 是文字实例级计数（16 箱×多实例），与「16箱」并列误读成 47 箱被改派；清单同编号重复且无坐标 | 拆 `改派文字实例数` + `改派箱数`（旧键删除，tests 无引用），跨栋改派每条补实例坐标 `@(x,y)`；日志同步显式口径。两填充源路径同一段代码，一并生效 | `parse_dxf_structured.py` + `pipeline_details.md §8` |
+| 7（评估·成立） | C7「V段数与箱数不一致·窗口内无箱号锚」逐单元 50+ 条同文案，根因（覆盖零产出）已被 C6 FAIL 拦下，淹没真告警 | ≥2 条同形态合并为图级汇总 1 条 + `单元明细`（信息不丢）；`对象` 用列表承载全部单元串（`judge_pending_scope` 原生逐个匹配，各单元 pending 判定不变）；inspect `_c7_one_line` 列表 join 展示（仅展示层）。单条不成组；非本形态逐字保留 | `analyze_coverage_vshape.py` + `inspect_closure.py` |
+| 8（评估·成立） | 云峰 probe.log 2095 行中 445 行同一句 `块定义: tag=A text=HDD` | 首见打印 + 重复折叠计数；附带修真 bug：原实现用 stale 变量 `bname`（上一循环遗留）查块定义，N 个不同块打的全是同一块定义，改查本轮 `bn`（纯探查输出，不影响产物） | `parse_dxf_structured.py` |
+
+**全仓审计结论（问题 4 要求）**：parse 侧其余 `E-DXF-*` 赋值点 —— 区间法几何归属（`E-DXF-GEOM`，真实几何来源）、`--fx-map` 回填（真实 fx-map 文件来源）均为单源 genuine，不改；coverage 侧（`analyze_coverage.py` / vshape）依据来源描述各自方法（竖干连续体 / V 型谷底），非多源复用，不改。`operations_discipline.md` A′/B′ 分档已登记箱位直写形态，无需补；`pipeline_details.md §9` 原「absent 时无此口径」已按双源修正。
+
+**验证**：
+- 编译：4 个改动脚本 `py_compile` 全绿；`budget` rc=0（SKILL.md 未动 46814 B；references 最大者 scripts_reference.md 46542 B，pipeline_details.md 增量在预警线内）
+- 冒烟：`tests/run_smoke.py --with-dxf` ALL PASS（T0~T13 失败 0 项）
+- 定向：Q4 真实源码分支 exec 桩测 6/6（直写 A′唯一/配对、B′区间分支标签正确；文件源三处标签逐字回归；pending 路径回归）；Q7 合并块 exec（3 条→1 汇总+3 明细，真告警保留）+ `judge_pending_scope` 列表对象 3 单元命中/无关楼栋不误伤；Q8 语料 probe 9 块 9 定义各显一次（旧 stale 变量下 9 行全同）；Q5 语料全链 `--quiet` rc=0，3 个 rc=3 跳过原因全进 `logs/pipeline.log`（35 行），Q6 新字段格式串实测
+- 凤鸣朝阳/云峰零回归：文件源分支字符串逐字未动 + present 路径条件未触（`_DESC_ADDED_SET` 为空时恒走旧标签）；a小区全链复跑 rc=0，17 箱全 `口径B:区间法` + `E-DXF-GEOM`（几何路径，本轮未改）
+
+- **版本**：`version.json` 0.101.0 → **0.102.0**（minor 位对应修订序号一百零二）。
+
+### 2026-09-25（一百）：待裁决项呈现方式「先推理 → 再选择题」（用户裁定）
+
+**实测动因**：云峰实跑后 6 项待裁决（5 项 C9 pending + 1 项 C5 乘数 FAIL）待报人，用户裁定呈现方式：**助手先推理（交叉分析图面证据、列事实与可能性），然后出选择题让用户作答**——不得只列「问题+双方数值」就把取证工作推回给用户。该裁定与 §5.5 既有精神（报人须写成可直接作答的选择题）同源，本次把它细化为两步呈现的硬要求。
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| ① §5.5 扩展 | `references/operations_discipline.md` | 在「最小化二选一」下新增「呈现顺序：先推理，再选择题」两步要求：先推理=呈现证据链（矛盾为什么成立、每个解释的成立条件与反证，可推理可推荐、不裁决）；再出选择题=每项 2~4 个选项覆盖主要解释 + 「其他」兜底 + 推荐项标注（推荐只是线索排序，用户选择才是裁决，落盘 E-HUMAN-RULING）；同一根因的多个矛盾项合并成一题；批量提交原则保持 |
+
+**与既有条款的关系**：不新增检查 ID、不动 rc 语义、不改任何脚本——纯操作纪律细化。§5.6 底线（惯例不得作裁决依据）、§5.7（可推理可推荐不裁决）、§五·补（E-HUMAN-RULING 最高）均不受影响，新要求正是这三条的呈现层落地。
+
+**验证**：budget rc=0（operations_discipline.md 24439 → ~25000 B，距预警线充足）；无代码改动，无需编译/冒烟/MD5 回归。
+
+**备份**：`.temp/ftth_bak_20260925_221641_ruling_format/`（operations_discipline.md 改前快照）。
+
+- **版本**：`version.json` 0.99.0 → **0.100.0**（minor 位对应修订序号一百）。
+
+### 2026-09-25（九十九）：云峰实跑驱动 —— C7 裁决项全量透传 + C5 图标法质量门禁 + unit_gaps 成因文案（opencode 第 6 轮审核）
+
+**实测动因**：云峰（143.5MB，多栋共享系统图 + 图标法户数）全链 11 阶段实跑（rc=2，5 项 C9 pending 属图纸真实矛盾，不在技能审核范围）暴露三个技能自身问题，交 opencode（muse-spark-1.3-contributor-free）独立审核，三项全部确认成立并给出落地方案，照单实施：
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| ① **P0 C7 机读层去截断** | `inspect_closure.py` | 原 warns（进 inspect.json + 末尾汇总）把「需人工裁决」json.dumps 后 [:80] 截断——残差/阈值/「需人工裁决」结论全被切在 JSON 字符串中间（coverage.json 里明明是全文）。新增 `_c7_one_line()`：dict 条目结构化压行（对象=…｜事项=…｜说明=…），非 dict 回退全量 json.dumps；详情行展示层 [:300]、warns 机读层不截断。全文件其余 [:N] 经 opencode 逐一审计：L308/413/417/477/625/702/833 均为展示层或计数式截断，机读层完好，不改。 |
+| ② **P0 C5·count-box 质量门禁** | `inspect_closure.py` + `ftth.py` | count_box.json 四类质量告警（待裁决乘数 / 刻度偏移异常列 / 共用刻度列组 / 同一端点多候选）此前仅在 parse-0-箱分支透出偏移异常一类；云峰 parse 有 23 箱 → 全部不可见，且复用轮连 count_box.log 都不打印，`*16` 这类 P5 强制裁决项静默漏网。现随 C5 透传（不新增检查 ID，C1~C10 名目不变）：**乘数未裁决 → FAIL**（L0-P5 禁区 + C9「未定案不得出表」哲学：带未裁决乘数出表 = 编造户数倍数，须人工裁决含义与落层口径后改数），刻度偏移异常列 / 共用刻度列组 / 同一端点多候选 / 未归属图标 → WARN（须复核不阻塞）。pipeline count_box 复用分支加只读摘要行（不重算不覆盖，判定以 inspect 为准）。 |
+| ③ **P2 unit_gaps 成因文案** | `ftth.py` + `check_unit_box_gaps.py` | 「骨架侧未就绪（未提供该输入路径）」让用户误以为忘了传参——成因其实在 pipeline 手里。titleblock 阶段逐分支记录 `_tb_note`（画像申报跳过 / 无图层候选不猜 / rc=3 申报制跳过 / 阶段失败），经新增 `--titleblock-note` 参数透传给子脚本替换通用文案。仅文案，unresolved 判定与 rc 语义不变；传了路径但读不了/不存在时仍用 _load_json 错误详情。 |
+
+**云峰实测前后对照**：
+- C7 warns：截断 `…"说明": "图形符号（闭合多段线(尺寸≤60)）；与安装楼层线` → 全量 `对象=4#配套楼/FX22#｜事项=箱安装层标注冲突（符号位置已定）｜说明=…与安装楼层线残差 40.7（阈值 18.0）…需人工裁决`
+- fails：5 项（C9×5）→ 6 项（**C5 乘数 FAIL 1 项** + C9×5）；warns：8 项（C7×8，截断）→ 10 项（C7×8 全量 + C5 偏移异常 4 列 + 共用刻度列 5 组）
+- unit_gaps 预检：`骨架侧未就绪（未提供该输入路径）` → `骨架侧未就绪（titleblock 阶段 rc=3：本图未提供图签形态的成对标注（申报制跳过））`
+- count_box 复用轮新增摘要行：`归层后总户数 331；乘数 2 / 偏移异常列 4 / 共用刻度列组 5 / 多候选 0 / 未归属 0`
+
+**验证**：
+- 编译：inspect_closure.py / ftth.py / check_unit_box_gaps.py py_compile 全绿
+- 体量：budget rc=0（SKILL.md 46814 B 未动，距预警线 186 B）
+- 冒烟：tests/run_smoke.py --with-dxf ALL PASS（T0~T13 失败 0 项）
+- 凤鸣 MD5 回归：parsed `CC88…E3B` / coverage `6CC2…7AB` 与基线逐位一致（该图 K=None，C5 质量透传块整体跳过——不回归的证明）
+- 云峰重跑：三处修复全部生效（见上对照），rc=2（6 fails / 10 warns）
+- unit_gaps 三态回归：无参单跑 → 旧通用文案（向后兼容）；--titleblock 指向损坏 JSON → unreadable + 原错误详情（hint 不掩盖真错误）；--titleblock-note → 文案替换生效
+
+**文档同步**：`references/step2_selfcheck.md` C5 行补「count-box 质量告警随 C5 透传」+ 新增「C5·count-box 质量透传」小节（文件 18554 B，余量充足）；SKILL.md 不动（体量红线）；scripts_reference.md 的 unit_gaps 概述行不涉参数枚举，无需改。
+
+**备份**：`.temp/ftth_bak_20260925_215747_yunfeng_review/`（3 个被改文件改前快照）。
+
+- **版本**：`version.json` 0.98.1 → **0.99.0**（minor 位对应修订序号九十九）。
+
+### 2026-09-25（九十八）：三路 stale 守卫 + parse rc=3 对齐 + 参数透传 + 退出码修正（第二轮评审驱动）
+
+**实测动因**：第二轮评审复现基线（凤鸣双跑 md5 逐位一致、云峰 5/46 pending、柳辛庄多地块拦截）后指出 4 项 P0 correctness + 7 项 P1 漂移 + 5 项 P2 体验。含两项参数透传的**失败尝试与回滚教训**。
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| ① **P0 stale 三路守卫** | `ftth.py` | inspect 的 `--coverage`/`--titleblock`/`--count-box` 三路 + unit_gaps 的 `--fx-map`/`--titleblock`/`--fx-locations` 三路 + coverage-vshape 的 `--fx-locations` 消费，全部从裸 `isfile` 改为「本轮产出标志 `_tb_produced`/`_fxl_produced`/`_cov_produced` + 残留 WARN」。复现路径：某 outdir 先跑图标法图，再跑非图标法图 → 旧文件被静默吃掉。 |
+| ② **P0 parse rc=3 对齐** | `ftth.py` | parse 的 `if rc:` 一刀切中止改为 `if rc==3: 继续`（与 coverage:866 / count_box 同语义）。按 L1-C2 rc=3=absent 跳过继续。 |
+| ③ **P0 count_box 参数透传** | `ftth.py` | fresh-run 从画像 `effective_layers.wire_layer` 透传 `--wire-layer`（语义正确：覆盖判定准备的连线层与 count_box 皮线层同义）。**不透传 `--floor-layer`**：probe 的 text_layer="0"（通用层名，云峰实测）传了破坏自适应 → rc=2。 |
+| ④ **P0 退出码修正** | `assemble_households.py` + `inspect_closure.py` | assemble 全员 sys.exit(1) → sys.exit(2)（11 处全是输入类错误）；inspect 输入类 return 1 → return 2（5 处）。按 L1-C2 rc=2=补探查/须修。 |
+| ⑤ P1 --stop-at 文档 | `pipeline_details.md` | 补 count_box（10→11 项） |
+| ⑥ P1 C1~C7 残留 | `step2_selfcheck.md` | 两处七项→C1~C10 |
+| ⑦ P1 冒烟/子命令数 | `README.md` + `SKILL.md` | T0-T6→T0-T13；子命令 13+"等"→16 显式列出（含 split-band/coverage-vshape/verify-truth） |
+| ⑧ P1 norm_floor 统一 | `inspect_closure.py` | 删本地漂移版，改调 `ftth_common.floor_num`（支持 B1/B2/WF），加「N层」后缀回退 |
+| ⑨ P1 fx_locations 参数透传 | `ftth.py` | 从 probe suggested_params.text_layer 透传 `--text-layer`（语义正确：文字层就是文字层） |
+| ⑩ P2 台账确定性 | `ledger_state.py` | `sort_keys=False` → `True` 固定键序；时间戳仍为唯一变量字段 |
+| ⑪ P2 入口编码 | `ftth.py` | 裸 `sys.stdout.reconfigure` → `ftth_common.ensure_console_utf8()`（幂等、有 try 守卫） |
+| ⑫ P2 C6 节名 | `SKILL.md` | "（含 AIGC 水印行说明）" → "§回读校验与 AIGC 水印行" |
+| ⑬ P2 silent except | `ftth.py` | 4 处画像读失败 except 加 DEBUG 打印（stderr），不改行为 |
+| ⑭ P2 version 叙述 | `version.json` | "九十三、九十四、九十六未 bump" → "九十四、九十五为九十三补丁无独立节，九十六未 bump" |
+
+**失败尝试与回滚（重要教训）**：
+- **titleblock --bldg-re 透传**：从 probe suggested_params.title_pattern 透传 → **实测凤鸣 C10 从 PASS 变 FAIL**（楼1 单元=2/层=18、楼2~8 全消失）。原因：probe 的 title_pattern 是系统图标题正则（`(\d+#楼).*示意图`），与图签楼名（`1#楼/1号楼/1楼`）语义不同。**回滚**，保持脚本内置默认。
+- **count_box --floor-layer 透传**：从 probe text_layer 透传 → **实测云峰 rc=2**（text_layer="0" 是通用层名，破坏自适应楼层识别）。**回滚**，floor-layer 留脚本自适应。
+
+**验证（三项目 + 冒烟 + 体量）**：
+- **凤鸣朝阳**：titleblock rc=0 + count_box rc=3 跳过 + inspect rc=0 FAIL 0 WARN 3；parsed/coverage MD5 与基线逐位一致（cc88…/6cc2…）—— stale 守卫 + parse rc=3 + norm_floor 回归零差异。
+- **云峰**：count_box fresh-run 成功（wire-layer 透传生效，rc=0），inspect 消费 count_box.json，5 pending 不变（图纸真实矛盾）。
+- **柳辛庄 1-4**：parse rc=2 多地块拦截路径不变。
+- **冒烟**：`run_smoke.py --with-dxf` ALL PASS（T0~T13 失败 0 项）。
+- **体量**：SKILL.md 46814 B（距预警线 186 B）；budget rc=0。
+- **编译**：ftth.py / assemble_households.py / inspect_closure.py / ledger_state.py 全绿。
+
+**opencode 审核返工（2026-09-25，同日第 3 轮，muse-spark-1.3-contributor-free 实跑驱动）**：
+
+opencode 独立审核九十八全部改动，判定：stale 守卫 ❌（旧裸块未删+_bmap 标志缺失）、norm_floor ✅、assemble 退出码 ✅、全仓退出码 ❌（12+ 处输入类仍用 rc=1）。逐项修复：
+
+| 返工项 | 文件 | 内容 |
+|---|---|---|
+| ⑤ **删 inspect 旧裸块** | `ftth.py` | 九十八加守卫块时漏删 L981-982/L996-997 两个旧 `isfile` 块 → stale 经旧块照样传入（守卫 WARN 形同虚设）+ 本轮产出时 --coverage/--titleblock 双传。**已删**，只保留守卫块。 |
+| ⑥ **补 _fxmap_produced** | `ftth.py` | `_bmap` 原用 `_fx_run and isfile`（gate 决定跑≠跑成功）→ fxmap 失败时旧残留照喂 parse --bldg-map。**加产出标志**（rc==0 置 True），`_bmap`/unit_gaps `--fx-map`/残留 WARN 全改吃该标志。 |
+| ⑦ **全仓输入类 rc=1→2** | 7 个脚本 | parse_dxf_structured（5 处：楼栋标题未匹配/--fx-map/--bldg-map 不可读与格式错）、analyze_coverage（1 处：对照表不可读）、analyze_coverage_vshape（2 处：标题未匹配/--fx-locations 不可读）、gen_addressbook（3 处：dxf_json 不存在与不可读/coverage_json 不可读）、extract_fx_locations（1 处：标注未匹配）、verify_coverage_truth（2 处：空表/缺列）、read_titleblock（1 处：容差量不出）。**保留 rc=1**：写盘失败、DXF 读取崩、缺依赖（xlrd/openpyxl）、read_titleblock L822 排版自相矛盾（2026-09-18 已裁定为图面质量问题）。 |
+| ⑧ **count_box DXF 指纹校验** | `ftth.py` | 新增 `_cb_fingerprint_ok()`：复用前比对产物「输入」字段（count_box_icons.py 写的完整 DXF 路径）与当前 dxf 的 basename；不匹配 → 不复用 + 显式提示 + fresh-run 重算。同 outdir 换图重跑不再静默喂错户数。 |
+
+**opencode 审核意见中未采纳 1 项**：read_titleblock L822（ToleranceEstimateError 排版自相矛盾）保留 rc=1 —— opencode 建议"一并归入 2"，但该处有 2026-09-18 的明确裁定注释（排版自相矛盾=图面数据质量问题，与输入不足是两回事），尊重既有设计决定。
+
+**opencode 二审返工（2026-09-25，第 4 轮，修复回执复审）**：
+
+opencode 复审上表 4 项修复回执后判定：❌-1/❌-2/指纹校验 ✅到位、L822 保留 ✅同意（三态区分注释链完整），但**rc 修正不算全仓闭环 —— 6 文件 9 处输入类遗漏**（上轮两轮均未覆盖的次级脚本）：
+
+| 文件 | 位置 | 内容 | 修法 |
+|---|---|---|---|
+| `count_households.py` | :164 | 楼栋未匹配 | →2 |
+| `probe_titleblock_tolerances.py` | :127/:139 | DXF 不存在 / 图层不存在 | →2 |
+| `merge_json.py` | :44/:48 | 缺参 / 未找到输入 | →2 |
+| `split_units.py` | :48/:56 | 输入 JSON / 规则 JSON 不可读 | →2 |
+| `ledger_elements.py` | :135/:251 | 图纸不存在 / 正则编译失败（参数写错） | →2 |
+
+**全仓终扫分类（修复后）**：剩余 rc=1 全部合理保留 —— 写盘失败 7 处（analyze_coverage:1524 / parse:2132 / gen:654 / extract_fx_map:445 / count_households:413 / merge_json:146 / split_units:150）、DXF 读取崩 7 处（ftth_common×4 / count_box_icons:575 / probe_tb:132 / read_titleblock:780）、缺依赖 3 处（xlrd / openpyxl / count_hdd:22 垫片）、**守门拦截 2 处**（read_titleblock:822 排版矛盾 / count_households:405 有损结果守门——拒绝不可信结果出表，与"输入不足"是两回事）、误报 4 处（vshape:179 单元号返回值 / read_titleblock:399 比较器 / ftth_batch:451 部分成功 / inspect:169 注释文本）。
+
+**三审返工验证**：5 个改动脚本编译全绿；冒烟 ALL PASS；凤鸣 parsed/coverage MD5 与基线逐位一致（cc88…/6cc2…）；budget rc=0。
+
+**opencode 审核返工验证**：
+- 编译：8 个改动脚本全绿（ftth/parse_dxf_structured/analyze_coverage/analyze_coverage_vshape/gen_addressbook/extract_fx_locations/verify_coverage_truth/read_titleblock_households）。
+- 凤鸣：parsed/coverage MD5 仍与基线逐位一致（cc88…/6cc2…），inspect rc=0。
+- 云峰指纹链路：匹配 → 复用（0.00s）；不匹配 → 提示"指纹不匹配（产物是另一张图的户数）"+ fresh-run 重算（14.58s）+ wire-layer 透传。
+- 冒烟 ALL PASS；budget rc=0。
+
+**备份**：`.temp/ftth_bak_20260925_195520_review2/`（11 个文件，改动前快照）。
+
+**opencode 终审返工（2026-09-25，第 5 轮，SystemExit 隐式 rc=1 家族清查）**：
+
+opencode 终审指出：前四轮退出码修正均以 `sys.exit(1)` 为扫描模式，遗漏了 `raise SystemExit("字符串")` 家族——Python 对字符串参数的 SystemExit 隐式取 rc=1，与 L1-C2（rc=2=输入不足/须修）不符，且 `grep sys\.exit\(1\)` 扫不到。全仓按 `raise SystemExit\(` 模式复扫，分类处置：
+
+| 文件 | 位置 | 原 `raise SystemExit("…")` | 改法 |
+|---|---|---|---|
+| `split_bands.py` | parse_bands :63/:68/:70/:72/:75 + main :94/:179/:181/:198/:201/:203 = 11 处 | --band 格式/数值/名称/区间校验、--config 不存在、DXF 不存在、--auto 与 --band 互斥、--yes 缺 --out-dir、缺 --band/--auto、--band 缺 --out-dir | 新增 `_fail(msg)` 辅助函数 → `sys.exit(2)`（消息仍打 stderr，行为与原 SystemExit 一致） |
+| `parse_dxf_structured.py` | :147 | 参数自检：正则捕获组不足（编译通过但解析期 `group(n)` 会 IndexError） | `sys.stderr.write` + `sys.exit(2)`（与文件内已有 rc=2 风格一致） |
+| `gen_9level_addressbook.py` | :170 | `--addr` 非 5 个逗号分隔值 | `print(file=sys.stderr)` + `return 2`（入口 `sys.exit(main())` 透传） |
+| `read_titleblock_households.py` | :278 | 图签层内未同时找到楼名与层户标注（消息明确「请用 --bldg-re / --lev-re 校正正则」=参数可修） | `print(file=sys.stderr)` + `return 2`（入口 `sys.exit(main())` 透传） |
+
+**刻意保留 rc=1（2 处守门拦截，非参数类）**：`gen_9level_addressbook.py:214` 守恒校验失败（行数≠应有，拒绝不可信结果出表）、`read_titleblock_households.py:163` 归并楼号冲突（需人工处理）——两者均「确实有问题/需人工介入」，与「输入不足·须修」是两回事。
+
+**与 rc=3 出口的分工确认**：`read_titleblock_households.py` L824 `[SKIP] rc=3`（本图整体不适用——estimate_tolerances 返回 None）是更高层设计出口，与 L278 的 rc=2（层内未找到标注、参数可修）分工不冲突——实测空层场景走 L824 rc=3（正确），L278 为量测成功后的次级检查（边缘路径，语义正确、透传安全）。
+
+**验证**：
+- **编译**：4 个改动脚本 `py_compile` 全绿。
+- **退出码行为**（经 ftth_launcher.py，8 用例）：T1 DXF 不存在 / T2 --auto 与 --band 互斥 / T3 无 --band 无 --auto / T4 --band 格式错 / T5 ymin≥ymax / T6 --addr 格式错 / T7 捕获组不足 → 全部 rc=2 ✓；T8 空层 → rc=3（走 L824 SKIP 分支，设计正确）。
+- **凤鸣 MD5 回归**：pipeline --stop-at coverage --reuse-geom --quiet，parsed.json `CC88…E3B` / coverage.json `6CC2…7AB` —— 与基线逐位一致，零差异。
+- **全仓复扫**：`raise SystemExit\(` 仅剩 3 处——2 处刻意保留守门 + 1 处 `_fail` docstring 提及（非代码）。
+
+**备份**：`.temp/ftth_bak_20260925_210944_review3/`（4 个改动文件终审返工后已验证快照；上轮中断时改前快照遗漏，此处补已验证状态作回滚锚点）。
+
+- **版本**：`version.json` 0.97.0 → **0.98.0**（minor 位对应修订序号九十八）。
+- **版本（·补）**：`version.json` 0.98.0 → **0.98.1**（patch 位对应九十八·补：SystemExit 隐式 rc=1 家族清查）。
+
+### 2026-09-25（九十七）：pipeline 自动衔接 count-box + 文档同步 + 交付水印说明（三项目实跑驱动）
+
+**实测动因**：深度检查（凤鸣朝阳/云峰/柳辛庄三项目实跑）发现画像 handoff 早在 plan 阶段就申报「每层户数=图标法（count_box_icons.py）」（云峰实测 13s 时已申报），但 `_PIPE_STAGES` 没有 count_box 阶段 —— 跑完整链（137s）后 inspect 的 C5/C8 才以 SKIP 提示「户数须由图标法提供」，用户还得手工补 count-box 再重跑 inspect（9/18 云峰留有 count_box.json / count_box_fixed.json 两轮手工痕迹）。「规则写在文档里、没有代码执行」—— 与 ③b titleblock、④b fx_locations 同一形态。
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| ① **P0 pipeline 自动衔接 count-box** | `ftth.py` | `_PIPE_STAGES` 新增 `count_box`（coverage 与 inspect 之间）；新增 `_pipe_countbox_choice(prof)` 辅助函数，**仅当画像申报每层户数脚本 == count_box_icons.py 时执行**（方法池同级，不替画像择法）；rc=2（输入不足）中止主链、rc=3（本图不适用）继续 —— 与 parse/coverage 同语义；count_box.json 已存在时**复用优先不重算**（尊重手工调参产物，与 count_box_icons.py 自身写保护一致）；产物落盘后 ⑦ inspect 已有的「outdir/count_box.json 存在即自动纳入」逻辑即刻生效 |
+| ② P1 脚本数统一 | `SKILL.md` / `README.md` / `references/scripts_reference.md` | 三处写死的脚本数（27 / 31 / 31）统一为实测 30 个 `.py`（`ls scripts/*.py` 实测；scripts_reference 自身约定「数量按实测填写」） |
+| ③ P1 交付水印说明 | `references/addressbook_template.md` + `gen_addressbook.py` | 新增「回读校验与 AIGC 水印行」小节 + gen 成功输出追加「交付提示」行：宿主对 .xlsx 自动追加 AIGC 水印行（实测凤鸣朝阳：生成 315 行 → 桌面 317 行），属系统预期行为，不是数据错误；统计户数按「楼栋列非空」过滤即可天然排除 |
+| ④ P2 interpreter_cache 说明 | `README.md` | scripts/ 行补注：运行生成 `.interpreter_cache.json`（`.gitignore` 已忽略，可安全删除，删除后下次启动重探一次） |
+
+**认知修正（P2 配套楼单元键退化）**：深度检查报告原列「配套楼单元键退化需显式提示」为 P2 建议项；复核云峰 inspect C1 日志发现，**该机制已存在** —— C1 的 `is_bldg_level_container` 判据对单元键==楼栋键的情况已打印「另有楼栋级兜底容器「X#楼」：承载单元号对不上的箱，已登记需人工裁决，不计入单元数」（云峰 11 栋全覆盖）。此为「已验证良好」项，不做代码改动。
+
+**验证（三项目实跑 + 冒烟 + 体量）**：
+- **云峰**：count_box 自动触发（10.13s，rc=0），count_box.json 落盘，inspect count_box 字段已指向产物；已存在时复用路径正确（「复用已有 count_box.json —— 手工调参产物优先不重算」）。
+- **凤鸣朝阳**：画像申报 parse 直读 → count_box rc=3 跳过（理由打印「画像申报每层户数脚本=parse_dxf_structured.py（非图标法）」）；parsed/coverage/titleblock 三产物 MD5 与改动前**完全一致**（CC88...E3B / 6CC2...7AB / 654B...72F），inspect rc=0 FAIL 0 WARN 3（与历史一致）—— 回归零差异。
+- **柳辛庄 1-4**：parse rc=2 中止路径不变（8 阶段停，count_box 阶段未执行，无副作用）。
+- **停点边界**：`--stop-at count_box` 跑到 count_box 后正确停止，inspect.json 未被改写。
+- **冒烟**：`tests/run_smoke.py --with-dxf` **ALL PASS（T0~T13 失败 0 项）**，exit=0。
+- **体量**：`ftth.py budget` rc=0；SKILL.md 46687 B（距预警线 313 B，"27→30"字节数不变）；addressbook_template.md 4196 B（references 预警线内）。
+- **编译**：`-W error::SyntaxWarning -m py_compile` 对 ftth.py / gen_addressbook.py 全绿。
+
+**评审返工（2026-09-25，评审驱动 6 项）**：
+
+| 返工项 | 文件 | 内容 |
+|---|---|---|
+| ① .gitignore 补条目 | `scripts/.gitignore` | 新增 `.interpreter_cache.json`；README 同步改为「已加入 `scripts/.gitignore` 忽略；上架打包前建议手动清理」（原文写「.gitignore 已忽略」但两份 .gitignore 均无该条目 → 失实） |
+| ② README 版本号 | `README.md` | 0.95.0＝九十五 → 0.97.0＝九十七 |
+| ③ pipeline 阶段链同步 | `SKILL.md` / `scripts_reference.md` / `pipeline_details.md` | 5 处旧阶段链（7~10 阶段、缺 count_box 等）统一为 `_PIPE_STAGES` 全 11 阶段；scripts_reference「串跑 8 个阶段」→「11 阶段」 |
+| ④ inspect stale 文件污染 | `ftth.py` | inspect 阶段仅当本轮 `_cb_run=True`（画像确为图标法）才传 `--count-box`；画像非图标法但残留文件存在时 WARN 提示删除，不静默消费（评审残留风险1） |
+| ⑤ fresh-run 未调参提示 | `ftth.py` | count_box fresh-run 成功后打印「未调参版（仅自适应量测）；若 C5/C8 户数与图面不符，请手工补跑 `ftth.py count-box --col-scale-map ...`」提示（评审残留风险2） |
+| ⑥ C6 水印行指针 | `SKILL.md` | C6 回读校验条补 1 行指向 `addressbook_template.md §回读校验与 AIGC 水印行`（评审指出 Step4/C6 只字未提水印） |
+
+**P2 fxmap 缓存：显式延期**。深度检查报告列为 P2 性能项（~30s/次大图），本次未实施，不改代码也不改文档 —— 属已知可优化项，待后续修订单独落地（若实施需 dxf 指纹校验 + fxmap.json 格式约定，改动面中等）。
+
+**备份**：`.temp/ftth_bak_20260925_182954/`（9 个文件，含 ftth.py / gen_addressbook.py / inspect_closure.py / SKILL.md / README.md / addressbook_template.md / scripts_reference.md / SKILL_CHANGELOG.md / version.json 的改动前快照）。
+
+- **版本**：`version.json` 0.95.0 → **0.97.0**（minor 位对应修订序号九十七；九十六未 bump，本次一并补到位）。
+
+### 2026-09-25（九十六）：启动器解释器缓存 + 探测超时 120s + 裁决批量落盘（凤鸣朝阳实跑驱动）
+
+**实测动因（非设计偏好）**：某 Windows 主机 `import ezdxf` 单次 24~52s（user CPU<0.1s，全为进程冷启动/杀软扫描的 I/O 等待），且**冷热不稳定**。原探测 `timeout=30` 恰好卡在耗时边界 —— 同一天 12:38 pipeline 探测通过、12:56 同一命令探测全失败（rc=9，整链 2m43s）；`FTTH_PYTHON` 设了也每次照付探测成本（实测链式 5 条调用 5m35s，均摊 ~56s/条）。
+
+| 改动 | 文件 | 内容 |
+|---|---|---|
+| ① 探测超时 | `ftth_launcher.py` | `_ezdxf_ok` timeout 30→120s（远大于实测上界 52s，消除边界抖动） |
+| ② 解释器缓存 | `ftth_launcher.py` | 探测命中后写 `scripts/.interpreter_cache.json`（exe + `ezdxf.__file__` + extra_args）；复用时仅两条 `isfile` 校验（0 成本），任一消失即自动重探。探测成本 N 次→1 次（实测命中后启动开销 28s→仅剩业务进程自身 import，属必付成本） |
+| ③ 批量裁决 | `ledger_state.py` | `ruling-add --from-json <file>`：JSON 数组 `[{"question","ruling","by"?,"scope"?,"key"?},…]`，`--by` 作条目缺省；一次调用落盘 N 条。实测 4 条裁决 5×56s → 1×28s。单条模式不变（回归通过） |
+| ④ 失败提示 | `ftth_launcher.py` | rc=9 提示语补缓存清理办法 |
+
+**冒烟（8 用例真机全过）**：冷启动探测+缓存落盘 / 未初始化 rc=3 / 缓存命中提速 / 批量落盘（默认 by + 条目覆盖）/ 零输入守卫 rc=3 / 坏 JSON rc=3 / 单条模式回归 / 真实台账回归。
+
+**配套建议（未实施，属系统层）**：该主机 import 慢疑与杀软实时扫描相关（每进程 ~10s 基线 + ezdxf 目录扫描 ~15-20s），可评估将 Python 安装目录加入杀软排除项；本技能不做任何杀软/系统改动。
+
+
+
+- **背景（上架禁令）**：技能市场导入检测到不允许的文件类型 `scripts\ftth.cmd`
+  （扩展名 `.cmd` 禁止导入），技能无法上架。这是唯一触发点；清理后 `scripts/`
+  仅剩 `.py`，不再含任何可执行脚本/编译产物。
+- **改动①（新增）**：`scripts/ftth_launcher.py` —— Python 版统一启动器，**功能等价**
+  于原 `ftth.cmd` + `_launch.py` 的合并：
+  - 解释器探测候选顺序不变：`FTTH_PYTHON` → 当前解释器 → 常见安装路径
+    （LOCALAPPDATA/ProgramFiles/SystemDrive 下 Python311~313）→ `py -3.13/-3.12/-3.11/-3`
+    → PATH 上的 `python`；全部**真实执行** `-c "import ezdxf"`（不按路径猜）。
+  - 参数分派不变：首参以 `.py` 结尾即转发该脚本（`scripts/` 前缀可写可不写），否则
+    转发 `ftth.py <首参> ...`。
+  - 退出码契约不变：透传目标退出码；全部候选失败 → rc=9 并打印处置办法。
+  - 附带收益：参数经 subprocess 直接传 argv（不经 shell），原 cmd.exe 吃正则 `|`
+    的旧坑（extract_fx_map 曾踩）随旧启动器一起消失；入口 `python` 无需带 ezdxf
+    （启动器自身只 import os/subprocess/sys），「禁止裸 python」对启动器入口豁免、
+    对业务脚本仍严格。
+- **改动②（删除）**：`scripts/ftth.cmd`、`scripts/_launch.py`、`scripts/__pycache__/`
+  （30 个 .pyc 运行产物）全部移入回收站。
+- **改动③（调用命令全量同步）**：`& "<技能目录>\scripts\ftth.cmd"` →
+  `python "<技能目录>\scripts\ftth_launcher.py"`。落点：SKILL.md（C7 契约表、
+  Step 1a 示例、Step 1b 说明）、README.md（8 处）、references/scripts_reference.md
+  （解释器契约整章重写 + 示例）、references/titleblock_and_intake_table.md、
+  references/coverage_rules.md、references/pipeline_details.md（注明旧数据为旧 cmd
+  启动器实测）、version.json（runtime_note）、requirements.txt、scripts/ftth.py /
+  ftth_batch.py / extract_fx_map.py 注释与 example。
+- **改动④（版本）**：`version.json` 0.91.0 → **0.95.0**（minor 位对应修订序号九十五；
+  九十三、九十四 未同步 bump，本次一并补到位并在 `skill_version_basis` 注明）。
+- **验证（本机实测）**：经被劫持的 TeleAgent runtime（无 ezdxf，Python 3.12）调用
+  启动器，全部通过 —— `--help` 子命令转发 rc=0、`dump_geom.py --help` .py 转发
+  rc=0、`budget` rc=0、不存在脚本 rc=2、未知子命令 rc=2、`FTTH_PYTHON` 指向无
+  ezdxf 解释器时自动回落 rc=0；`-W error::SyntaxWarning -m py_compile` 全绿。
+  冒烟（tests/run_smoke.py --with-dxf，主 Python 3.13 实测）：**ALL PASS（失败 0 项）**，
+  T0~T13 全绿，exit=0。
+- **上架遗留提醒**：① 技能自带 `.git/` 目录，上架打包时须排除；② 任何一次本机
+  运行都会再生 `scripts/__pycache__/`，上架前清理或确认打包器忽略（.gitignore 已
+  忽略，入库不受影响）。
+
+- **坑4（P0，判据用错范围却逐组弃解）**：格组归属的**前提**是「每个格组所在那一行有它
+  的楼名锚点」。前提不成立时，逐组判「不采信」＝把一整批标注**因一个用错范围的判据
+  丢出成品**。实测凤鸣朝阳小区：图签 12 个单元格里**仅 1 个**能被楼名认领（8%），
+  其余 11 组被判「不落盘」。
+  根因（取证：BZ 图层文字转储）：该图图签的楼名写成**多栋合并**
+  （`1#楼，2#楼` / `3#楼，5#楼` / `6#楼,7#楼,`），`bldg_re.fullmatch` 要求「整条＝单个
+  楼名」故**全不认** ⇒ 图签单元格**零锚点**；判据抓到的 7 个锚点实为**系统图内的单栋
+  标签**（离最近格组 362.2~425.0，方向纯横向），全部被**尺度闸**拦下。
+  而该图 **C10 实测 PASS**（图签 vs 系统图逐栋 7 栋一致）⇒ 信息另有来源，
+  此处纯属**判据用错范围**，不是数据丢失。
+- **修法**：① `assign_cells_to_buildings` 新增 `applicability_min=0.5` 认领率闸门 ——
+  `采信组/总组 < 0.5` ⇒ 整体判**不适用**：`owner`/`blocked` 置空、**全部**标注交回
+  逐标注判据，并在裁决记录里留 `适用`/`不适用原因`；调用方据此**不得**再逐组打印
+  「不采信 / 不落盘」（那是误判范围）。返回结构额外给出 `适用`/`不适用原因`。
+  ② 新增 `collect_multi_bldg_labels(texts, bldg_re_src)`：把「匹配楼名正则但不
+  fullmatch 且含分隔符」的文字**只登记不解析** —— 拆分会把单元挂到错的楼栋
+  （分隔符集：`，,、;；`／`~～`／数字-数字）。调用方新增 `[图签·多栋合并楼名]` 登记段。
+  ③ 日志新增 `[格组·不适用]` 分支，与逐组裁决**互斥**。
+- **阈值实证（为什么取 0.5）**：柳辛庄 band1~band4 认领率 6/6、14/14、18/18、5/6
+  （**最低 83%**）；凤鸣朝阳 1/12（**8%**）。50% 落在两者之间且**远离两端边界**。
+- **行为变化（如实记录，勿读成回归）**：凤鸣朝阳 `未匹配到层户的单元标注数` 由
+  **0 → 12**。原因：那 11 条原先在 `_cell_blocked` 分支被**提前 continue** 吞进
+  另一个桶（`[格组·不采信]`），根本走不到 `not cand` 分支，故「未匹配」恒为 0 ——
+  **0 是假象**。关掉格组后 12 条全部如实登记为未匹配。
+  自证：24 条单元标注 = 落格 12 + 未落格 12；未落格那 12 条命中容差窗，去重后编号数
+  恰为 1 + 2×5 + 1 = **12**，与 7 栋汇总表、质量报告「单元24」严丝合缝。
+  唯一代价：`[格组·补判]` 少救 1 条，但该条与已有标签**重复**（`8号楼 1单元×2`），
+  编号去重后单元数不变（仍为 1）⇒ 净损失 0。
+- **验证**：凤鸣朝阳 `pipeline` rc=0；C10 **PASS**（7 栋一致）；修复后连跑三轮
+  （run2/run3/run4）stdout 行为差异 **0 行**，`titleblock.json`/`parsed.json`/
+  `coverage.json` 三方 md5 **完全一致**（`inspect.json` 差异仅为内嵌产物路径）；
+  FAIL/WARN 0/2 不变。柳辛庄 band1~band4 逐行**零行为变化**（唯一差异为"合计 Xs"耗时行），
+  认领率均 ≥83% **未触发闸门**。冒烟 **ALL PASS**：新增 T12（认领率过低须整体判不适用
+  且不弃解；反向达标须照常适用落盘；偏置认领须留痕；拒绝须来自优势闸而非尺度闸）
+  与 T13（多栋合并楼名须登记、单栋楼名与非楼名文字不得误收）。
+- **测试自身的坑（记以防再犯）**：T12 初版把合成锚点放在 `x = -_CW`（整整一格宽之外），
+  `d1 = 59020.5 >` 一格高 45041.3 ⇒ **先被尺度闸拦下**，两支撑均采信 0 组，
+  测的其实是另一条路。修法：偏置改为格宽的 **3.4%**（`_OFF12 = 2000.0`，对齐实测
+  band2 的 3.2%），既落在格 x 跨度之外、又在尺度闸内。另修一条**空真**断言：
+  原用 `all(... for _s in unclaimed)` 而该场景 `unclaimed` 为空 ⇒ 恒真，等于没测；
+  改为构造**等距歧义锚点**（y 取两行正中）使 `unclaimed` 非空后再生效。
+- **备份**：`WorkBuddy/2026-09-23-12-44-53/.audit/backup_ftth_skill_20260923_1346`
+  （本轮修复**前**状态，已复核 `applicability_min` 出现 0 次、当前源 5 次）。
+- **路径备忘（避免后人误判"改的不是跑的那份"）**：
+  `~/.workbuddy/skills/ftth-address-extractor` 是指向
+  `~/.config/TeleAgent/users/v1_public_1903017811319390212/skills/ftth-address-extractor`
+  的**符号链接**（`ftth_common.py` md5 两侧一致），两处是同一份。
+
+### 2026-09-23（九十三）：图签格组归属族修坑 —— 柳辛庄 band1~band4 实跑（含真丢解一例）
+
+- **坑1（P0，真丢解）**：格组归属把「楼名 x 必须落在格组横向跨度内」当**硬闸**，
+  无覆盖即判「退让认领 → 不采信」，而不采信**禁止回落逐标注** ⇒ 整行 `N单元`
+  全部不落盘、图签侧该栋**单元数丢成 None**。实测 band2 `4#楼`：楼名画在本行格组
+  左边界**之外** 3813.2（格宽 118040.9 的 **3.2%**，两份拼版一致），到本行 11167.5、
+  到次近格 26201.1（**优势 2.35 倍**）—— 证据充足却被闸掉。修法：无覆盖分支不再弃权，
+  改为「最近格 + 优势闸（`d1 ≤ dominance×次近格`）」**采信并登记** `offset_claims`
+  （与 `unclaimed` 分开呈现：一个是已落盘但依据弱，一个是压根没落盘）。
+  **优势闸只许用于缺结构证据的分支**：有覆盖的支路若也叠加，本行偏移 17705.8 /
+  上一行底边 23361.2（行距 41067）会让该行**永久**判「优势不足」（band4 `2#楼` 正是此值）。
+  B 步同时删掉「胜者未横向覆盖即不采信」，把该事实降为裁决记录里的一个字段。
+- **坑2（P1，证据失真）**：`collect_titleblock_unit_cells` 的「落格」原口径是
+  「落在**任意矩形**里」⇒ 只落在图框内的标注被计成已核。实测 band1：20 条里
+  **8 条**只落在 585000×430500 的**图框**内（该处根本没有单元格），旧口径报
+  「落格 20 / 未落格 0」。修法：「落格」只算**主尺寸族**（单元格），原始计数另存
+  `落入任意矩形标注数` 供诊断 —— 「没核」不得呈现成「已核」。
+- **坑3（P2，原因标错）**：未认领锚点一律打印「优势不足」，实际原因是**超尺度闸**；
+  措辞改为「逐条原因见下」并补锚点坐标。
+- **验证**：band1~band4 `pipeline` 全 rc=0；band2 采信 12→14、不采信 2→0、
+  图签 `4#楼 单元数 None→2`、C10 可比楼栋 3→7；band1 落格 20→12；
+  **band3/band4 逐行零行为变化**；FAIL/WARN 四地块计数不变（11/11/16/7）。
+  第二来源：band2 `4#楼` 系统图侧 2 单元（C1）＝图签侧 2（C10 判定可比一致）。
+  幂等复跑（同码同输入两轮）行为差异 **0 行**。冒烟 T7~T11 全 PASS（新增 T11：
+  偏置但优势明确须采信 / 偏置且优势不足须不认领，并反向验证拒绝来自优势闸而非尺度闸）。
+- **备份**：`WorkBuddy/2026-09-23-12-44-53/.audit/backup_ftth_skill_20260923_1346`
+  （92/92 文件 md5 逐个一致，BACKUP_OK）。
+
+### 2026-09-22（九十二）：coverage待裁决同单元双条去重 —— 2块地实测
+
+- **Bug**：`analyze_coverage_vshape.py` 同一单元在缺箱时登记两条（配对循环内
+  「V 段数多于箱数」＋循环后「V段数与箱数不一致」，后者信息为前者超集）。
+  band2 实测 14 项里 7 组是同一句话的复制；band1（1块地）13 项同理。
+  0186 去重只杀完全相同的 JSON，杀不掉这种语义重复。
+- **Fix**：配对循环内缺箱只 `break` 不登记，统一由循环后一条登记（含谷底明细）；
+  零箱时说明追加一句「窗口内无箱号锚（箱编号在布线图区，属图纸固有分离；
+  V段仅输出覆盖线索，箱配对见parse侧）」。仍列待裁决、不静默放行（L0-I4）。
+  只改登记，不改任何测量值与配对算法。备份：
+  `WorkBuddy/backup-ftth-skill-20260922_082751_pre_coverage_dedup/`（4 文件 sha16 逐个核对一致）。
+- **验证**：band2 pipeline rc=0，coverage待裁决 14→7、C7 14→7，parse 7栋24箱、
+  V谷底/米数表逐字不变；band1 回归 rc=0，C7 13→7（含超邻域箱锚1条保留），
+  parse 5栋22箱、V谷底不变。已锁 R010-R016 值不受影响。
+
+### 2026-09-21（九十一）：图签单元归属块方向自判 —— band2-5# 现场复核修假矛盾
+
+- **Bug**：单元标注 → 层户配对的单点「最近者胜」无块方向概念。容差窗上下都大
+  （柳辛庄 band2：unit_dy_lo=-88518/hi=108919）而楼块纵向间距仅 ~80k 时，行间标注恒
+  命中上下两块；按 |dy| 必偏向行下方的楼块 ⇒ 整列系统性下判一行。band2 实测：
+  上行（1#/2#/3#）→4#/5#、中行（4#/5#真值）→6#/7#，5# 收「1单元×4」、1#/2#/3#
+  零标签；C10 据此报「图签1 vs 系统2」假矛盾（用户肉眼＋箱位直读＋系统图三方均为
+  2 单元；直查 geom 落盘证实 24/24 采全、"2单元"文本存在，采集层无罪）。
+- **Fix**（`read_titleblock_households.py`，用户已裁定实施）：两遍式——第一遍只收集
+  候选；用窗内仅一栋候选的无歧义标注自判本图方向（dy＝层户y－单元y；dy>0 恒成立⇒
+  块底式，反之块顶式；需 ≥3 条且一致率 ≥0.8，否则不锁定、行为与旧版逐位一致）。
+  锁定后歧义标注优先同向候选、同向内仍按 (|dy|,|dx|) 最近；无同向候选则回退旧规则
+  并在歧义记录加「方向回退」键（加法字段，消费方 .get 兼容）。备份：
+  `桌面/柳辛庄/.temp/run20260921_fresh/backup/read_titleblock_households.py.bak_20260921_pre_blockdir`。
+- **验证**（fresh 重跑，不读历史；titleblock_fix1.json＋inspect_fix1.json 落各带目录）：
+  band2 锁定块底式（8/8）→ 5#=1×4 重复消除、5#=[1,2]、1#=2/2#=1/3#=1 全填上，
+  C10 FAIL 2→WARN（rc=2→0）；band1 锁定块底式 → C10 维持 WARN（未核 7→5 处），零回归；
+  band4 证据不足不锁定 → 与旧版逐项一致（FAIL 0/WARN 10），零回归；
+  band3 锁定块底式 → 修好 2#（∅→[1,2]，对上箱位）与 5#（[1,2]→[1]，对上箱位），
+  但 7# [1,2]→[2] 转响：`[8224259,-8721309,1单元]` 是 2# 与 7# 唯一的"1单元"来源
+  （零和，不可约——每幅"1单元"少一条），旧版静默饿死 2#（∅），新版交 C10 待裁决。
+  静默错→响错是本技能要的方向（L0-I4），但 7# 归属仍需人眼裁定。
 ### 2026-09-20（九十·补）：图签单元归属消歧改按行（dy 优先）—— 柳辛庄 R1 实测
 
 - **Bug**：单元标注 → 层户配对的「最近者胜」度量为 `(|dx|,|dy|)`。单元列相对层户列
@@ -3149,3 +3618,9 @@ python scripts/ftth.py plan --dxf <图纸>.dxf --out profile.json --probe probe.
   1. 「count-box 的偏移异常会卡 `inspect` 的 C2 门禁」—— **错**。该 FAIL 分支仅在
      parse 侧 **0 箱**时进入；parse 侧有箱时 C2 走 PASS，本判据**不进任何门禁**，只是提示。
   2. 「裁决后重跑 inspect 可使 C9 转 PASS」—— **做不到**，见上条契约缺口。
+
+### 2026-09-25（一百零一）：柳辛庄实跑暴露三缺陷 —— C6 双行 PASS 伪装闭合 + V 型法覆盖零产出静默放行 + C9 零对象/零字段混写（只改 inspect_closure.py）
+
+**实测动因**：柳辛庄 8 带（V 型法形态）全链实跑：band9-1/band9-2 的 inspect.json 里 C6 有两条记录（SKIP +「闭合 0/缺线索 0/安装层越界 0」PASS），机读方按末条消费即把 16 箱零覆盖读成闭合；8 带 coverage 箱级记录全 0（V 型法窗口内无箱号锚，箱编号在布线图区，属图纸固有分离）却 C9 只 WARN、全链无任何 pending/FAIL；band5 覆盖 absent（rc=3）后 20 箱零结论而 inspect FAIL 0 全绿：① **P0 C6 双行**——09-19 修复加的零记录 SKIP + WARN 分支后未短路，落到末尾兜底又追一条 PASS，改为 FAIL 单记录 + else 短路（C3 同期分支有 `elif not cmap: pass` 短路，经核无同构缺陷，不动）；② **P0 覆盖零产出门禁（方案 B）**——parse 有箱而 coverage 箱级记录为 0（含未提供 coverage 的 absent 路径）时 C6 判 FAIL（rc=2 输入不足/须修，非 rc=3；L1-C8 静默放行禁令），未选方案 A（vshape 侧无 parse 箱清单，补箱级 pending 记录需新增输入与管线透传，改动面大且有编造覆盖之嫌）；③ **P1 C9 报文**——「已提供但零字段」拆分为零对象（coverage 箱级 0 条，无对象可挂字段，非字段漏写；已由 C6 FAIL 拦下，此处只解释不重复拦下）与有对象无字段（产出方未落 L1-C8 字段，原口径 WARN 点名），避免问题 2 修复后 C9 自相矛盾。**验证**：py_compile 全绿；budget rc=0（SKILL.md 46814 B 未动）；合成三态 fixture——零覆盖 C6 单条 FAIL/rc=2 且 C3/C6 均单记录、有覆盖 C6 单条 PASS/rc=0（竖线法/凤鸣路径逻辑未动）、缺 coverage C6 单条 FAIL；冒烟 ALL PASS（T5 缺 ezdxf 跳过，与基线一致）。**行为变化（如实记录）**：柳辛庄 band1~band4/band8/band5 此前 rc=0 全绿，修复后因 C6 FAIL 转 rc=2——正是本次要拦下的静默放行，非回归；云峰（23 箱带字段）、凤鸣朝阳（17 箱闭合单行 PASS）两条路径零差异。
+
+> AI生成

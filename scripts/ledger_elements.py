@@ -132,7 +132,7 @@ def _load_geom(args, log):
     cache = args.geom or (dxf + ".geom.json")
     if not os.path.exists(dxf):
         log.error("图纸不存在：%s", dxf)
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 三审）：输入类错误按 L1-C2 应为 rc=2
     if os.path.exists(cache):
         g = C.load_geom(dxf, log=log, out=cache)
     else:
@@ -248,7 +248,7 @@ def main():
         CORE_RE = re.compile(CORE_RE_DEFAULT)
     except re.error as e:
         log.error("正则编译失败（参数写错？）：%s", e)
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 三审）：输入类错误（参数写错）按 L1-C2 应为 rc=2
 
     missing, ledger, pending = [], {}, []
 

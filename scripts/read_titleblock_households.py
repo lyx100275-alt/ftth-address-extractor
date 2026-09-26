@@ -51,9 +51,11 @@ import os
 import re
 import sys
 
-from ftth_common import (ToleranceEstimateError, ensure_console_utf8,
+from ftth_common import (ToleranceEstimateError, assign_cells_to_buildings,
+                         collect_multi_bldg_labels, collect_titleblock_unit_cells,
+                         ensure_console_utf8,
                          estimate_titleblock_tolerances, filter_titleblock_units,
-                         UNIT_RE_SRC)
+                         load_geom, UNIT_RE_SRC)
 
 ensure_console_utf8()
 
@@ -176,6 +178,17 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
     bl = [(x, y, s) for x, y, s in texts if re.fullmatch(bldg_re, s)]
     lvf = [(x, y, s) for x, y, s in texts if re.fullmatch(lev_re, s)]
     lvu = [(x, y, s) for x, y, s in texts if re.fullmatch(unit_re, s)]
+    # 图签层里「一格里写了多栋」的楼名（`1#楼，2#楼` / `6#楼,7#楼,`）——`fullmatch` 一条都不认，
+    #   若只静默跳过，症状会跑到下游很远的地方才显露（实测凤鸣朝阳：图签 12 个单元格零锚点，
+    #   下游却报成「格组 11 条不落盘」，根因完全看不出来）。此处只登记、不解析。
+    multi_bldg = collect_multi_bldg_labels(texts, bldg_re)
+    if multi_bldg:
+        print('[图签·多栋合并楼名] %d 条：%s'
+              % (len(multi_bldg),
+                 '、'.join('%s@[%.1f,%.1f]' % (s, x, y) for x, y, s in multi_bldg[:8])))
+        print('    └ 这**不是**本脚本可解析的楼名（正则要求整条=单个楼名）——「格内单元 ↔ 各栋」'
+              '的对应关系取决于格内单元画序，图上并未逐栋标注 ⇒ 交人工裁决；'
+              '此类图的图签第二来源须说明「本次未参与/仅部分参与」')
     if not bl or not lvf:
         # 2026-09-15 效率优化：分离标注 variant fallback
         # 当主正则（如 (\d+)层/(\d+)户 合并写法）匹配不到时，尝试分离写法：
@@ -209,6 +222,40 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
                 if synth_lvf:
                     lvf = synth_lvf
                     print('[variant] 图签为分离标注形式（NF + M户/层），已自动配对合成 %d 条层户标注' % len(lvf))
+    # 2026-09-23（柳辛庄 band3 实测）：图签明细表的**绘制格**是「N单元」归属的客观边界。
+    #   背景：本脚本原判据是「单元标注 → 最近层户」，靠容差窗 + 块方向自判消歧；但
+    #   同栋「单元列」相对「层户列」的 x 偏置逐栋不同（实测 0.6k~101k），偏置一旦
+    #   超过 --unit-dx（本图自适应量出 90571），真主被排除、隔壁楼入选或直接落空 ——
+    #   实测 7# 的 `1单元` 判给 4#、8# 的 `1单元` 因 |dx|=102356 超窗而落空，
+    #   7#/8# 单元数 2→1，C10 报成「图签与系统图矛盾」（人工按矛盾查图必然查不到）。
+    #   而图上每个 `(楼栋, 单元)` 都画了一格，格内同时写着该单元的箱编号；格的位置
+    #   就是归属。故新增「格组」判据（属**测量**：用图上已画的边界做包含/相邻判定），
+    #   逐标注的最近层户判据整体保留为**回退**与**对照**（两者不一致时逐条留痕）。
+    _cells_info = None
+    _cell_groups = []
+    _cell_protected = set()
+    if lvu and dxf:
+        try:
+            from ftth_common import load_geom
+            _geom = load_geom(dxf)
+            _cell_groups, _cells_info = collect_titleblock_unit_cells(
+                lvu, _geom.get('polylines') or [])
+            # 落进「主尺寸格」的标注 = 图签数据本体，禁止被 filter 当系统图列头剔除
+            for _g in _cell_groups:
+                for _m in _g['members']:
+                    _cell_protected.add(id(_m))
+            print('[格组] %s' % ('启用：格尺寸 %s，格组 %d 个（落格 %d / 未落格 %d）'
+                                 % (_cells_info['格尺寸'], len(_cell_groups),
+                                    _cells_info['落格标注数'], _cells_info['未落格标注数'])
+                                 if _cells_info['启用'] else
+                                 '未启用（%s）—— 回落逐标注最近层户判据' % _cells_info['原因']))
+            for _d in _cells_info['弃用组'][:8]:
+                print('[格组·弃用] 格 x[%.1f,%.1f] y[%.1f,%.1f]：%s'
+                      % (_d['格'][0], _d['格'][1], _d['格'][2], _d['格'][3], _d['原因']))
+        except Exception as _e:      # 判据不可用不得中断主流程，但必须留痕
+            print('[格组] 判据不可用（%r）—— 回落逐标注最近层户判据' % (_e,))
+            _cell_groups, _cell_protected = [], set()
+
     # 2026-09-18（P0）：把「图签块内的单元标注」从全图同名标注里分出来。
     #   `N单元` 在**系统图里也出现**（每栋系统图楼层列顶部的单元列头），与图签同图层同写法。
     #   旧实现把两者一起配对 ⇒ 单元被配到错误楼栋：实测某图 7 栋里 5 栋单元数错、
@@ -216,7 +263,8 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
     #   判据与容差量测共用同一处实现（ftth_common.filter_titleblock_units），两侧不得各写一份。
     if lvu:
         _lvu_all = len(lvu)
-        lvu, _lvu_drop = filter_titleblock_units(lvu, bl, lvf)
+        lvu, _lvu_drop = filter_titleblock_units(lvu, bl, lvf,
+                                                 protected=_cell_protected)
         if _lvu_drop:
             print('[图签块] 单元标注 %d 个 → 保留 %d 个、剔除 %d 个'
                   '（离任何楼名/层户都远 ⇒ 属系统图内的单元列头，非图签数据）：%s'
@@ -227,12 +275,53 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
         #   图签标注常在独立图签层（与 FTTH 强特征层不同），此前只能靠试错找层。
         #   走 geom 缓存全量文字，成本低；候选仅作提示，需人工确认。
         _cand_hint = _layer_candidates_hint(dxf, bldg_re, lev_re)
-        raise SystemExit(f'[参数/信号缺失] 图签层 {layer} 内未同时找到 楼名({len(bl)}) 与 层户标注({len(lvf)})，'
-                         f'请用 --bldg-re / --lev-re 校正正则' + _cand_hint)
+        print(f'[参数/信号缺失] 图签层 {layer} 内未同时找到 楼名({len(bl)}) 与 层户标注({len(lvf)})，'
+              f'请用 --bldg-re / --lev-re 校正正则' + _cand_hint, file=sys.stderr)
+        return 2  # 2026-09-25（opencode 三审 SystemExit 家族清查）：参数可修类 rc=1 → rc=2
 
     def bldg_id(s):
         m = re.search(r'(\d+)', s)
         return int(m.group(1))
+
+    # ---- 格组 → 归属（判据实现在 ftth_common.assign_cells_to_buildings，全技能唯一一份）----
+    #   判据要点与两轮修正的实测依据见该函数 docstring：
+    #     A 楼名主导认领（取「横向投影覆盖它的格组」中最近的一个 —— 楼名是行头，
+    #       横向必落在本行 x 跨度内，实测四个地块真主 dx 恒为 0，且与图形朝向无关）
+    #     + B 格组定锚（多栋争抢需优势明确，否则不判）+ 尺度闸（认领距离 ≤ 一个格高）。
+    #   被删除的「同排共享」：band3 实测图签是**多列并排**版式（同一 y 带内并列 3 列，
+    #   是**不同楼栋**的行），同排共享会把不同列误并 → 18 组里 14 组「多栋争抢」。
+    #   而「一行多格」已由 collect_titleblock_unit_cells 的相邻并组解决，无需共享。
+    #   为什么距离以「格组矩形」为基准而不是「标注点」：格组与楼名是**表格行关系**——
+    #     楼名紧贴格组上沿（实测 8.6k~23.5k），而标注点自己可能离本栋楼名有 10 万
+    #     （同栋单元列相对层户列的 x 偏置）。用标注点算距离＝把表格结构信息丢掉。
+    _cell_owner = {}
+    _cell_verd = []
+    _cell_blocked = set()
+    _cell_anchors_unclaimed = []
+    _cell_offset_claims = []
+    _cell_applicable = True
+    _cell_inapplicable_why = ''
+    if _cell_groups:
+        try:
+            _ch = float((_cells_info or {}).get('格尺寸', [None, None])[1])
+        except (TypeError, ValueError, IndexError):
+            _ch = None
+        # 锚点只用**楼名**：楼名是图上唯一的楼栋自证文字；层户文字形如 `15层/2户`，
+        #   取号会取到层数（15），**不得**拿它当楼号（本函数首版踩过）。
+        _anchors = [(_a[0], _a[1], _a[2], (which(_a[1]), bldg_id(_a[2])))
+                    for _a in bl if which(_a[1]) is not None]
+        _cres = assign_cells_to_buildings(_cell_groups, _anchors, cell_h=_ch)
+        _cell_verd = _cres['verdicts']
+        _cell_owner = _cres['owner']
+        _cell_blocked = _cres['blocked']
+        _cell_anchors_unclaimed = _cres['unclaimed']
+        # 采信但「楼名画在本行格组横向跨度之外」的认领 —— 与「未认领」分开呈现：
+        #   前者已落盘、只是依据较弱；后者压根没落盘。混在一起会读成同一件事。
+        _cell_offset_claims = _cres.get('offset_claims') or []
+        # 判据**前提不成立**（认领率过低）⇒ 整体不适用：owner/blocked 置空，
+        #   全部标注交回逐标注判据；调用方不得逐组打印「不采信/不落盘」（那是误判范围）。
+        _cell_applicable = _cres.get('适用', True)
+        _cell_inapplicable_why = _cres.get('不适用原因') or ''
 
     # 2026-09-15 修复（P0-12）：给了 --band 时，落带外的标注 which() 返回 None。
     #   旧逻辑不判 None 就把 None 当地块名写入 data，输出阶段 sorted(data.items())
@@ -295,16 +384,84 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
     #   判据升级（排他约束/成对间距）需人工先裁定，脚本不自动择一。
     _unit_ambiguous = []
     _units_no_bldg = 0
+    # 2026-09-21（块方向自判，柳辛庄 band2-5# 现场复核立项、用户已裁定实施）：
+    #   背景：单元行相对所属楼块层户行可能偏上（块顶式）或偏下（块底式），
+    #   同图内为常量但图图不同。容差窗上下都大（本图 ±90~108k）而楼块纵向
+    #   间距仅 ~80k 时，行间标注恒命中上下两块；单点最近者胜按 |dy| 必偏向
+    #   行下方的楼块 ⇒ 整列系统性下判一行（band2 实测：上行→4#/5#、中行→6#/7#，
+    #   5# 收「1单元×4」、1#/2#/3# 零标签，C10 报假矛盾；用户肉眼＋箱位直读
+    #   ＋系统图三方均为 2 单元）。
+    #   判据：先用窗内仅一栋候选的**无歧义标注**自判本图方向（dy＝层户y－单元y；
+    #   dy＞0 恒成立⇒块底式，dy＜0 恒成立⇒块顶式；需 ≥3 条且一致率 ≥0.8，
+    #   否则不锁定）。锁定后歧义标注优先同向候选、同向内仍按 (|dy|,|dx|) 最近；
+    #   无同向候选则回退旧规则并在歧义记录标「方向回退」。不锁定或单候选时
+    #   行为与旧版逐位一致。第一遍只收集候选、不判决。
+    def _dysgn(d):
+        return 1 if d > 0 else (-1 if d < 0 else 0)
+
+    _unit_cands = []   # [(u, cand)]
+    _dir_votes = []    # 无歧义标注的 dy 符号（取同楼候选中 |dy| 最小者的符号）
+    _cell_conflicts = []   # 2026-09-23：格组判据与逐标注判据不一致的留痕
+    _cell_only = []        # 逐标注判据**够不到**（超容差窗 ⇒ 旧版直接落空）但格组判据能判的标注
+    _cell_blocked_labels = []   # 所在绘制格**不采信** ⇒ 不落盘、不回落（交人）
     for u in lvu:
         bd = which(u[1])
         if bd is None:
             _out_of_band['单元'] += 1
             continue
+        if id(u) in _cell_blocked:
+            # 该标注所在的绘制格**判据不采信**（无楼名认领 / 多栋争抢且优势不足）：
+            #   **不落盘、也不回落逐标注判据** —— 回落出来的值已被实测证伪
+            #   （柳辛庄 band4：逐标注把 2#楼那一行判给了 3#楼，而格内箱编号自证属 2#楼）。
+            #   取安全侧（少解，可见）而非回落（错解被当成已核，不可见），逐条交人。
+            _cell_blocked_labels.append([round(u[0], 1), round(u[1], 1), u[2]])
+            continue
         cand = [v for v in lvf if which(v[1]) == bd and abs(v[0] - u[0]) <= unit_dx
                 and unit_dy_lo <= (v[1] - u[1]) <= unit_dy_hi]
         if not cand:
-            _unmatched_units.append([round(u[0], 1), round(u[1], 1), u[2]])
+            # 超容差窗：旧版在此落空（登记后交人）。若该标注落在图签绘制格内、
+            #   格组判据已给出归属，则它不是「漏读」而是「容差窗量偏了」——两者都登记。
+            if id(u) in _cell_owner:
+                _cell_only.append([round(u[0], 1), round(u[1], 1), u[2],
+                                   '%s %d号楼' % _cell_owner[id(u)]])
+            else:
+                _unmatched_units.append([round(u[0], 1), round(u[1], 1), u[2]])
             continue
+        _unit_cands.append((u, cand))
+        _ow = {lvl_owner.get(id(t)) for t in cand} - {None}
+        if len(_ow) == 1:
+            _bv = min(cand, key=lambda t: abs(t[1] - u[1]))
+            _s = _dysgn(_bv[1] - u[1])
+            if _s:
+                _dir_votes.append(_s)
+    _n_v = len(_dir_votes)
+    _n_pos = sum(1 for s in _dir_votes if s > 0)
+    _lock_dir = None
+    if _n_v >= 3 and _n_pos >= 0.8 * _n_v:
+        _lock_dir = 1
+    elif _n_v >= 3 and (_n_v - _n_pos) >= 0.8 * _n_v:
+        _lock_dir = -1
+    if _lock_dir is not None:
+        print('[块方向自判] 无歧义标注 %d 条（dy>0 有 %d 条）→ 锁定%s式'
+              '（单元行在层户行%s方），歧义标注优先同向候选、同向内仍按 (|dy|,|dx|)'
+              % (_n_v, _n_pos if _lock_dir == 1 else _n_v - _n_pos,
+                 '块底' if _lock_dir == 1 else '块顶',
+                 '下' if _lock_dir == 1 else '上'))
+    elif _dir_votes:
+        print('[块方向自判] 无歧义标注 %d 条但方向不一致（dy>0 有 %d 条），'
+              '证据不足不锁定，维持旧规则' % (_n_v, _n_pos))
+    for u, cand in _unit_cands:
+        # 2026-09-20 度量 (|dy|,|dx|) 保持（见上注释）；本轮只加同向优选。
+        _pool = cand
+        _dir_fb = False
+        if _lock_dir is not None:
+            _same = [t for t in cand
+                     if (t[1] - u[1]) == 0 or _dysgn(t[1] - u[1]) == _lock_dir]
+            if _same:
+                _pool = _same
+            else:
+                # 无同向候选：回退旧规则（全池最近），歧义记录里标记。
+                _dir_fb = True
         # 2026-09-20（柳辛庄 R1 实测 + 用户现场地面真值，升级 R4 预留判据）：
         #   仍是「最近者胜」，度量从 (|dx|,|dy|) 改为 (|dy|,|dx|) ——
         #   行身份由 y 决定：单元行与楼名行上下错层（本图单元行整体偏上/偏下
@@ -316,7 +473,7 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
         #   已验证：band3（3#=2/7#=2 系用户地面真值，4#保持1）＋ band2 下线
         #   （列模型一致＋双像对称）＋ band9-2-11#（[2]→[1,2] 对上系统侧）。
         #   已知转移：band3-6#（2→1）转成新 C10 待裁定——标签零和，无中生有不得。
-        v = min(cand, key=lambda t: (abs(t[1] - u[1]), abs(t[0] - u[0])))
+        v = min(_pool, key=lambda t: (abs(t[1] - u[1]), abs(t[0] - u[0])))
         key = lvl_owner.get(id(v))
         if not key:
             _units_no_bldg += 1
@@ -328,14 +485,38 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
             if _k:
                 _ownermap.setdefault(_k, _t)
         if len(_ownermap) > 1:
-            _unit_ambiguous.append({
+            _rec = {
                 '标注': [round(u[0], 1), round(u[1], 1), u[2]],
                 '命中楼栋数': len(_ownermap),
                 '候选': [{'地块': _k[0], '楼栋': '%d号楼' % _k[1],
                           '与标注偏移': [round(abs(_t[0] - u[0]), 1), round(abs(_t[1] - u[1]), 1)]}
                          for _k, _t in sorted(_ownermap.items(), key=lambda kv: kv[0][1])],
-                '判给了': [bd2, bn]})
+                '判给了': [bd2, bn]}
+            if _dir_fb:
+                # 2026-09-21：块方向锁定下无同向候选、已回退旧规则（全池最近）。
+                _rec['方向回退'] = True
+            _unit_ambiguous.append(_rec)
+        # ---- 格组判据优先（2026-09-23）----
+        #   为何优先：格是图上画出来的归属边界（属测量），而「最近层户」只是代理量，
+        #   其容差窗无法表达「同栋单元列相对层户列的 x 偏置逐栋不同」。两者不一致时
+        #   **必须逐条留痕**（不得静默覆盖旧判据的结论）。
+        _co = _cell_owner.get(id(u))
+        if _co and (_co[0], _co[1]) != (bd2, bn):
+            _cell_conflicts.append({
+                '标注': [round(u[0], 1), round(u[1], 1), u[2]],
+                '逐标注判据': '%s %d号楼' % (bd2, bn),
+                '格组判据': '%s %d号楼' % _co,
+                '采信': '格组判据（图上绘制格边界）'})
+            bd2, bn = _co
+        elif _co:
+            bd2, bn = _co
         evidence[bd2][bn].setdefault('单元', []).append([round(u[0], 1), round(u[1], 1), u[2]])
+
+    # 逐标注判据**超容差窗落空**但格组判据能判的标注：按格组归属落盘（2026-09-23）
+    for _co_x, _co_y, _co_s, _co_own in _cell_only:
+        _k = _co_own.split(' ')
+        evidence[_k[0]][int(_k[1].replace('号楼', ''))].setdefault(
+            '单元', []).append([_co_x, _co_y, _co_s])
 
     for bd, blds in evidence.items():
         for bn, ev in blds.items():
@@ -391,6 +572,58 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
               f'（不属于任何指定地块）：楼名 {_out_of_band["楼名"]}、'
               f'层户 {_out_of_band["层户"]}、单元 {_out_of_band["单元"]} 条。'
               '若数量过大，请核对 --band 边界是否覆盖了全部目标地块。')
+    # 格组判据留痕（2026-09-23）：采信了哪些格组、哪些不采信、与旧判据冲突了哪几条。
+    #   不采信/冲突项**一律交人核对**，不自动择一。
+    if _cell_verd and not _cell_applicable:
+        # 前提不成立 ⇒ 判据整体不适用：**不逐组打印**（逐组打印会造出「11 条不落盘」这种
+        #   离根因很远的告警，而标注其实全部交回逐标注判据、并未丢解）。
+        print('[格组·不适用] %s' % _cell_inapplicable_why)
+        print('    └ 处置：本图的「N单元」**全部**走逐标注判据（与启用格组判据前的行为一致）；'
+              '格组逐组裁决仅作留痕，不参与落盘。根因通常是图签楼名写法不被 bldg-re 接受'
+              '（看上一段 [图签·多栋合并楼名]）或图签层混入了系统图的格。')
+    elif _cell_verd:
+        print('[格组·归属] 共 %d 组：采信 %d、不采信 %d'
+              % (len(_cell_verd), sum(1 for _r in _cell_verd if _r['采信']),
+                 sum(1 for _r in _cell_verd if not _r['采信'])))
+        for _r in _cell_verd:
+            _an = _r.get('最近锚点')
+            if _an:
+                print('    %s 单元 %s → %s（最近 %s「%s」距离 %.1f；次近不同栋 %s）'
+                      % ('✓' if _r['采信'] else '✗', _r['单元号'],
+                         _an['归属'], _an['类型'], _an['文字'], _an['距离'],
+                         (_r['次近不同栋'] or {}).get('归属') or '(无)'))
+            else:
+                print('    %s 单元 %s → (无楼名认领本行)' % ('✓' if _r['采信'] else '✗',
+                                                          _r['单元号']))
+            if not _r['采信']:
+                print('       └ %s' % _r.get('不采信原因', ''))
+    if _cell_anchors_unclaimed:
+        print('[格组·锚点] %d 个楼名未对任何行做认领（逐条原因见下；不猜，交人核对）：'
+              % len(_cell_anchors_unclaimed))
+        for _s in _cell_anchors_unclaimed[:8]:
+            print('    · %s' % _s)
+    if _cell_offset_claims:
+        print('[格组·偏置认领] %d 个楼名的 x 落在本行格组横向跨度之外，已按'
+              '「最近格 + 优势闸」认领（**已采信并落盘**，与上一项「未认领」不同；'
+              '逐条登记供复核）：' % len(_cell_offset_claims))
+        for _s in _cell_offset_claims[:8]:
+            print('    · %s' % _s)
+    if _cell_conflicts:
+        print('[格组·改判] %d 条标注的归属被格组判据改写（逐条对照如下，供复核）：'
+              % len(_cell_conflicts))
+        for _r in _cell_conflicts[:12]:
+            print('    %s：逐标注判据→%s｜格组判据→%s'
+                  % (_r['标注'][2], _r['逐标注判据'], _r['格组判据']))
+    if _cell_only:
+        print('[格组·补判] %d 条标注超出 --unit-dx/--unit-dy 容差窗（旧版直接落空），'
+              '已按格组归属：%s' % (len(_cell_only),
+                              '、'.join('%s→%s' % (r[2], r[3]) for r in _cell_only[:8])))
+    if _cell_blocked_labels:
+        print('[格组·不采信] %d 条单元标注因所在绘制格判据不采信而**未落盘**'
+              '（不回落逐标注判据 —— 回落值已被实测证伪），逐条交人核对：%s'
+              % (len(_cell_blocked_labels),
+                 '、'.join('%s@[%.1f,%.1f]' % (r[2], r[0], r[1])
+                          for r in _cell_blocked_labels[:8])))
     return data, evidence, {'楼名标注总数': len(bl), '层户标注总数': len(lvf),
                             '单元标注总数': len(lvu),
                             '出现次数分布': {str(k): v for k, v in sorted(dist.items())},
@@ -399,6 +632,16 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
                             '未唯一匹配到楼名的层户标注数': len(lvf) - len(lvl_owner),
                             '未匹配到层户的单元标注数': len(_unmatched_units),
                             '未匹配到层户的单元标注': _unmatched_units[:20],
+                            '格组判据': _cells_info,
+                            '格组判据适用': _cell_applicable,
+                            '格组判据不适用原因': _cell_inapplicable_why,
+                            '图签多栋合并楼名(待人工裁决)': multi_bldg[:20],
+                            '格组归属': _cell_verd,
+                            '格组未做认领的楼名': _cell_anchors_unclaimed,
+                            '格组偏置认领(已采信)': _cell_offset_claims,
+                            '格组不采信而未落盘的单元标注': _cell_blocked_labels,
+                            '格组补判(超容差窗)': _cell_only,
+                            '格组改写旧判据的标注': _cell_conflicts,
                             '单元归属歧义标注数': len(_unit_ambiguous),
                             '单元归属歧义标注': _unit_ambiguous[:20],
                             '重复单元标签的楼': _unit_dup_labels,
@@ -607,7 +850,9 @@ def main(argv=None):
                 '[ERROR] 以下参数既未显式传入，按图也量不出来：'
                 + '、'.join('--' + n.replace('_', '-') for n in _still) + '\n'
                 '  多为该图缺少对应标注所致；请先用 probe_titleblock_tolerances.py 量测后传入。\n')
-            return 1
+            return 2  # 2026-09-25（opencode 审核）：量不出来=输入不足，按 L1-C2 应为 rc=2。
+                      # 上一分支（ToleranceEstimateError）保持 rc=1 不动——排版自相矛盾
+                      # 是图面数据质量问题（2026-09-18 已裁定），与输入不足是两回事。
         _tol_src = '按图自适应（%d 项由图纸量出）' % len(_tol_missing)
         print('[几何容差] 未显式传入的项已按图自适应推定：')
         for n in _tol_missing:

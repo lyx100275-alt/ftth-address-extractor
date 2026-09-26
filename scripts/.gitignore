@@ -4,3 +4,6 @@
 # assets/标准地址表模板.xlsx）会因此被误排除。见上级 .gitignore。
 __pycache__/
 *.pyc
+
+# 解释器探测缓存（ftth_launcher.py 运行时生成；可安全删除，删除后下次启动重探一次）
+.interpreter_cache.json

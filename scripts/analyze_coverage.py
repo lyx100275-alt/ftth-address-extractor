@@ -261,7 +261,7 @@ if args.bldg_map:
             _bm = json.load(f)
     except (IOError, json.JSONDecodeError) as e:
         log.error(f"无法读取分纤箱对照表: {args.bldg_map}\n{e}")
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
     # 2026-09-15（P0-10 配套）：对照表的**重号**必须可见。
     #   本步按【编号】建键，同编号多实例会在此合并（后写覆盖前写）——旧实现无任何提示，
     #   箱位凭空消失。实测某图对照表 72 条、唯一编号 64（8 个编号各 2 次、指向不同楼栋），

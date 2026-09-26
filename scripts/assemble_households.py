@@ -58,12 +58,12 @@ try:
         count = json.load(f)
 except (IOError, json.JSONDecodeError) as e:
     print(f"[assemble] 错误：无法读取 count JSON {args.count}: {e}")
-    sys.exit(1)
+    sys.exit(2)
 
 cols = count.get("列")
 if not isinstance(cols, list) or not cols:
     print("[assemble] 错误：count JSON 中没有「列」数组（确认输入是 count_box_icons.py 的输出）")
-    sys.exit(1)
+    sys.exit(2)
 
 
 def norm_unit(ukey, bkey=None):
@@ -97,20 +97,20 @@ def parse_col_map(spec):
             continue
         if "=" not in item:
             print(f"[assemble] 错误：col-map 条目缺少 '='：{item!r}（应为 列号=楼栋/单元）")
-            sys.exit(1)
+            sys.exit(2)
         left, right = item.split("=", 1)
         left = left.strip()
         if not left.isdigit():
             print(f"[assemble] 错误：列号必须是数字：{left!r}（条目 {item!r}）")
-            sys.exit(1)
+            sys.exit(2)
         ci = int(left)
         if ci < 0 or ci >= len(cols):
             print(f"[assemble] 错误：列号 {ci} 越界（count.json 共 {len(cols)} 列，0 基）")
-            sys.exit(1)
+            sys.exit(2)
         units = [u.strip() for u in right.split(",") if u.strip()]
         if not units:
             print(f"[assemble] 错误：条目 {item!r} 没有给出任何 楼栋/单元")
-            sys.exit(1)
+            sys.exit(2)
         for u in units:
             if "/" in u:
                 bkey, ukey = u.split("/", 1)
@@ -127,7 +127,7 @@ def parse_col_map(spec):
             out.append((ci, bkey, ukey))
     if not out:
         print("[assemble] 错误：col-map 为空")
-        sys.exit(1)
+        sys.exit(2)
     # 同一 (楼栋,单元) 只能被一列声明
     seen = {}
     for ci, bkey, ukey in out:
@@ -135,7 +135,7 @@ def parse_col_map(spec):
         if key in seen:
             print(f"[assemble] 错误：(楼栋,单元) {bkey}/{ukey} 被列 {seen[key]} 和列 {ci} 同时声明——"
                   f"户数会翻倍。同一单元只能归属一列；如为共享系统图，把多个单元写在同一列的右侧。")
-            sys.exit(1)
+            sys.exit(2)
         seen[key] = ci
     return out
 
@@ -156,11 +156,11 @@ for ci, bkey, ukey in mapping:
             n = int(n)
         except (TypeError, ValueError):
             print(f"[assemble] 错误：列 {ci} 楼层 {fl!r} 户数非法：{n!r}")
-            sys.exit(1)
+            sys.exit(2)
         if n > 0:
             if fl in floors:
                 print(f"[assemble] 错误：列 {ci} 楼层 {fl!r} 在逐层数据中重复出现")
-                sys.exit(1)
+                sys.exit(2)
             floors[fl] = {"户数": n}
     unit = out_data["楼栋"].setdefault(bkey, {"单元": {}})["单元"].setdefault(
         ukey, {"楼层表": {}, "分纤箱": []})
@@ -181,7 +181,7 @@ if args.coverage:
             raw_cov = json.load(f)
     except (IOError, json.JSONDecodeError) as e:
         print(f"[assemble] 错误：无法读取 coverage JSON {args.coverage}: {e}")
-        sys.exit(1)
+        sys.exit(2)
     bldg_source = raw_cov.get("楼栋", raw_cov) if isinstance(raw_cov, dict) else {}
     for bkey, bdata in bldg_source.items():
         if not isinstance(bdata, dict):

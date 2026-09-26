@@ -45,7 +45,7 @@ try:
         input_data = json.load(f)
 except (IOError, json.JSONDecodeError) as e:
     log.error(f"无法读取输入JSON: {args.input}\n{e}")
-    sys.exit(1)
+    sys.exit(2)  # 2026-09-25（opencode 三审）：输入类错误按 L1-C2 应为 rc=2
 
 # 读取拆分规则
 try:
@@ -53,7 +53,7 @@ try:
         rules = json.load(f)
 except (IOError, json.JSONDecodeError) as e:
     log.error(f"无法读取拆分规则JSON: {args.rules}\n{e}")
-    sys.exit(1)
+    sys.exit(2)  # 2026-09-25（opencode 三审）：同上
 
 # 解析输入结构
 buildings = {}  # {楼名: {原始楼层表, 分纤箱, 标题}}

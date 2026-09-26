@@ -161,7 +161,7 @@ bldg_anchors = find_bldg_anchors(texts, TITLE_RE)
 
 if not bldg_anchors:
     log.error("未匹配到楼栋标题，请检查 --title-pattern / --text-layer，或先运行 --probe")
-    sys.exit(1)
+    sys.exit(2)  # 2026-09-25（opencode 三审）：输入类错误按 L1-C2 应为 rc=2
 
 # ---------- 尺度锚：阈值按层高自适应（2026-09-15 通用化，须在首次使用 args.* 前解析） ----------
 # 比值的历史出处：层高 30 时 match_tol=30 / x_cluster=20 / x_y_gap=6（原手调默认值）。

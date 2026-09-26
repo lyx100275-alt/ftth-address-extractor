@@ -21,7 +21,7 @@
 
 · V 形**局部极小**（谷底）⇒ 该分纤箱的安装楼层
 · 一个米数列含 N 个谷底 ⇒ 该单元有 N 个分纤箱，每个覆盖一段
-· 双箱单元的覆盖分界：取相邻两个谷底之间的中位行（对称 V 下等价于两曲线交点）
+· 双箱单元的覆盖分界：取相邻两个谷底之间米数最大的行作为分界（该行归下段/下箱）
 
 与竖线法的分工
 ----------------------
@@ -380,7 +380,7 @@ def main():
     titles.sort(key=lambda t: t[0])
     if not titles:
         log.error("未匹配到任何楼栋标题，请检查 --title-pattern 与 --text-layer")
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
 
     # 展开为「每栋一个分析窗口」。共享标题的多栋共用同一 x 区间——
     #   此处不按栋切分窗口内数据（切分需图纸语义），改在结果里标注为待人工核对。
@@ -524,7 +524,7 @@ def main():
 
     result = {
         'DXF文件': args.dxf,
-        '方法': 'V型计算（皮线米数 V 形规律）：米数谷底→箱安装层；相邻谷底中位行→覆盖分界',
+        '方法': 'V型计算（皮线米数 V 形规律）：米数谷底→箱安装层；相邻谷底间米数最大行→覆盖分界',
         '说明': '本结果由文字标注几何推得。已用箱号文字 y 做独立交叉验证（自检_v底vs箱符号）',
         '参数': {
             '文字图层': sorted(layers),
@@ -855,6 +855,8 @@ def main():
             #   10F 米数 48 = |10-4|×4+24，只能归下箱（4F）；11F 米数 36 = |11-14|×4+24，
             #   只能归上箱（14F）→ 真分界为 10F/11F。
             #   理论上「米数最大行 = 离下箱最远的层」，与逐层米数公式一致，不依赖间距奇偶。
+            #   2026-09-21 用户裁决：中位法已彻底废除，并列时同样不得用中点选择。
+            #   并列（两行米数相同=两箱等距层）：取行号大的（靠下的），归下段/下箱。
             segs = []
             if len(valleys) == 1:
                 segs = [(0, len(rows) - 1, valleys[0])]
@@ -868,10 +870,8 @@ def main():
                         cuts.append(_cand[0])
                     else:
                         # 并列：两箱的等距层（如 5F/14F 装配的 9F 与 10F，米数同为 40）。
-                        # 取靠近区间中点者，使两侧覆盖层数均衡 —— 与设计表一致
-                        # （5F/14F→9/10 即此情形；若不处理并列会误得 10/11）。
-                        _mid = (a + b) / 2.0
-                        cuts.append(min(_cand, key=lambda j: (abs(j - _mid), -j)))
+                        # 取行号最大者（靠下的行），归下段/下箱 —— 不用中点法
+                        cuts.append(max(_cand))
                 starts = [0] + cuts
                 ends = [c - 1 for c in cuts] + [len(rows) - 1]
                 segs = [(s0, s1, v) for (s0, s1), v in zip(zip(starts, ends), valleys)]
@@ -949,10 +949,9 @@ def main():
 
             for si, sm in enumerate(seg_meta):
                 if si >= len(uboxes):
-                    result['需人工裁决'].append({
-                        '对象': '%s %d单元' % (bkey, ui + 1),
-                        '事项': 'V 段数多于箱数，无法配对',
-                        '说明': 'V 段 %d 个 / 箱 %d 个' % (len(seg_meta), len(uboxes))})
+                    # 2026-09-22（2块地优化）：缺箱不再此处登记——统一由下方
+                    # ‘V段数与箱数不一致’一条登记（含谷底明细），避免同单元双条
+                    # 重复（实测 band2 14 项里 7 组是同一句话的复制）。
                     break
                 bx = uboxes[si]
                 dev = round(abs(bx[1] - sm['v底y']), 1)
@@ -998,12 +997,20 @@ def main():
                                 '说明': '楼层 %s 在米数列无对应标注行，本方法结果中不得出现（见 coverage_rules.md「V型计算」）' % fl})
 
             if len(seg_meta) != len(uboxes):
+                _vbx_note = ('V段 %d 个（谷底 %s）/ 箱 %d 个（%s）'
+                             % (len(seg_meta), [s['v底楼层'] for s in seg_meta],
+                                len(uboxes), [b[2] for b in uboxes]))
+                if not uboxes:
+                    # 2026-09-22（2块地优化）：窗口内零箱号锚是图纸固有分离
+                    # （箱编号在布线图区、系统图在另一区，无几何关联，见 pipeline
+                    # gate 既定处置），不是“箱丢了”。V 段仅输出覆盖楼层线索，
+                    # 箱配对见 parse 侧坐标关联。仍列待裁决、不静默放行。
+                    _vbx_note += ('；窗口内无箱号锚（箱编号在布线图区，属图纸固有分离；'
+                                  'V段仅输出覆盖线索，箱配对见parse侧）')
                 result['需人工裁决'].append({
                     '对象': '%s %d单元' % (bkey, ui + 1),
                     '事项': 'V段数与箱数不一致',
-                    '说明': 'V段 %d 个（谷底 %s）/ 箱 %d 个（%s）'
-                            % (len(seg_meta), [s['v底楼层'] for s in seg_meta],
-                               len(uboxes), [b[2] for b in uboxes])})
+                    '说明': _vbx_note})
 
             binfo['单元']['%d单元' % (ui + 1)] = unit
 
@@ -1103,7 +1110,7 @@ def main():
                 _fxl = _json.load(_fp)
         except Exception as _ex:                                        # noqa: BLE001
             log.error("无法读取 --fx-locations %s: %s", args.fx_locations, _ex)
-            sys.exit(1)
+            sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
         _loc_idx = {}
         for _e in _fxl.get('唯一箱位') or []:
             _loc_idx.setdefault((_e['楼栋'], _e['单元']), set()).add(_e['安装层'])
@@ -1200,6 +1207,34 @@ def main():
     result['需人工裁决'] = _dedup
     if len(_dedup) != len(_raw_pend):
         print('  · 待裁决清单去重：%d → %d 项（重复项已合并）' % (len(_raw_pend), len(_dedup)))
+
+    # ---- 同形态告警合并（2026-09-26，一百零二·评估项 7，成立才修 → 成立）----
+    #   「窗口内无箱号锚」形态：箱编号在布线图区、V 窗口内恒无箱号锚 —— 图纸固有分离，
+    #   同一根因（覆盖零产出，已由 inspect C6 FAIL 拦下）在 N 个单元逐条透传同文案
+    #   （8 带合计 50+ 条），信息增量为零且淹没真告警（如箱位锚超邻域剔除）。
+    #   合并为图级汇总 1 条 + 单元明细（信息不丢）：「对象」用**列表**承载全部单元对象串 ——
+    #   pending_items_from_rulings / judge_pending_scope 原生支持列表对象（逐个匹配），
+    #   故下方各单元 result_confirmation=pending 判定逐字不变；inspect C7 透传只计 1 项。
+    #   只合本形态（事项 == 'V段数与箱数不一致' 且说明含 '窗口内无箱号锚'），其余待裁决逐字保留；
+    #   仅 1 条时不成组、不合并（行为与旧版一致）。
+    _anchor_items = [x for x in result['需人工裁决']
+                     if isinstance(x, dict) and x.get('事项') == 'V段数与箱数不一致'
+                     and '窗口内无箱号锚' in str(x.get('说明') or '')]
+    if len(_anchor_items) >= 2:
+        _anchor_ids = {id(x) for x in _anchor_items}
+        _rest = [x for x in result['需人工裁决'] if id(x) not in _anchor_ids]
+        _merged = {
+            '对象': [x.get('对象') for x in _anchor_items],
+            '事项': 'V段数与箱数不一致',
+            '说明': ('%d 个单元命中同形态：窗口内无箱号锚（箱编号在布线图区，属图纸固有分离；'
+                     'V段仅输出覆盖线索，箱配对见parse侧）—— 同形态根因（覆盖零产出）已由 C6 拦下；'
+                     '各单元 V 段/谷底明细见「单元明细」。' % len(_anchor_items)),
+            '单元明细': [{'对象': x.get('对象'), '说明': x.get('说明')}
+                         for x in _anchor_items],
+        }
+        result['需人工裁决'] = _rest + [_merged]
+        print('  · 同形态告警合并：%d 条「窗口内无箱号锚」→ 图级汇总 1 条（单元明细 %d 个）'
+              % (len(_anchor_items), len(_anchor_items)))
 
     _dg_concl = (result.get('自检_偏差门禁') or {}).get('结论')
     _dg_ok = (_dg_concl == '可信')

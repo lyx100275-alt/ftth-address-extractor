@@ -144,11 +144,12 @@ for _arg, _pat, _rex, _need, _eg in (
     if _arg == "--cable-pattern" and _rex is not None and "?P<meters" in (_pat or ""):
         continue
     if _rex is not None and _rex.groups < _need:
-        raise SystemExit(
+        sys.stderr.write(
             f"[参数自检] {_arg} 本脚本解析期需要至少 {_need} 个捕获组，"
             f"当前 pattern 只有 {_rex.groups} 个: {_pat!r}\n"
             f"  正确形态{_eg}\n"
-            f"  （2026-09-16 实测：无捕获组编译通过、rc=0 假象，到解析期才 IndexError 裸崩）")
+            f"  （2026-09-16 实测：无捕获组编译通过、rc=0 假象，到解析期才 IndexError 裸崩）\n")
+        sys.exit(2)  # 2026-09-25（opencode 三审 SystemExit 家族清查）：参数类错误 rc=1 → rc=2
 
 
 # ---------- 皮线米数标注：写法谱（2026-09-18）----------
@@ -253,11 +254,18 @@ if args.probe:
         insert_blocks_seen[bname] = insert_blocks_seen.get(bname, 0) + 1
     if insert_blocks_seen:
         log.info("\n== INSERT 块统计 ==")
+        # 2026-09-26（一百零二·评估项 8，成立 → 修，附带真 bug）：
+        #   ① 去重：匿名块（*D…）常共享同一 ATTDEF（如 tag=A text=HDD），原实现每块打
+        #      一遍相同行（云峰实测 445 行同一句）—— 首见打印、重复折叠计数，首见信息不丢；
+        #   ② 顺手修 stale 变量：原实现用 `bname`（上一个 for 循环的遗留 = 最后一个 INSERT
+        #      的块名）查块定义，而非本轮循环变量 `bn` —— N 个不同块打的全是同一个块的
+        #      定义，各块自己的定义反而一次没出现。改查 `bn`（纯探查输出，不影响任何产物）。
+        _seen_attdef = {}  # attdef内容 -> 重复折叠次数
         for bn, cnt in sorted(insert_blocks_seen.items(), key=lambda x: -x[1]):
             log.info(f"  {bn}: {cnt} 个")
             # 读取块定义中的 ATTDEF 和子实体
             try:
-                block = doc.blocks.get(bname)
+                block = doc.blocks.get(bn)
                 if block:
                     attdefs = []
                     for sub in block:
@@ -268,9 +276,17 @@ if args.probe:
                             if txt:
                                 attdefs.append(f"{sub.dxftype()}={txt}")
                     if attdefs:
-                        log.info(f"    块定义: {', '.join(attdefs)}")
+                        _key = ", ".join(attdefs)
+                        if _key in _seen_attdef:
+                            _seen_attdef[_key] += 1
+                        else:
+                            _seen_attdef[_key] = 0
+                            log.info(f"    块定义: {_key}")
             except Exception as _ex:
-                log.debug("读取块 %s 的块定义失败，已跳过块内明细: %s", bname, _ex)
+                log.debug("读取块 %s 的块定义失败，已跳过块内明细: %s", bn, _ex)
+        _folded = sum(_seen_attdef.values())
+        if _folded:
+            log.info(f"    （另有 {_folded} 个块的块定义与上文相同，已折叠不重复打印）")
         # 统计 INSERT 实例的 ATTRIB 属性值
         log.info("\n== INSERT 实例 ATTRIB 属性样例（前20个） ==")
         shown = 0
@@ -716,7 +732,7 @@ except MultiPlotDuplicateAnchorError as _e:
 
 if not bldg_anchors:
     log.error("未匹配到楼栋标题，请检查 --title-pattern / --text-layer，或先运行 --probe")
-    sys.exit(1)
+    sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
 
 anchor_xs = sorted([(k, v["x"]) for k, v in bldg_anchors.items()], key=lambda x: x[1])
 anchor_y_map = {k: v.get("y", 0) for k, v in bldg_anchors.items()}
@@ -1344,11 +1360,11 @@ if args.fx_map:
             _raw = json.load(_f)
     except (IOError, json.JSONDecodeError) as e:
         log.error("无法读取 --fx-map %s: %s" % (args.fx_map, e))
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
     _entries = _raw.get("FX映射表") if isinstance(_raw, dict) else _raw
     if not isinstance(_entries, list):
         log.error("--fx-map 格式不对：顶层应含「FX映射表」数组（确认是 extract_fx_map.py 产物）")
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 审核）：同上
     for _e in _entries:
         if isinstance(_e, dict) and _e.get("编号"):
             FX_MAP.setdefault(str(_e["编号"]).strip(), []).append(_e)
@@ -1380,11 +1396,11 @@ if args.bldg_map:
             _raw2 = json.load(_f)
     except (IOError, json.JSONDecodeError) as e:
         log.error("无法读取 --bldg-map %s: %s" % (args.bldg_map, e))
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
     _entries2 = _raw2.get("FX映射表") if isinstance(_raw2, dict) else _raw2
     if not isinstance(_entries2, list):
         log.error("--bldg-map 格式不对：顶层应含「FX映射表」数组（确认是 extract_fx_map.py 产物）")
-        sys.exit(1)
+        sys.exit(2)  # 2026-09-25（opencode 审核）：同上
     for _e2 in _entries2:
         if isinstance(_e2, dict) and _e2.get("编号"):
             BDG_MAP.setdefault(str(_e2["编号"]).strip(), []).append(_e2)
@@ -1448,13 +1464,19 @@ if _DESC_EVID:
         log.info("图上箱位直写证据：采纳 %d 个编号（A′ 箱位描述 / B′ 单元标注；"
                  "对照表已覆盖者不重复采纳）" % len(_DESC_ADDED))
         if _bdgmap_meta is None:
-            # 未传 --bldg-map 时该容器为 None，但下面「改派条数」等记账会用到它 ——
+            # 未传 --bldg-map 时该容器为 None，但下面「改派文字实例数/改派箱数」等记账会用到它 ——
             #   自证来源同样是一次「对照表式」归属，故补建容器并写明来源，留痕可追溯。
             _bdgmap_meta = {"来源": "图上箱位直写自证（本图未传 --bldg-map）",
                             "文件": None, "条目数": len(_DESC_ADDED),
                             "唯一编号": len(_DESC_ADDED), "重号编号": []}
     # 注意：此处不告警 —— 判据不足的编号多数已由「系统图几何归属」正常入楼，
     #   只有在产物「未归属分纤箱」里仍存在的才算真待裁决（见下方产物段过滤）。
+# 2026-09-26（一百零二，问题 4）：BDG_MAP 有两个填充源 —— ① --bldg-map 文件
+#   （extract_fx_map.py 产物，总图对照表，仅 present 时）；② 图上箱位直写证据
+#   （build_fx_direct_evidence，直写自证，absent 时）。② 只补 ① 未覆盖的编号
+#   （见上 `if _no_d in BDG_MAP: continue`），故两源编号集合互斥 —— 本集合即
+#   「直写源」的判据，下游逐箱标签据此区分（来源/依据来源/口径不得硬编码成对照表）。
+_DESC_ADDED_SET = set(_DESC_ADDED)
 
 # ---------- --bldg-map 改派：把 FX 文字挂到对照表给定的楼栋/单元 ----------
 # 必须在楼栋循环之前完成。改派对象是**文字本身**：先在每栋文字里摘出有对照表映射的
@@ -1533,6 +1555,7 @@ PENDING_NOTES = []       # parse 侧「需人工裁决」登记（透传进产�
 _FX_ENTRY = {}           # {(编号, round(x,2))} -> 该实例配对到的对照表条目（重号实例专用）
 BDGMAP_DUP_MATCHED = []  # 重号按坐标配对成功的留痕
 FX_DROPPED_DUP = []      # 重号编号中「与任何对照表实例都配不上坐标」的文字实例（不产出箱）
+SHARED_CLONE_PRUNED = []  # 共享系统图克隆来的零箱单元容器被剪的留痕（2026-09-23）
 
 
 BDGMAP_NO_UNIT = set()  # 条目的「单元」字段取不出单元号（退回楼栋级容器，登记交人）
@@ -1548,6 +1571,7 @@ if BDG_MAP:
         for _t0 in bldg_texts[_b0]:
             _owner[id(_t0)] = _b0          # 记录原归属，用于留痕与移除
     _moved = 0
+    _moved_nos = set()  # 2026-09-26（一百零二，问题 6）：改派的不同编号数（箱数口径）
     _claimed = set()
     for _t in texts:
         _m = FX_RE.search(_t["内容"]) if FX_RE else None
@@ -1616,24 +1640,34 @@ if BDG_MAP:
         _FX_ENTRY[(_no, round(_t["x"], 2))] = _cand[0]
         _claimed.add(id(_t))
         _moved += 1
+        _moved_nos.add(_no)
         _old = _owner.get(id(_t))
         if _old != _tb:
             # 「(不在任何楼栋x区间)」这一情形正是本类图纸的特征，留痕备查。
             #   单元位写**图上单元原文**（取不到号时注明），不得写成已归一的目标容器名
             #   —— 目标容器要到楼栋循环里才可能与图上单元轴对上，此处还不是结论。
-            BDGMAP_MOVED.append("%s: %s -> %s/%s"
-                                % (_no, _old or "(不在任何楼栋x区间)", _tb,
+            # 2026-09-26（一百零二，问题 6）：每条留痕补实例坐标 —— 同一编号在图上
+            #   有多处文字实例（GCD_HC×2 + TEL_TEXT×1 等）时，不带坐标看不出 47 条是
+            #   「同编号多实例」还是「多个不同箱」。
+            BDGMAP_MOVED.append("%s@(%.1f,%.1f): %s -> %s/%s"
+                                % (_no, _t["x"], _t["y"],
+                                   _old or "(不在任何楼栋x区间)", _tb,
                                    _tu_raw or "(单元字段为空→待定)"))
     if _claimed:                              # 从原楼栋摘除，避免重复计数
         for _b0 in list(bldg_texts.keys()):
             bldg_texts[_b0] = [_t0 for _t0 in bldg_texts[_b0]
                                if id(_t0) not in _claimed]
-    log.info("--bldg-map 改派：%d 个 FX 文字按对照表归属（跨栋/跨区 %d 个）；重号未改派 %d 个"
-             % (_moved, len(BDGMAP_MOVED), len(set(BDGMAP_SKIP_DUP))))
+    log.info("--bldg-map 改派：%d 个 FX 文字实例（%d 个编号）按对照表归属"
+             "（跨栋/跨区 %d 条）；重号未改派 %d 个"
+             % (_moved, len(_moved_nos), len(BDGMAP_MOVED), len(set(BDGMAP_SKIP_DUP))))
     if BDGMAP_UNRESOLVED:
         log.warning("--bldg-map 有 %d 个编号的对照表楼栋值解析不到本图锚点（这些箱保持原归属）：%s"
                     % (len(BDGMAP_UNRESOLVED), "；".join(BDGMAP_UNRESOLVED[:5])))
-    _bdgmap_meta["改派条数"] = _moved
+    # 2026-09-26（一百零二，问题 6）：旧「改派条数」是文字实例级计数（同编号多处
+    #   文字实例各计一条），与「分纤箱提取状态: N箱」并列会误读成 N 个箱被改派 ——
+    #   拆成两个显式字段，语义不再含糊（旧键删除；tests 无引用，见一百零二记录）。
+    _bdgmap_meta["改派文字实例数"] = _moved
+    _bdgmap_meta["改派箱数"] = len(_moved_nos)
     _bdgmap_meta["跨栋改派"] = BDGMAP_MOVED
     _bdgmap_meta["重号未改派"] = sorted(set(BDGMAP_SKIP_DUP))
     _bdgmap_meta["楼栋值未解析"] = BDGMAP_UNRESOLVED
@@ -1742,6 +1776,11 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
                 _eu_raw = str(_ent1.get("单元") or "").strip()
                 if _eu_raw and _eu_raw != str(_ent1.get("楼栋") or "").strip():
                     fx["图上单元"] = _eu_raw
+            _fx_no = str(fx.get("编号", "")).strip()
+            # 2026-09-26（一百零二，问题 4）：安装楼层值取 _ent1（数值语义不动），
+            #   但标签必须按实际填充源区分 —— 直写源（_DESC_ADDED_SET）标箱位直写，
+            #   文件源（--bldg-map 总图对照表）维持现标签（云峰 present 路径逐字不变）。
+            _ent1_is_direct = _fx_no in _DESC_ADDED_SET
             if _ent1 and _ent1.get("安装楼层"):
                 fx["区间法参考值"] = fl_name
                 # 非有限距离（本单元无可用楼层行时 assign_floor_by_interval 返回 inf）
@@ -1751,17 +1790,27 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
                                     if isinstance(dist, (int, float)) and math.isfinite(dist)
                                     else None)
                 fx["安装楼层"] = _ent1["安装楼层"]
-                fx["安装楼层口径"] = ("口径A′:对照表内该编号实例坐标配对（图上直写）"
-                                    if _ent1_is_dup else "口径A:图上直写（总图对照表）")
-                fx["安装楼层来源"] = "fxmap对照表"
+                if _ent1_is_direct:
+                    fx["安装楼层口径"] = ("口径A′:图上箱位直写标注（编号实例坐标配对）"
+                                        if _ent1_is_dup else "口径A′:图上箱位直写标注（编号唯一映射）")
+                    fx["安装楼层来源"] = "箱位直写标注（fx_locations）"
+                else:
+                    fx["安装楼层口径"] = ("口径A′:对照表内该编号实例坐标配对（图上直写）"
+                                        if _ent1_is_dup else "口径A:图上直写（总图对照表）")
+                    fx["安装楼层来源"] = "fxmap对照表"
                 fx["安装楼层误差"] = 0.0
                 # ---- 结果状态契约（v3.1 L1-C8）产出方落地 ----
                 # 对照表实例坐标配对（唯一命中）+ 非空安装楼层 = 客观判据 ⇒ measured + settled
                 fx["result_origin"] = "measured"
                 fx["result_confirmation"] = "settled"
-                fx["依据来源"] = ("E-DXF-TEXT:总图对照表（图上直写安装楼层，编号实例坐标配对）"
-                                if _ent1_is_dup else
-                                "E-DXF-TEXT:总图对照表（图上直写安装楼层，编号唯一映射）")
+                if _ent1_is_direct:
+                    fx["依据来源"] = ("E-DXF-TEXT:图上箱位直写标注（N号楼M单元K层，编号实例坐标配对）"
+                                    if _ent1_is_dup else
+                                    "E-DXF-TEXT:图上箱位直写标注（N号楼M单元K层，编号唯一映射）")
+                else:
+                    fx["依据来源"] = ("E-DXF-TEXT:总图对照表（图上直写安装楼层，编号实例坐标配对）"
+                                    if _ent1_is_dup else
+                                    "E-DXF-TEXT:总图对照表（图上直写安装楼层，编号唯一映射）")
             else:
                 # 2026-09-18（P0）：对照表内该编号有**多个**实例（重号）而本文字实例与任一
                 #   实例都配不上坐标 ⇒ 归属无客观判据。此时**不得**退回「几何 x 区间 +
@@ -1800,7 +1849,13 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
                 _x_in_range = bool(_br and _br[0] <= fx.get("x", 0) <= _br[1])
                 fx["result_confirmation"] = ("settled" if (_bm_unique or _x_in_range)
                                              else "pending")
+                # 2026-09-26（一百零二，问题 4）：_bm_unique 的映射可能来自直写源
+                #   （B′ 级：只到单元、安装层走区间法，正落本分支）—— 此时依据来源
+                #   不得写「总图对照表」。判定逻辑（settled/pending）与数值一律不动。
+                _bm_is_direct = _bm_unique and (_fx_no in _DESC_ADDED_SET)
                 fx["依据来源"] = (
+                    "E-DXF-TEXT:图上箱位直写标注（仅楼栋/单元，安装层走区间法，归属已定案）"
+                    if _bm_is_direct else
                     "E-DXF-TEXT:总图对照表（编号唯一映射，归属已定案）" if _bm_unique else
                     ("E-DXF-GEOM:系统图内几何归属（编号文字在本栋 x 区间内）" if _x_in_range else
                      "未对照总图、且编号文字不在本栋 x 区间内 —— 归属待裁决"))
@@ -1913,6 +1968,55 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
         if others:
             result["楼栋"][bldg]["单元"][uname]["其它"] = others
 
+    # ---------- 共享克隆单元容器剪枝（2026-09-23 新增） ----------
+    # 根因：一张系统图服务多栋时（标题原文如 `4-6号楼综合布线系统图`），单元轴按标题
+    #   克隆给组内**每一栋**（见上方「共享区间」一节）；而箱标注是**逐栋自证**的
+    #   （图上直写 `4号楼1单元…`）。当组内某栋的箱全部落在 `1单元`、而克隆来的单元轴
+    #   另有 `2单元` 时，该栋就多出一个**零箱**的 `2单元` 容器 —— 单元数虚高，
+    #   inspect C10 把「图签=1 / 系统图=2」报成**图面矛盾**（实测柳辛庄 band3 的
+    #   4#/5#/6# 三栋全中；人工按矛盾去查图必然查不到：图签与箱标注都写着 1 单元）。
+    # 判据（属**测量**，不是对图面含义的推断）：本栋箱的 `图上单元` 是图上直写的自证，
+    #   其单元号集合 S 即该栋「有箱证据」的单元集；零箱且号 ∉ S 的容器 = 克隆残留。
+    # 三条约束（任一不满足即不剪，宁留不改）：
+    #   ① 只对**共享区间内**的楼栋启用（非共享图不存在克隆）；
+    #   ② 本栋每个箱都必须取到可解析的单元号（否则 S 不完整，宁可保留）；
+    #   ③ 逐条登记进「需人工裁决」与专列，绝不静默删 —— 属「不进成品/可回滚⇒
+    #      取安全侧＋标记」，与「未裁决值不得进入成品」不冲突（被剪的是零箱容器）。
+    _shared_names = set()
+    for _ss in (_shared_src or []):
+        _shared_names.update(_ss.get("names") or [])
+    if bldg in _shared_names and result["楼栋"][bldg].get("单元"):
+        _ev_nums, _no_num = set(), 0
+        for _uv2 in result["楼栋"][bldg]["单元"].values():
+            for _fx2 in (_uv2.get("分纤箱") or []):
+                _n2 = unit_num(_fx2.get("图上单元"))
+                if _n2 is None:
+                    _no_num += 1
+                else:
+                    _ev_nums.add(_n2)
+        _prune = [un for un, uv in result["楼栋"][bldg]["单元"].items()
+                  if not (uv.get("分纤箱") or [])
+                  and unit_num(un) is not None and unit_num(un) not in _ev_nums]
+        if _ev_nums and _no_num == 0 and _prune:
+            for _un_p in _prune:
+                result["楼栋"][bldg]["单元"].pop(_un_p)
+            _item = {
+                "对象": "%s（%s/%s）" % (bldg, titles[0] if titles else "?",
+                                      "、".join(_prune)),
+                "事项": "共享系统图的单元轴克隆残留：%s 个零箱单元容器不计入本栋单元数"
+                        % len(_prune),
+                "说明": "本栋箱自证的单元号 = %s（来自图上直写的 `图上单元`）；"
+                        "被剪容器 = %s（箱数 0）。共享组 = %s —— 克隆判据见产物"
+                        "「楼栋边界/共享区间」。**属安全侧处置、可回滚**，如认为该单元"
+                        "确实存在（只是本图未画箱），请人工恢复。"
+                        % (sorted(_ev_nums), _prune, "、".join(sorted(_shared_names))),
+            }
+            SHARED_CLONE_PRUNED.append(_item)
+            PENDING_NOTES.append({"对象": _item["对象"], "事项": _item["事项"],
+                                  "说明": _item["说明"]})
+            log.warning("  [共享克隆剪枝] %s：%s 不在本栋箱自证单元集 %s 内且零箱 → 不计入"
+                        % (bldg, _prune, sorted(_ev_nums)))
+
 # ---------- 未归属分纤箱：禁止静默丢文字（2026-09-18 新增） ----------
 # 根因：箱编号文字的归属走「对照表认领 → 各楼栋单元桶」两条路。两条都不成立的文字
 #   （对照表无此编号 / 编号重号未择一 / 对照表条目楼栋值为空）会留在原桶；而本类图纸
@@ -1999,6 +2103,16 @@ if FX_DEDUP:
         "收敛条数": len(FX_DEDUP), "收敛清单": FX_DEDUP}
     log.info("分纤箱按编号收敛：%d 条（同编号多实例 → 单箱）" % len(FX_DEDUP))
 
+if SHARED_CLONE_PRUNED:
+    result["共享克隆单元剪枝"] = {
+        "说明": "共享系统图（一图多栋）的单元轴是按标题克隆给组内每一栋的；本栋箱标注"
+                "（图上直写 `图上单元`）未出现、且箱数为 0 的克隆容器不计入本栋单元数。"
+                "属安全侧处置、可回滚：如认为该单元确实存在（只是本图未画箱），"
+                "请人工恢复并在此登记后方可取用。",
+        "剪枝条数": len(SHARED_CLONE_PRUNED), "清单": SHARED_CLONE_PRUNED}
+    log.info("共享克隆单元剪枝：%d 条（零箱且不在本栋箱自证单元集内）"
+             % len(SHARED_CLONE_PRUNED))
+
 if _UNPAIRED or FX_DROPPED_DUP:
     result["未配对编号实例"] = {
         "说明": "这些编号已定归属，但图上还有同号的其它文字实例未与本编号的对照表条目配对"
@@ -2038,7 +2152,7 @@ if _bdgmap_meta:
     _bdgmap_meta["单元名并存"] = BDGMAP_NAMEMISS
     _bdgmap_meta["重号按坐标配对"] = BDGMAP_DUP_MATCHED
     result["BDGMAP归属"] = _bdgmap_meta
-    log.info("--bldg-map 归属结果：跨栋改派 %d；重号按坐标配对 %d；重号未配对 %d；单元名并存 %d"
+    log.info("--bldg-map 归属结果：跨栋改派 %d 条（文字实例级）；重号按坐标配对 %d；重号未配对 %d；单元名并存 %d"
              % (len(BDGMAP_MOVED), len(BDGMAP_DUP_MATCHED),
                 len(set(BDGMAP_SKIP_DUP)), len(BDGMAP_NAMEMISS)))
 

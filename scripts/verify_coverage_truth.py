@@ -20,6 +20,9 @@
     --col-floor 八级        楼层列（默认「八级」）
     --col-door 九级         户号列（默认「九级」，仅用于计数校验）
     --json-key 覆盖范围线索 覆盖JSON里存放线索的键（默认「覆盖范围线索」）
+    --fx-prefix 前缀        定稿表分纤箱列统一前缀（可选，与 gen --fx-prefix 对称；
+                              如 gen 出表时加了「绿城凤鸣朝阳」，反查须传同一前缀；
+                              比对前对表列值剥前缀再全等匹配；未传时行为不变）
 
 退出码：
     0 = 全部一致；2 = 存在不一致或无法比对；1 = 输入/解析错误。
@@ -94,6 +97,10 @@ def main():
     ap.add_argument("--col-floor", default="八级")
     ap.add_argument("--col-door", default="九级")
     ap.add_argument("--json-key", default="覆盖范围线索")
+    ap.add_argument("--fx-prefix", default=None,
+                    help="定稿表分纤箱列统一前缀（可选，与 gen --fx-prefix 对称）："
+                         "比对前对表列值剥前缀（startswith 才剥）再全等匹配；"
+                         "未传时行为不变。")
     args = ap.parse_args()
 
     wb = openpyxl.load_workbook(args.xlsx, data_only=True)
@@ -101,7 +108,7 @@ def main():
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         print("标准地址表为空")
-        return 1
+        return 2  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
     header = [("" if c is None else str(c).strip()) for c in rows[0]]
 
     def colidx(name):
@@ -119,22 +126,33 @@ def main():
     missing = [k for k, v in ci.items() if v is None]
     if missing:
         print(f"标准地址表缺少列：{missing}（表头：{header}）")
-        return 1
+        return 2  # 2026-09-25（opencode 审核）：输入类错误按 L1-C2 应为 rc=2
 
     # 真值聚合：分纤箱 → {楼层整数: 户数}
+    # 2026-09-26（一百零五·问题 14）：与 gen --fx-prefix 对称 —— 定稿表 P 列若带
+    #   统一前缀（如「绿城凤鸣朝阳FL01-FX01」），而 coverage 线索为裸编号
+    #   （如「FL01-FX01」），须先剥前缀再全等匹配，否则 17/17 全失配。
+    #   语义与 gen 侧 _with_fx_prefix 镜像：startswith 才剥、空串前缀等于未传；
+    #   空值/空白/「未分配」天然不匹配前缀、不受影响。未传时行为逐字不变。
+    _fx_prefix = (args.fx_prefix.strip() if isinstance(args.fx_prefix, str) else "") or ""
     truth = OrderedDict()
     n_rows = 0
+    n_stripped = 0
     for r in rows[1:]:
         if not r or r[ci["box"]] in (None, ""):
             continue
         box = str(r[ci["box"]]).strip()
+        if _fx_prefix and box.startswith(_fx_prefix):
+            box = box[len(_fx_prefix):]
+            n_stripped += 1
         fl = norm_floor(r[ci["floor"]])
         n_rows += 1
         d = truth.setdefault(box, {"楼栋": str(r[ci["bldg"]] or ""), "单元": str(r[ci["unit"]] or ""),
                                    "楼层": OrderedDict(), "户数": 0})
         d["楼层"][fl] = d["楼层"].get(fl, 0) + 1
         d["户数"] += 1
-    print(f"真值：{n_rows} 户 / {len(truth)} 个分纤箱")
+    print(f"真值：{n_rows} 户 / {len(truth)} 个分纤箱"
+          + (f"（--fx-prefix {args.fx_prefix!r} 剥离 {n_stripped} 行）" if _fx_prefix else ""))
 
     cov = json.load(open(args.json, encoding="utf-8"))
     got = {}   # box -> (楼栋, 单元, 覆盖集合, 来源)
@@ -175,6 +193,35 @@ def main():
     extra = [b for b in got if b not in truth]
     if extra:
         print("\n线索里有真值表没有的箱：%s" % extra)
+    # 2026-09-26（一百零五·问题 14）：前缀形态下「线索里有真值表没有的箱」是误导
+    #   方向 —— 真实成因是表列带前缀与线索裸编号形态不匹配（以为表缺箱，实际是
+    #   编号形态对不上）。未传 --fx-prefix 且全部行失配时，检测表列是否为
+    #   「公共前缀 + 线索编号」形态：是则优先提示用 --fx-prefix 重跑；只提示、
+    #   不自动剥（多小区合并表自动剥有误配风险）。退出码语义不变。
+    if not _fx_prefix and truth and got and len(bad) == len(truth):
+        _clues_by_len = sorted(got, key=len, reverse=True)  # 长串优先，防短串误配
+        _pfx = None
+        _hit = 0
+        for _tb in truth:
+            for _cb in _clues_by_len:
+                if len(_tb) > len(_cb) and _tb.endswith(_cb):
+                    _hit += 1
+                    _p = _tb[:len(_tb) - len(_cb)]
+                    if _pfx is None:
+                        _pfx = _p
+                    elif _pfx != _p:
+                        _pfx = False  # 各行前缀不一致，无统一前缀
+                    break
+        if _hit and isinstance(_pfx, str) and _pfx:
+            print("\n提示：真值表分纤箱列疑似带统一前缀（%d/%d 行剥离 %r 后恰为线索裸编号），"
+                  "与覆盖线索编号形态不匹配，可用 --fx-prefix %r 重跑。"
+                  "（不自动剥离：多小区合并表有误配风险。）"
+                  % (_hit, len(truth), _pfx, _pfx))
+        elif _hit:
+            print("\n提示：真值表分纤箱列疑似带前缀（%d/%d 行为某线索编号加前缀形态），"
+                  "与覆盖线索裸编号形态不匹配；确认前缀后用 --fx-prefix <前缀> 重跑。"
+                  "（不自动剥离：多小区合并表有误配风险。）"
+                  % (_hit, len(truth)))
     print("\n合计：一致 %d / 不一致 %d / 总计 %d"
           % (len(truth) - len(bad), len(bad), len(truth)))
     return 0 if not bad else 2

@@ -1,3 +1,14 @@
+---
+AIGC:
+  ContentProducer: '001191110102MAD55U9H0F10002'
+  ContentPropagator: '001191110102MAD55U9H0F10002'
+  Label: '1'
+  ProduceID: '6f604bf3-5665-460e-8d72-4e1d93064a09'
+  PropagateID: '6f604bf3-5665-460e-8d72-4e1d93064a09'
+  ReservedCode1: 'b81b7b6f-0de8-40d3-81e8-9a86a1fb910a'
+  ReservedCode2: 'b81b7b6f-0de8-40d3-81e8-9a86a1fb910a'
+---
+
 # 流水线细则：脚本行为、参数细节与实现背景
 
 > **本文件是什么**：SKILL.md 「Step 1b: 结构化解析」的**细则层** —— 脚本行为、参数细节、实现背景与实测案例。SKILL.md 只保留**协议与硬约束**（要点式）。
@@ -11,7 +22,7 @@
 
 ## 1. `ftth.py` 统一入口
 
-调度 `pipeline` / `probe` / `plan` / `parse` / `coverage` / `coverage-vshape` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box` / `gen` 等子命令；**`ftth.py pipeline` 一条命令串跑 `geom → probe → plan → parse → coverage → inspect`（只解析、不出表，实测 38.7s → 18.4s）**；参数三级优先：命令行显式 > `--config` > 脚本默认值。
+调度 `pipeline` / `probe` / `plan` / `parse` / `coverage` / `coverage-vshape` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box` / `gen` 等子命令；**`ftth.py pipeline` 一条命令串跑 `geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → count_box → inspect`（只解析、不出表，实测 38.7s → 18.4s）**；参数三级优先：命令行显式 > `--config` > 脚本默认值。
 
 子命令清单、依赖矩阵、可抄示例、`--config` 机制、批量编排 `ftth_batch.py` 见 `references/scripts_reference.md`。**口径**：`count` = 皮线计数法；`count-box` = 家居配线箱图标法（旧名 `count-hdd`），两者同属区间法口径；`extract_fx_map.py` / `read_titleblock_households.py` / `gen_9level_addressbook.py` 为直调脚本。
 
@@ -61,7 +72,7 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 2. 对照表的「楼栋」字段可能带单元后缀（`N#楼M单元`）而本图锚点名不含单元，实现须做前缀解析后再匹配，否则含后缀的条目会被整批丢弃；
 3. 改派循环的数据源必须是**全图文字**而非按楼栋切好的子集 —— 后者的"丢失物"本就不在其中，从它里面找必然 0 命中。
 
-**产物**：写 `BDGMAP归属` 段（改派条数 / 跨栋改派清单 / 重号未改派 / 单元名并存）与顶层 `分纤箱提取状态`（0 箱时显式标注"须核是否总图对照表形态"）。
+**产物**：写 `BDGMAP归属` 段（改派文字实例数 / 改派箱数 / 跨栋改派清单·每条带实例坐标 / 重号未改派 / 单元名并存）与顶层 `分纤箱提取状态`（0 箱时显式标注"须核是否总图对照表形态"）。旧 `改派条数` 为文字实例级计数（一百零二起拆分为两字段，不再使用）。
 
 **无对照表图纸（absent）**：箱的楼栋 / 单元 / 安装楼层归属由**方法池**（区间法：编号文字 / 箱符号落楼层带；读取标注：图上直写）测定并逐箱写出依据，交人工复核 —— 不引入 y 坐标关联推算作来源。
 
@@ -73,7 +84,9 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 
 **安装楼层口径因此共 3 个取值**：`口径A:图上直写`（本楼系统图内直写）、`口径A:图上直写（总图对照表）`（对照表直写、跨图区）、`口径B:区间法`（本楼系统图楼层带区间法）—— 输出中必须原样标注用的是哪一个。
 
-**注意**：对照表值本质仍是「图上标注直读」来源，只有存在真实集中总图（present）时才可用；absent 时无此口径，安装楼层只能由四法测出。
+**双源标签区分（一百零二）**：`BDG_MAP` 有两个填充源 —— ① `--bldg-map` 文件（extract_fx_map.py 产物，总图对照表，仅 present 时）；② 图上箱位直写证据（build_fx_direct_evidence，直写自证，absent 时补①未覆盖的编号）。逐箱标签**按实际填充源区分**：① 走现标签（`fxmap对照表` / `E-DXF-TEXT:总图对照表…`）；② 标 `箱位直写标注（fx_locations）` / `E-DXF-TEXT:图上箱位直写标注（N号楼M单元K层，…）`、口径 `口径A′:图上箱位直写标注（…）`。B′ 级（只到单元、安装层走区间法）落在区间分支时，依据来源标直写、不标对照表。数值语义（安装楼层值/误差/result 字段）不受影响，只修标签。
+
+**注意**：对照表值本质仍是「图上标注直读」来源；absent 时无对照表口径，但图上箱位直写证据（A′/B′，见 operations_discipline.md §五·补分档）仍可产出 settled 安装楼层 —— 标签须如上指向直写源，不得指向不存在的 fxmap.json。
 
 ## 10. `inspect --fx-pattern` 产物自描述
 
@@ -85,7 +98,7 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 
 ## 11. `ftth.py pipeline` 阶段顺序为什么固定
 
-`geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → inspect`，`--stop-at` 的 choices 与之一致（**由 `ftth.py` 的 `_PIPE_STAGES` 单一定义**，本节仅为说明 —— 两者不一致时以代码为准并改本节）。
+`geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → count_box → inspect`，`--stop-at` 的 choices 与之一致（**由 `ftth.py` 的 `_PIPE_STAGES` 单一定义**，本节仅为说明 —— 两者不一致时以代码为准并改本节）。
 
 `fxmap` 必须在 `parse` **之前** —— 依据硬约束 ②，parse 与 coverage 都需要总图对照表来定楼栋 / 单元归属；排在其后会变成"先用被明文禁止的方法切完、再拿正确数据去补 coverage"，parse 侧永远 0 箱（实测 C0/C2/C3/C4/C6 全 FAIL）。同一份对照表在 parse（`--bldg-map` + `--fx-map`）与 coverage（`--bldg-map`）两处复用，**一份数据、两处同源**，避免各取各的。
 
@@ -184,14 +197,15 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 > 外移原因：`scripts_reference.md` 达 48,915 B、距硬上限仅剩 85 B（`ftth.py budget` 二次信号）。
 > 本节原文逐字搬入（2026-09-17 立）；依赖矩阵/可抄示例仍在 `scripts_reference.md`。
 
-一条命令串跑 `geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → inspect`（以 `ftth.py` 的 `_PIPE_STAGES` 为准）。各阶段以子进程直调 `ftth.py`，
-**不再经 `ftth.cmd` / `_launch.py`**，固定启动开销只付一次。
+一条命令串跑 `geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → count_box → inspect`（以 `ftth.py` 的 `_PIPE_STAGES` 为准）。各阶段以子进程直调 `ftth.py`，
+**不再经启动器 `ftth_launcher.py`**，固定启动开销只付一次。
 
 ```bat
 ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项目目录>"
 ```
 
-**为什么要它（实测依据，非设计偏好）**：经 `ftth.cmd` 逐条调用时，**每条命令**都要固定付一份启动开销 ——
+**为什么要它（实测依据，非设计偏好）**：经启动器逐条直调时，**每条命令**都要固定付一份启动开销 ——
+（以下为旧 `ftth.cmd` 启动器实测数据，2026-09-17 立；新版 `ftth_launcher.py` 已合并 cmd+_launch 两层，数值只会更低，定性结论不变）
 `cmd` 批处理 0.78s + 探测 `-c "import ezdxf"` 1.93s（裸解释器 0.62s ＋ import ezdxf 1.31s）
 + `_launch.py` 1.13s + 调度层 `ftth.py` 0.65s ≈ **3.7s/条**，与图纸大小无关。
 实测某图 6 个阶段逐条调用 **38.74s** → 本命令 **18.37s**（冷缓存 24.99s）。
@@ -202,9 +216,9 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
 | `--outdir` | **必需** | 产物目录；各阶段用固定文件名落在此处（`config.json` / `profile.json` / `titleblock.json` / `fxmap.json` / `fx_locations.json` / `unit_box_gaps.json` / `parsed.json` / `coverage.json` / `inspect.json`），**之后仍可单条命令接着跑，或重跑其中一段** |
 | `--project-dir` | 建议 | 透传给 `plan`，用于检测《楼宇信息采集表》。**不传会让 `intake_table` 留 `unknown`** |
 | `--profile` | 可选 | 复用指定画像；默认 `<outdir>/profile.json` |
-| `--stop-at` | 可选 | 跑到该阶段为止（`geom` / `probe` / `plan` / `titleblock` / `fxmap` / `fx_locations` / `unit_gaps` / `parse` / `coverage` / `inspect`，默认 `inspect`）；分阶段调试用 |
+| `--stop-at` | 可选 | 跑到该阶段为止（`geom` / `probe` / `plan` / `titleblock` / `fxmap` / `fx_locations` / `unit_gaps` / `parse` / `coverage` / `count_box` / `inspect`，默认 `inspect`）；分阶段调试用 |
 | `--reuse-geom` | 可选 | 几何缓存比 DXF 新时直接复用，不重跑 `dump_geom` |
-| `--quiet` | 可选 | 各阶段输出写 `<outdir>/logs/<阶段>.log`，不刷屏 |
+| `--quiet` | 可选 | 各阶段输出写 `<outdir>/logs/<阶段>.log`，不刷屏；ftth.py 自身阶段级输出（跳过原因/既定处置/告警）同步 tee 写 `<outdir>/logs/pipeline.log`（一百零二起恒落盘，quiet 与否一致） |
 
 > **`titleblock` 阶段 + 图层参数按子命令分派**（2026-09-18 实跑新增/修复）——
 > 前者产出 C10 的输入（`read_titleblock_households.py` → `<outdir>/titleblock.json`），
@@ -223,3 +237,5 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
 - 耗时台账落 `<outdir>/pipeline_timing.json`（逐阶段 rc ＋ 秒数）—— **排障与优化都以它为准，不凭印象**。
 - **各阶段参数自洽**：`probe` 产物 `config.json` 同时作为 `--probe` 与 `--config` 传给 `plan`，
   再传给 `parse` / `coverage*`，与手工逐条调用等价；**校验口径不因走流水线而放宽**。
+
+> AI生成

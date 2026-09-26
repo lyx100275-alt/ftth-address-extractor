@@ -124,7 +124,7 @@ def main(argv=None):
 
     if not os.path.isfile(a.dxf):
         sys.stderr.write('[ERROR] 找不到 DXF 文件: %s\n' % a.dxf)
-        return 1
+        return 2  # 2026-09-25（opencode 三审）：输入类错误按 L1-C2 应为 rc=2
     try:
         by_layer = load_layer_texts(a.dxf, a.layer)
     except Exception as ex:                                        # noqa: BLE001
@@ -136,7 +136,7 @@ def main(argv=None):
         if a.layer not in by_layer:
             sys.stderr.write('[ERROR] 图层 %r 不存在或其中没有文字。可用图层：%s\n'
                              % (a.layer, '、'.join(sorted(by_layer)[:20])))
-            return 1
+            return 2  # 2026-09-25（opencode 三审）：输入类错误按 L1-C2 应为 rc=2
         texts = by_layer[a.layer]
         print('[图层] 指定 %s，文字 %d 条' % (a.layer, len(texts)))
     else:
