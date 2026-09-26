@@ -16,6 +16,21 @@ AIGC:
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
 > 归位记录（2026-09-17）：五十三~五十六 曾被追加到文件末尾且标题层级误为二级，已移至顶部并统一为三级；仅移动与改层级，正文逐字未动。
 
+### 2026-09-26（一百零八）：git 管理外移 + 技能目录瘦身（版本库独立管理）
+
+**动因**：技能目录内嵌 `.git/`（约 5.15 MB / 312 个文件，占技能体积约 40%），且上架打包时被平台裁剪成残缺仓库（缺 HEAD/config/index，git 无法识别，仅剩 objects/refs/logs），版本管理在技能目录里既膨胀又不可用。
+
+**改动**：
+
+| # | 问题 | 改动 | 文件 |
+|---|---|---|---|
+| 1 | 技能目录携带残缺 `.git`（约 5.15 MB），上架打包须排除 | **git 管理整体外移**：`.git/`（残缺）、`.gitattributes`、`.gitignore`、`scripts/.gitignore` 全部移出技能目录（入回收站）；技能目录只保留运行文件，体量 13.00 MB/435 文件 → **7.72 MB/120 文件**（净减 5.28 MB） | 技能目录根 / `scripts/` |
+| 2 | 版本历史真源缺失（0.90.1 后 0.91~0.107 变更从未提交） | **版本库迁移**：`.backup` 中的完整仓库（31 个提交、含 0.65~0.90 全部历史、远程 `git@github.com:lyx100275-alt/ftth-address-extractor.git`）迁移至工作空间 `技能版本库/ftth-address-extractor/`；当前 0.107.0 全部内容同步入库并提交为基线（`fc84a74`，tag `v0.107.0`）；`.gitignore` 补 `*.geom.json` 忽略（规则置于 `!tests/**` 之后才生效） | 工作区 `技能版本库/ftth-address-extractor/` |
+| 3 | 技能目录不再有 git 后，如何维护版本 | 新增独立「版本管理」技能 `skill-version-manager` 统一驱动提交/打 tag/查看 diff；README 新增「版本管理（git）」章节，说明版本库位置与同步流程 | `README.md` |
+| 4 | 版本号口径 | `version.json` 0.107.0 → **0.108.0**（对应本条目「一百零八」），`skill_version_basis` 注明 git 外置事实 | `version.json` |
+
+**验证**：版本库 `git status` 干净、`git log` 完整（0.65.0 → 0.107.0 基线 + 修正提交）；技能目录 `Test-Path` 确认 `.git`/`.gitattributes`/`.gitignore`/`scripts/.gitignore` 均不存在；`ftth.py budget` 与冒烟不受影响（技能脚本未改动，仅目录结构与文档变更）。
+
 ### 2026-09-26（一百零七）：merge_json 冲突来源可溯源 + 跨轮一致性扫描（多带合并链路 1 主修 + 1 评估）
 
 **实测动因**：一百零六的冲突即停在柳辛庄 8 带合跑中发现来源标识只记 basename——8 输入全叫 `parsed.json`，`merged_v2_conflict.json` 里 `conflicts["1#楼"]` 7 个元素来源全是 `"parsed.json"`，控制台 FAIL 行与 `--allow-overwrite` WARNING 行同样无法区分哪一带，「冲突即停交人裁决」的溯源价值被削弱。

@@ -73,7 +73,7 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
 | 路径 | 说明 |
 |---|---|
 | `SKILL.md` | 唯一权威协议（流程 / 状态机 / 硬约束），会话首屏加载 |
-| `scripts/` | 30 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`，公共模块 `scripts/ftth_common.py`。运行会在 `scripts/` 生成 `.interpreter_cache.json`（解释器探测缓存，已加入 `scripts/.gitignore` 忽略；可安全删除，删除后下次启动重探一次；上架打包前建议手动清理） |
+| `scripts/` | 30 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`，公共模块 `scripts/ftth_common.py`。运行会在 `scripts/` 生成 `.interpreter_cache.json`（解释器探测缓存，由版本库 `.gitignore` 忽略，不入库；可安全删除，删除后下次启动重探一次；上架打包前建议手动清理） |
 | `references/` | 细则文档（参数表 / 覆盖规则 / 选法 / 图签协议 / 流水线细则 / 操作纪律…） |
 | `methods/` | 图纸类型方法（楼-簇 / 共享混合 / 图签主导）+ 信号定义 |
 | `assets/` | 标准地址表模板 xlsx |
@@ -83,8 +83,19 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
 
 ## 版本
 
-`version.json`：`minor` = 修订序号（当前 0.98.0＝九十八），`major` 固定 0、
+`version.json`：`minor` = 修订序号（当前 0.108.0＝一百零八），`major` 固定 0、
 对外发布时由人工提升；不采用未经验证的语义化版本号。GitHub tag 与 release
 只在人工确认后打。
+
+## 版本管理（git）
+
+- **git 仓库不随技能目录携带**（技能目录只含运行文件）：完整历史与版本管理
+  位于工作空间 `技能版本库/ftth-address-extractor/`（远程
+  `git@github.com:lyx100275-alt/ftth-address-extractor.git`，本地分支领先
+  远程时为未推送变更）。
+- 提交 / 打 tag / 查看 diff 等操作由「版本管理」技能（skill-version-manager）统一
+  驱动，不手工在技能目录里 `git init`。
+- 技能内容变更后：把技能目录文件同步进版本库工作区 → `git add -A` → 按
+  `SKILL_CHANGELOG.md` 序号提交 → 需要时打 tag。
 
 > AI生成
