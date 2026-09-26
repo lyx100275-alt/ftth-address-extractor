@@ -59,13 +59,15 @@ python "$SK\scripts\ftth_launcher.py" pipeline --dxf $D --outdir $T --project-di
 
 ```bat
 python "$SK\scripts\ftth_launcher.py" budget                                   rem 体量闸门
-<python> tests\run_smoke.py [--with-dxf]                          rem T0-T13 冒烟
+<python> tests\run_smoke.py [--with-dxf] [--corpus <语料dxf>]      rem T0-T13 冒烟
 ```
 
 - 体量纪律：`SKILL.md` 与 `references/*.md` 单文件预警线 47,000 B / 硬上限
   49,000 B / 宿主截断 51,200 B，阈值唯一来源是 `version.json` 的 `budget` 段。
 - 冒烟：T0 全仓编译 / T1 单一源守卫 / T2 注册=分发对账 / T3 纯函数 / T4 闸门 /
-  T5 真语料 probe（需 ezdxf，加 `--with-dxf`）/ T6 出表链黄金路径（含 gen，需 openpyxl）/
+  T5 真语料 probe（需 ezdxf + 语料，加 `--with-dxf`；语料已外置版本库
+  `tests/corpus/`，可用 `--corpus <路径>` 或环境变量 `FTTH_TEST_DXF` 指定，缺失自动 SKIP）/
+  T6 出表链黄金路径（含 gen，需 openpyxl）/
   T7~T13 格组认领/多栋合并/偏置优势闸等图签格组回归（详见 `tests/run_smoke.py`）。
 
 ## 目录

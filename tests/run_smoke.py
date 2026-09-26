@@ -2,13 +2,16 @@
 """包内冒烟自检（stdlib 为主；T5 语料 DXF 需 ezdxf，缺则 SKIP）。
 
 用法::
-    python tests/run_smoke.py [--with-dxf]
+    python tests/run_smoke.py [--with-dxf] [--corpus <dxf路径>]
+
+    语料 DXF 已移出技能目录（版本库 tests/corpus/ 保留）：
+    --corpus 参数 > 环境变量 FTTH_TEST_DXF > 内置路径，均缺失则 T5 自动 SKIP。
 
 T1 单一源守卫：_txt_fields 恰 1 份实现；无本地 bldg_num 重复定义（同名异义防线）
 T2 注册面=分发面：ftth.py 每个 add_parser 的子命令在分发段有分支（差集 ∅）
 T3 纯函数语义：bldg_num / bldg_num_or_none / _txt_fields 两态出口
 T4 体量闸门：ftth.py budget rc=0
-T5 语料冒烟（可选）：tests/corpus/a小区.dxf probe rc=0
+T5 语料冒烟（可选）：语料 DXF probe rc=0（语料缺失自动 SKIP）
 T0 全仓编译：scripts/*.py py_compile 全过（语法级）
 T6 出表链黄金路径（合成料，无需 DXF/ezdxf）：assemble 组装（全名单元键+中文单元+共享克隆）
     → apply-ruling 改数 → gen 出表；专杀 2026-09-19 双 P0（assemble NameError、
@@ -111,7 +114,7 @@ check('T0 全仓 py_compile', not _bad, '; '.join(_bad[:3]))
 r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'budget'], capture_output=True, text=True, encoding='utf-8', errors='replace')
 check('T4 budget rc=0', r.returncode == 0, 'rc=%s' % r.returncode)
 
-# T5 语料冒烟（可选，需 ezdxf）
+# T5 语料冒烟（可选，需 ezdxf + 语料；语料缺失自动 SKIP，不阻断）
 if '--with-dxf' in sys.argv:
     try:
         import ezdxf  # noqa: F401
@@ -119,16 +122,29 @@ if '--with-dxf' in sys.argv:
     except ImportError:
         HAS = False
     if HAS:
-        dxf = os.path.join(HERE, 'corpus', 'a小区.dxf')
-        with tempfile.TemporaryDirectory() as td:
-            out = os.path.join(td, 'probe.json')
-            r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'probe', '--dxf', dxf, '--out', out],
-                               capture_output=True, text=True, encoding='utf-8', errors='replace')
-            ok = r.returncode == 0 and os.path.exists(out)
-            check('T5 语料 probe rc=0', ok, 'rc=%s' % r.returncode)
-            if ok:
-                d = __import__('json').load(io.open(out, encoding='utf-8'))
-                check('T5 probe 产物含建议参数', 'suggested_params' in d or 'signals' in d or len(d) > 0)
+        # 语料 DXF 已移出技能目录（版本库 tests/corpus/ 保留）：
+        # 解析顺序 --corpus 参数 > 环境变量 FTTH_TEST_DXF > 技能目录内置路径
+        dxf = None
+        if '--corpus' in sys.argv:
+            _i = sys.argv.index('--corpus')
+            if _i + 1 < len(sys.argv):
+                dxf = sys.argv[_i + 1]
+        if dxf is None:
+            dxf = os.environ.get('FTTH_TEST_DXF')
+        if dxf is None:
+            dxf = os.path.join(HERE, 'corpus', 'a小区.dxf')
+        if not os.path.exists(dxf):
+            print('[SKIP] T5（语料缺失: %s；已外置到版本库 tests/corpus/，可用 --corpus 或 FTTH_TEST_DXF 指定）' % dxf)
+        else:
+            with tempfile.TemporaryDirectory() as td:
+                out = os.path.join(td, 'probe.json')
+                r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'probe', '--dxf', dxf, '--out', out],
+                                   capture_output=True, text=True, encoding='utf-8', errors='replace')
+                ok = r.returncode == 0 and os.path.exists(out)
+                check('T5 语料 probe rc=0', ok, 'rc=%s' % r.returncode)
+                if ok:
+                    d = __import__('json').load(io.open(out, encoding='utf-8'))
+                    check('T5 probe 产物含建议参数', 'suggested_params' in d or 'signals' in d or len(d) > 0)
     else:
         print('[SKIP] T5（缺 ezdxf）')
 
