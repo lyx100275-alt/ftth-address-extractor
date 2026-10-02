@@ -60,21 +60,27 @@ python "$SK\scripts\ftth_launcher.py" pipeline --dxf $D --outdir $T --project-di
 
 ```bat
 python "$SK\scripts\ftth_launcher.py" budget                                   rem 体量闸门
-<python> tests\run_smoke.py [--with-dxf] [--corpus <语料dxf>]      rem T0~T22 冒烟（无 T16/T21，历史编号缺口）
+<python> tests\run_smoke.py [--with-dxf] [--corpus <语料dxf>] [--regen-golden]   rem T0~T22 冒烟（无 T16/T21，历史编号缺口；--with-dxf 仅 T5 用，T14/T17 默认即跑）
 ```
 
 - 体量纪律：`SKILL.md` 与 `references/*.md` 单文件预警线 47,000 B / 硬上限
   49,000 B / 宿主截断 51,200 B，阈值唯一来源是 `version.json` 的 `budget` 段。
-- 冒烟：T0 全仓编译 / T1 单一源守卫（含 T1b 归一委托锁）/ T2 注册=分发对账 /
-  T3 纯函数 / T4 闸门（含 T4b 文档一致性 `check_docs.py`）/
+- 冒烟：T0 全仓编译 / T1 单一源守卫（含 T1b 权威实现锁：归一委托 + run_c9 /
+  hu_mult_of / sanitize_nonfinite / build_scale_anchors / merge_pending_items /
+  write_json 有且仅有一份实现）/ T2 注册=分发对账 /
+  T3 纯函数 / T4 闸门（含 T4b 文档一致性 `check_docs.py`、T4c 契约落地门禁
+  `check_contract_coverage.py`、T4d 迁移门禁判据 #6、T4e 调用链 C7 门禁
+  `check_launch_path.py`）/
   T5 真语料 probe（需 ezdxf + 语料，加 `--with-dxf`；语料已外置版本库
   `tests/corpus/`，可用 `--corpus <路径>` 或环境变量 `FTTH_TEST_DXF` 指定，缺失自动 SKIP）/
   T6 出表链黄金路径（含 gen，需 openpyxl）/
   T7~T13 格组认领/多栋合并/偏置优势闸等图签格组回归（详见 `tests/run_smoke.py`）/
-  T14 三图 golden 回归（需 `--with-dxf` + 桌面三图齐备，缺图自动 SKIP；
-  基线 `tests/golden_expected.json`）/
+  T14 三图 golden 回归（**默认即跑**，不再需要 `--with-dxf`；缺图自动 SKIP；
+  基线 `tests/golden_expected.json` 只能由 `--regen-golden` 重生，手工改 json
+  无任何机制能察觉——故禁止手改）/
   T15 台账确定性（`FTTH_FIXED_TIME` 冻结时钟后同序列写入逐位一致）/
-  T17 产物契约门（需本轮 T14 产物：`check_contracts.py` 锁 L1-C8 词汇封闭）/
+  T17 产物契约门（随 T14 默认执行：`check_contracts.py` 锁 L1-C8 词汇封闭；
+  T17b 调用链形状覆盖：真图产物全部纳入 C7 核对，漏配即 FAIL）/
   T18 冲突矩阵回归（`tests/run_conflict_matrix.py`，覆盖来源状态机闭环，
   **纯函数级、不需 DXF 语料**，任何时候都能跑）/
   T19~T22 出口门禁负向测试（无闭合/陈旧闭合/pending覆盖直达 gen 必须 FAIL）。
@@ -84,17 +90,17 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
 | 路径 | 说明 |
 |---|---|
 | `SKILL.md` | 唯一权威协议（流程 / 状态机 / 硬约束），会话首屏加载 |
-| `scripts/` | 43 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`，公共模块 `scripts/ftth_common.py`（命名归一域已抽取为 `scripts/ftth_naming.py`，由前者 re-export，调用方零改动；归属纯函数已抽取为 `scripts/attribution_engine.py`；V 谷底统一证据为 `scripts/coverage_engine.py`；写法谱/楼层分类为 `scripts/floor_engine.py`）。运行会在 `scripts/` 生成 `.interpreter_cache.json`（解释器探测缓存，由版本库 `.gitignore` 忽略，不入库；可安全删除，删除后下次启动重探一次；上架打包前建议手动清理） |
+| `scripts/` | 43 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`（16 子命令），公共模块 `scripts/ftth_common.py`。分层引擎：命名归一 `ftth_naming.py`（由前者 re-export，调用方零改动）、归属 `attribution_engine.py`、V 谷底统一证据 `coverage_engine.py`、写法谱/楼层/分单元 `floor_engine.py`、事实提取 `dxf_extract.py`、箱证据 `evidence_builder.py`、冲突议题 `conflict_engine.py`（inspect 只剩门禁登记与展示）。门禁三件套：`check_docs.py`（文档一致 D1~D12）/ `check_contract_coverage.py`（契约落地登记双向对拍）/ `check_transitions.py`（迁移门禁）/ `check_launch_path.py`（C7 调用链：启动器置 `FTTH_VIA_LAUNCHER`，产物带 `_via_launcher` 标记）；状态 `ledger_state.py`（`state-set`/`state-get` 落 `状态.json`，只记位置不裁决）。运行会在 `scripts/` 生成 `.interpreter_cache.json`（解释器探测缓存，由版本库 `.gitignore` 忽略，不入库；可安全删除，删除后下次启动重探一次；上架打包前建议手动清理） |
 | `references/` | 细则文档（参数表 / 覆盖规则 / 选法 / 图签协议 / 流水线细则 / 操作纪律…） |
 | `methods/` | 图纸类型方法（楼-簇 / 共享混合 / 图签主导）+ 信号定义 |
 | `assets/` | 标准地址表模板 xlsx |
-| `tests/` | `run_smoke.py` + 语料 `corpus/a小区.dxf` |
-| `SKILL_CHANGELOG.md` | 完整修订记录（中文序号，追加放顶部） |
-| `version.json` | 版本号 + 台账 schema 标识 + 体量阈值（minor 位 = 修订序号） |
+| `tests/` | `run_smoke.py`（T0~T22，缺 T16/T21 历史编号缺口）+ `run_conflict_matrix.py` + `golden_expected.json`（T14 基线，只可 `--regen-golden` 重生）+ `README.md`（语料外置说明）。测试语料 DXF 自 0.109.0 起**不随技能目录携带**，位于版本库 `tests/corpus/`（代号 `a小区`/`b小区`，无真实项目信息），缺料自动 SKIP |
+| `SKILL_CHANGELOG.md` | 完整修订记录（中文序号，追加放顶部）+ `changelog/` 归档（每 40 条一片，`part01~04` + 说明） |
+| `version.json` | 版本号 + 台账 schema 标识 + 体量阈值（minor 位 = 修订序号）+ 契约落地登记 `contract_coverage`（L1 每条契约登记产出方/检查器/coverage；**新增/改动 L1 契约必须同刻登记，否则 `check_contract_coverage.py` 判 rc=2**） |
 
 ## 版本
 
-`version.json`：`minor` = 修订序号（当前 0.108.0＝一百零八），`major` 固定 0、
+`version.json`：`minor` = 修订序号（当前 0.147.0＝一百四十七），`major` 固定 0、
 对外发布时由人工提升；不采用未经验证的语义化版本号。GitHub tag 与 release
 只在人工确认后打。
 

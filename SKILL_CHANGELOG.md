@@ -15,6 +15,18 @@ AIGC:
 > 追加规则：新条目加在**本文件顶部**（本说明之后、最新条目之前），编号沿用 SKILL.md 的序号体系。
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
 
+### 2026-10-02（一百四十八）：README 追补 —— 门禁现状与目录表与 0.147 对齐
+
+**动因**：README（给人看的入口）多处停在 0.108 时代：版本号、T14/T17 门禁口径、tests 语料位置；T4c/T4d/T4e/T17b 四项新门禁与分层引擎无处可查。纯文档追补，零代码改动。
+| # | 改动 | 文件 |
+|---|---|---|
+| 一 | 版本号 0.108.0 → 0.147.0（一百四十七） | `README.md` |
+| 二 | 冒烟说明刷新：T1b 权威实现锁全表、T4c/T4d/T4e、T14 默认即跑 + `--regen-golden` 唯一重生口、`--with-dxf` 仅 T5 用、T17b 形状覆盖 | `README.md` |
+| 三 | 目录表刷新：scripts 43 引擎清单补全（dxf_extract/evidence_builder/conflict_engine/门禁件/ledger_state）、tests 去外置语料改 golden+矩阵+说明、`changelog/` 归档行、`version.json` 行补 contract_coverage 登记义务 | `README.md` |
+
+**验证**：`check_docs` D1~D12 ALL PASS（D7/D9 链接零断链）；`budget` rc=0；`check_contract_coverage` rc=0。代码零改动，smoke 不重跑（上一轮 0.147.0 全绿即本轮代码基线）。
+- **版本**：`version.json` 0.147.0 → **0.148.0**
+
 ### 2026-10-02（一百四十七）：P2-2 第二组 —— 待裁决后处理抽为 merge_pending_items
 
 **动因**：`analyze_coverage_vshape.py` main 仍逾 1200 行。第一组（尺度锚）已验证“抽取锁真图回归”的做法有效，本轮抽第二组。
