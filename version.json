@@ -1,7 +1,7 @@
 {
   "skill": "ftth-address-extractor",
     "skill_version": "0.145.0",
-  "skill_version_basis": "minor 位 = SKILL_CHANGELOG 修订序号（0.143.0 对应「一百四十三」；0.142.0 对应「一百四十二」）；patch 位对应同一修订序号内的「·补」条目；major 位固定 0，待对外发布时由人工提升。不采用未经验证的语义化版本号，避免出现无据可查的版本事实。git 管理自一百零八起外置（技能目录不再携带 .git，版本库位于工作空间技能版本库）；一百零九起测试语料同样外置版本库（T5 支持 --corpus/FTTH_TEST_DXF，缺料自动 SKIP）",
+  "skill_version_basis": "minor 位 = SKILL_CHANGELOG 修订序号（0.143.0 对应「一百四十三」；0.142.0 对应「一百四十二」）；patch 位对应同一修订序号内的「·补」条目；major 位固定 0，待对外发布时由人工提升。不采用未经验证的语义化版本号，避免出现无据可查的版本事实。git 管理自一百零八起外置（技能目录不携带 .git，版本库为独立 git 仓库。**一百四十五实测：该版本库此前根本不存在**，151 条修订无任何 diff 能力；现已建立并入库、打 tag v0.145.0）；一百零九起测试语料同样外置版本库（T5 支持 --corpus/FTTH_TEST_DXF，缺料自动 SKIP）",
   "versioning_since": "2026-09-18",
   "versioning_purpose": "使技能包输出可复现、可回滚、可 diff。此前追溯只能靠 SKILL_CHANGELOG 的中文修订序号，且真源不在任何版本控制下。",
 
@@ -122,6 +122,6 @@
     "result_fields": "脚本产物须带 result_origin / result_confirmation 两字段（L1-C8），并由 inspect_closure.py C9 校验闭合。",
     "state_carrier": "跨阶段状态由三本台账承载（理解快照 / 裁决台账 / 别名台账）+ **一个当前态字段**（`状态.json`，schema 见 schema_version.session_state）。当前态只由 scripts/ledger_state.py state-set/state-get 读写；**状态机定义仍在 SKILL.md，节点枚举唯一权威 = ledger_state.py 的 STATES**（check_docs.py D11 与文档图双向对拍）。迁移门禁由 scripts/check_transitions.py 核对（禁止迁移 6 条，含判据 #6 申报态与证据对拍）。",
     "contract_coverage": "契约落地登记见本文件 contract_coverage 段；执行方 = scripts/check_contract_coverage.py，登记对拍的轻量版在 scripts/check_docs.py D10。**新增/改动 SKILL.md「L1 契约」必须同刻登记**，漏登判 rc=2。",
-    "changelog": "SKILL_CHANGELOG.md（完整修订记录，中文序号追溯）"
+    "changelog": "SKILL_CHANGELOG.md（保留最近 20 条）+ changelog/part01~04（历史条目，每 40 条一份，2026-10-02 起归档）。**中文序号是追溯的唯一依据**（本文件 minor 位即序号）；跨文件检索按序号，不要按日期。归档目录由 check_docs.py D9 豁免：其正文含正则字面量会被链接正则误判，且冻结副本不得改写。"
   }
 }
