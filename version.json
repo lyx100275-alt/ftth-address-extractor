@@ -1,6 +1,6 @@
 {
   "skill": "ftth-address-extractor",
-    "skill_version": "0.146.0",
+    "skill_version": "0.147.0",
   "skill_version_basis": "minor 位 = SKILL_CHANGELOG 修订序号（0.143.0 对应「一百四十三」；0.142.0 对应「一百四十二」）；patch 位对应同一修订序号内的「·补」条目；major 位固定 0，待对外发布时由人工提升。不采用未经验证的语义化版本号，避免出现无据可查的版本事实。git 管理自一百零八起外置（技能目录不携带 .git，版本库为独立 git 仓库。**一百四十五实测：该版本库此前根本不存在**，151 条修订无任何 diff 能力；现已建立并入库、打 tag v0.145.0）；一百零九起测试语料同样外置版本库（T5 支持 --corpus/FTTH_TEST_DXF，缺料自动 SKIP）",
   "versioning_since": "2026-09-18",
   "versioning_purpose": "使技能包输出可复现、可回滚、可 diff。此前追溯只能靠 SKILL_CHANGELOG 的中文修订序号，且真源不在任何版本控制下。",

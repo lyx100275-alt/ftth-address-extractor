@@ -471,6 +471,62 @@ def build_scale_anchors(args, texts, log, is_floor, cbre):
     return hmed, col_tol, hmed_any, fl_step, fl_why, fl_col_tol, box_tol, note
 
 
+def merge_pending_items(result):
+    """待裁决后处理：去重 + 同形态合并（就地改 result['需人工裁决']）。
+
+    2026-10-02（P2-2 第二组）从 main() 抽出。本块只碰 result['需人工裁决']，
+    依赖仅 json + print，无 main() 局部量、无提前退出 ——
+    抽取无 NameError/语义漂移风险类问题（第一组 CBRE 教训见 build_scale_anchors）。
+    行为不变：去重按内容 key 保序；合并仅「V段数与箱数不一致」+
+    「窗口内无箱号锚」且 >= 2 条时成组，单条不成组；console 文案逐字保留。
+    """
+    # ---- 待裁决清单去重（2026-09-18 实跑修复，P1）----
+    #   同一 (对象, 事项) 会在多个判据分支下被重复 append：实测某图 18 项里有 8 项
+    #   是同一句话的复制（「V 段数多于箱数」与「V段数与箱数不一致」各出现两遍）。
+    #   重复项不改变数值，但把「待裁决 N 项」虚高、稀释人工注意力，也让人误以为
+    #   有更多独立疑点。按内容 key 保序去重（不排序 —— 保持判据产出顺序可追溯）。
+    _raw_pend = result.get('需人工裁决') or []
+    _seen_pend = set()
+    _dedup = []
+    for _x in _raw_pend:
+        _k = json.dumps(_x, ensure_ascii=False, sort_keys=True)
+        if _k in _seen_pend:
+            continue
+        _seen_pend.add(_k)
+        _dedup.append(_x)
+    result['需人工裁决'] = _dedup
+    if len(_dedup) != len(_raw_pend):
+        print('  · 待裁决清单去重：%d → %d 项（重复项已合并）' % (len(_raw_pend), len(_dedup)))
+
+    # ---- 同形态告警合并（2026-09-26，一百零二·评估项 7，成立才修 → 成立）----
+    #   「窗口内无箱号锚」形态：箱编号在布线图区、V 窗口内恒无箱号锚 —— 图纸固有分离，
+    #   同一根因（覆盖零产出，已由 inspect C6 FAIL 拦下）在 N 个单元逐条透传同文案
+    #   （8 带合计 50+ 条），信息增量为零且淹没真告警（如箱位锚超邻域剔除）。
+    #   合并为图级汇总 1 条 + 单元明细（信息不丢）：「对象」用**列表**承载全部单元对象串 ——
+    #   pending_items_from_rulings / judge_pending_scope 原生支持列表对象（逐个匹配），
+    #   故下方各单元 result_confirmation=pending 判定逐字不变；inspect C7 透传只计 1 项。
+    #   只合本形态（事项 == 'V段数与箱数不一致' 且说明含 '窗口内无箱号锚'），其余待裁决逐字保留；
+    #   仅 1 条时不成组、不合并（行为与旧版一致）。
+    _anchor_items = [x for x in result['需人工裁决']
+                     if isinstance(x, dict) and x.get('事项') == 'V段数与箱数不一致'
+                     and '窗口内无箱号锚' in str(x.get('说明') or '')]
+    if len(_anchor_items) >= 2:
+        _anchor_ids = {id(x) for x in _anchor_items}
+        _rest = [x for x in result['需人工裁决'] if id(x) not in _anchor_ids]
+        _merged = {
+            '对象': [x.get('对象') for x in _anchor_items],
+            '事项': 'V段数与箱数不一致',
+            '说明': ('%d 个单元命中同形态：窗口内无箱号锚（箱编号在布线图区，属图纸固有分离；'
+                     'V段仅输出覆盖线索，箱配对见parse侧）—— 同形态根因（覆盖零产出）已由 C6 拦下；'
+                     '各单元 V 段/谷底明细见「单元明细」。' % len(_anchor_items)),
+            '单元明细': [{'对象': x.get('对象'), '说明': x.get('说明')}
+                         for x in _anchor_items],
+        }
+        result['需人工裁决'] = _rest + [_merged]
+        print('  · 同形态告警合并：%d 条「窗口内无箱号锚」→ 图级汇总 1 条（单元明细 %d 个）'
+              % (len(_anchor_items), len(_anchor_items)))
+
+
 def main():
     ap = argparse.ArgumentParser(description='皮线 V 形覆盖判定（V型计算）')
     ap.add_argument('dxf', help='输入 DXF 文件路径')
@@ -1517,51 +1573,7 @@ def main():
     #   confirmation：本单元在「需人工裁决」中有条目、或偏差门禁判「不可信」⇒ pending
     #           （待裁决，禁止进成品，由 C9 拦下）；否则 settled。
     #           口径与 parse 侧一致：有客观依据（自检通过、几何归属成立）即可定案。
-    # ---- 待裁决清单去重（2026-09-18 实跑修复，P1）----
-    #   同一 (对象, 事项) 会在多个判据分支下被重复 append：实测某图 18 项里有 8 项
-    #   是同一句话的复制（「V 段数多于箱数」与「V段数与箱数不一致」各出现两遍）。
-    #   重复项不改变数值，但把「待裁决 N 项」虚高、稀释人工注意力，也让人误以为
-    #   有更多独立疑点。按内容 key 保序去重（不排序 —— 保持判据产出顺序可追溯）。
-    _raw_pend = result.get('需人工裁决') or []
-    _seen_pend = set()
-    _dedup = []
-    for _x in _raw_pend:
-        _k = json.dumps(_x, ensure_ascii=False, sort_keys=True)
-        if _k in _seen_pend:
-            continue
-        _seen_pend.add(_k)
-        _dedup.append(_x)
-    result['需人工裁决'] = _dedup
-    if len(_dedup) != len(_raw_pend):
-        print('  · 待裁决清单去重：%d → %d 项（重复项已合并）' % (len(_raw_pend), len(_dedup)))
-
-    # ---- 同形态告警合并（2026-09-26，一百零二·评估项 7，成立才修 → 成立）----
-    #   「窗口内无箱号锚」形态：箱编号在布线图区、V 窗口内恒无箱号锚 —— 图纸固有分离，
-    #   同一根因（覆盖零产出，已由 inspect C6 FAIL 拦下）在 N 个单元逐条透传同文案
-    #   （8 带合计 50+ 条），信息增量为零且淹没真告警（如箱位锚超邻域剔除）。
-    #   合并为图级汇总 1 条 + 单元明细（信息不丢）：「对象」用**列表**承载全部单元对象串 ——
-    #   pending_items_from_rulings / judge_pending_scope 原生支持列表对象（逐个匹配），
-    #   故下方各单元 result_confirmation=pending 判定逐字不变；inspect C7 透传只计 1 项。
-    #   只合本形态（事项 == 'V段数与箱数不一致' 且说明含 '窗口内无箱号锚'），其余待裁决逐字保留；
-    #   仅 1 条时不成组、不合并（行为与旧版一致）。
-    _anchor_items = [x for x in result['需人工裁决']
-                     if isinstance(x, dict) and x.get('事项') == 'V段数与箱数不一致'
-                     and '窗口内无箱号锚' in str(x.get('说明') or '')]
-    if len(_anchor_items) >= 2:
-        _anchor_ids = {id(x) for x in _anchor_items}
-        _rest = [x for x in result['需人工裁决'] if id(x) not in _anchor_ids]
-        _merged = {
-            '对象': [x.get('对象') for x in _anchor_items],
-            '事项': 'V段数与箱数不一致',
-            '说明': ('%d 个单元命中同形态：窗口内无箱号锚（箱编号在布线图区，属图纸固有分离；'
-                     'V段仅输出覆盖线索，箱配对见parse侧）—— 同形态根因（覆盖零产出）已由 C6 拦下；'
-                     '各单元 V 段/谷底明细见「单元明细」。' % len(_anchor_items)),
-            '单元明细': [{'对象': x.get('对象'), '说明': x.get('说明')}
-                         for x in _anchor_items],
-        }
-        result['需人工裁决'] = _rest + [_merged]
-        print('  · 同形态告警合并：%d 条「窗口内无箱号锚」→ 图级汇总 1 条（单元明细 %d 个）'
-              % (len(_anchor_items), len(_anchor_items)))
+    merge_pending_items(result)
 
     _dg_concl = (result.get('自检_偏差门禁') or {}).get('结论')
     _dg_ok = (_dg_concl == '可信')

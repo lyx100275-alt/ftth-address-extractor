@@ -134,6 +134,9 @@ _single = {'def unit_num(': 'ftth_naming.py', 'def bldg_num(': 'ftth_naming.py',
            #   main() 拆出的第一块（1245 行）。抽取时曾真发生 CBRE 漏传 NameError，
            #   此处锁住它只此一份，防日后有人在 main 里重写一份。
            'def build_scale_anchors(': 'analyze_coverage_vshape.py',
+           # 2026-10-02（一百四十七）第二块：merge_pending_items（待裁决去重+同形态合并，
+           #   C8 产出方第一段）。只碰 result['需人工裁决']，无 main 局部依赖。
+           'def merge_pending_items(': 'analyze_coverage_vshape.py',
            'def write_json(': 'ftth_common.py'}
 _single_bad = []
 for sig, owner in _single.items():

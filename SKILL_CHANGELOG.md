@@ -15,6 +15,18 @@ AIGC:
 > 追加规则：新条目加在**本文件顶部**（本说明之后、最新条目之前），编号沿用 SKILL.md 的序号体系。
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
 
+### 2026-10-02（一百四十七）：P2-2 第二组 —— 待裁决后处理抽为 merge_pending_items
+
+**动因**：`analyze_coverage_vshape.py` main 仍逾 1200 行。第一组（尺度锚）已验证“抽取锁真图回归”的做法有效，本轮抽第二组。
+| # | 改动 | 文件 |
+|---|---|---|
+| 一 | 新顶层函数 `merge_pending_items(result)`：待裁决去重（内容 key 保序）+ 同形态合并（仅「V段数与箱数不一致」+「窗口内无箱号锚」≥2 条成组）。块内 45 行逐字节搬移（脚本核对一致），只碰 `result['需人工裁决']`，依赖仅 `json` + `print`、无 main 局部量、无提前退出；main 内原址改为单行调用 | `scripts/analyze_coverage_vshape.py` |
+| 二 | T1b 补锁 `merge_pending_items`（单一实现核对，防 main 内重写第二份） | `tests/run_smoke.py` |
+
+**验证**：`py_compile` 全仓 0 错；`check_docs` D1~D12 ALL PASS（D8 43=43=43）；`budget` rc=0；`check_contract_coverage` rc=0；`run_conflict_matrix` ALL PASS；`run_smoke` ALL PASS（含 T1b 新锁、T14 三图 golden 默认回归全对拍一致 —— 抽取行为零漂移）。
+- **版本**：`version.json` 0.146.0 → **0.147.0**
+- **残留**：main 仍约 1200 行；C8 逐箱状态段（`_dg_ok`/`judge_pending_scope` 循环）与跨阶段对账段留待第三组（需 `args`/`log`，依赖形态不同，另开一轮）。
+
 ### 2026-10-02（一百四十六）：C7 登记翻转补齐 —— 契约 9/9 全 enforced + T1b 补锁
 
 **动因**：一百四十五 P2-4 落了 C7 转 enforced 的全部代码（`check_launch_path.py` + 启动器 `FTTH_VIA_LAUNCHER` + `write_json` 写 `_via_launcher` + T4e/T17b），但 `version.json` 登记与两处文档仍写 C7 `declared` —— 代码与登记不一致。本轮只翻登记、零代码改动。
