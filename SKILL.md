@@ -86,7 +86,14 @@ AIGC:
 
 ## L1 契约（全局唯一定义）
 
-> 本节是**跨步骤接口定义**；任何步骤提到下列契约一律指回本节，**禁重写副本**。新增/改动契约须登记 `version.json` 的 `contract_coverage`，漏登 rc=2（见 [operations_discipline.md](references/operations_discipline.md) §九·补）。
+> 本节是**跨步骤接口定义**；任何步骤提到下列契约一律指回本节，**禁重写副本**。新增/改动契约须登记 `version.json` 的 `contract_coverage`（漏登 rc=2，见 [operations_discipline.md](references/operations_discipline.md) §九·补）。
+
+**两档读法（2026-10-02 会审整改 P2-3）**：C1~C9 中 **`enforced` 的（有机器执行方）可以照着跑**；标 `declared` 的**只有文字纪律、没有检查器，靠自觉**。当前仅 C7 属后者。分档的机器真源是 `version.json` 的 `contract_coverage[*].coverage`，改档须改那里（改本文文字无效，门禁只认登记）。
+
+| 档 | 契约 | 执行方 |
+|---|---|---|
+| `enforced` | C1 C2 C3 C4 C5 C6 C8 C9 | 见各条「校验」行 / `contract_coverage` 登记 |
+| `declared` | **C7**（调用纪律） | **无** —— 解释器探测由启动器自身兜底，但「是否绕过启动器直调」机器判不了 |
 
 ### C1 输入契约：信号状态与选法
 
@@ -157,6 +164,8 @@ AIGC:
 > 24 列对照表见 [addressbook_template.md](references/addressbook_template.md) §回读校验与 AIGC 水印行；九级填写规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)。Step 2 门禁与 Step 4 实现均引用本条，**不再复述公式**。
 
 ### C7 调用契约：路径、解释器与命令纪律
+
+> **`declared` 档：以下四条无机器检查器，靠自觉**（唯一一条非 enforced 契约）。
 
 | 项 | 规则 |
 |---|---|
@@ -341,7 +350,7 @@ ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 
 #### Step 1b: 结构化解析
 
-探查确定参数后，用 ezdxf 提取全部 FTTH 信息。脚本清单与职责（42 个文件）见 [scripts_reference.md](references/scripts_reference.md) §脚本清单与职责，**调用一律走 `ftth_launcher.py` 启动器**（见 **L1-C7**）。
+探查确定参数后，用 ezdxf 提取全部 FTTH 信息。脚本清单与职责（43 个文件）见 [scripts_reference.md](references/scripts_reference.md) §脚本清单与职责，**调用一律走 `ftth_launcher.py` 启动器**（见 **L1-C7**）。
 
 **入口**：`ftth.py`（16 子命令：`pipeline`/`probe`/`plan`/`parse`/`coverage`/`coverage-vshape`/`inspect`/`assemble`/`apply-ruling`/`count`/`count-box`/`gen`/`budget`/`transitions`/`split-band`/`verify-truth`）；参数优先级：命令行显式>`--config`>默认。**`ftth.py pipeline` 串跑 11 阶段**（以 `_PIPE_STAGES` 为准，完整链见 [pipeline_details.md](references/pipeline_details.md) §11；只解析不出表）。**口径**：`count`=皮线计数法、`count-box`=家居配线箱图标法，同属区间法口径。
 

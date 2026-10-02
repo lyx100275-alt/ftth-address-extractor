@@ -108,6 +108,12 @@ def write_json(path, obj, encoding="utf-8", log=None, indent=2, ensure_ascii=Fal
 
     dump 前强制清洗非有限浮点为 `null`（见 `sanitize_nonfinite`）——
     保证产物是**标准 JSON**，任何语言的严格解析器都读得进来。
+
+    L1-C7 调用契约标记（2026-10-02）：经 `ftth_launcher.py` 派生的产物，顶层带
+    `_via_launcher: true`。这让「是否绕过启动器直调」从跨进程事实变成**产物上
+    可读的字段**，由 `scripts/check_launch_path.py` 核对。
+    刻意写**布尔真值**而非时间戳/路径：含变量的标记会让每次运行产物 md5 都变，
+    golden 回归（T14）将永久假红。业务代码若自行设置该键，本函数不覆盖。
     """
     import json
     _hits = []
@@ -115,6 +121,10 @@ def write_json(path, obj, encoding="utf-8", log=None, indent=2, ensure_ascii=Fal
     if _hits and log is not None:
         log.warning("产物含非有限浮点 %d 处，已清洗为 null：%s"
                     % (len(_hits), "、".join(_hits[:8])))
+    if (os.environ.get("FTTH_VIA_LAUNCHER")
+            and isinstance(obj, dict) and "_via_launcher" not in obj):
+        obj = dict(obj)
+        obj["_via_launcher"] = True
     ensure_parent(path, log=log)
     with open(path, "w", encoding=encoding) as f:
         json.dump(obj, f, ensure_ascii=ensure_ascii, indent=indent)

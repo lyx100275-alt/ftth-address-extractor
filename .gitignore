@@ -1,7 +1,11 @@
-byte-compiled / optimized / DLL files
+# 技能目录只放运行文件（L0-I6 维护约定）
+# 本目录由宿主程序管理、可能被整体清理且不进回收站 —— **不得在此留存备份**。
+# 备份一律存技能目录之外（宿主 skills/.backup/ 与工作空间版本库）。
+
+# Python 字节码缓存：每次跑冒烟即重新生成，属产物不是源
 __pycache__/
 *.py[cod]
-*.so
+*.pyd
 
 # 编辑器/工具缓存
 .interpreter_cache.json
@@ -10,10 +14,10 @@ __pycache__/
 *.tmp
 .*.swp
 
-# 运行产物（几何缓存 / 台账 / 出表中间件）—— 不入版本库
+# 运行产物（几何缓存 / 台账 / 出表中间件）
 *.geom.json
 *.pkl
-*.xlsx
-*_解析结果.json
+*.pyd
 标准地址表*.xlsx
+*_解析结果.json
 _ftth_*.json

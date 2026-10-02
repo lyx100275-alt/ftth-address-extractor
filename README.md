@@ -84,7 +84,7 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
 | 路径 | 说明 |
 |---|---|
 | `SKILL.md` | 唯一权威协议（流程 / 状态机 / 硬约束），会话首屏加载 |
-| `scripts/` | 42 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`，公共模块 `scripts/ftth_common.py`（命名归一域已抽取为 `scripts/ftth_naming.py`，由前者 re-export，调用方零改动；归属纯函数已抽取为 `scripts/attribution_engine.py`；V 谷底统一证据为 `scripts/coverage_engine.py`；写法谱/楼层分类为 `scripts/floor_engine.py`）。运行会在 `scripts/` 生成 `.interpreter_cache.json`（解释器探测缓存，由版本库 `.gitignore` 忽略，不入库；可安全删除，删除后下次启动重探一次；上架打包前建议手动清理） |
+| `scripts/` | 43 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`，公共模块 `scripts/ftth_common.py`（命名归一域已抽取为 `scripts/ftth_naming.py`，由前者 re-export，调用方零改动；归属纯函数已抽取为 `scripts/attribution_engine.py`；V 谷底统一证据为 `scripts/coverage_engine.py`；写法谱/楼层分类为 `scripts/floor_engine.py`）。运行会在 `scripts/` 生成 `.interpreter_cache.json`（解释器探测缓存，由版本库 `.gitignore` 忽略，不入库；可安全删除，删除后下次启动重探一次；上架打包前建议手动清理） |
 | `references/` | 细则文档（参数表 / 覆盖规则 / 选法 / 图签协议 / 流水线细则 / 操作纪律…） |
 | `methods/` | 图纸类型方法（楼-簇 / 共享混合 / 图签主导）+ 信号定义 |
 | `assets/` | 标准地址表模板 xlsx |

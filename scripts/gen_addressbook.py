@@ -62,6 +62,12 @@ ap.add_argument("--inspect", "--inspect-json", dest="inspect_json", required=Tru
                      "任一不满足即 rc=2 禁出表（P0 出口门禁，2026-09-29 一百二十七）。")
 ap.add_argument("--out", required=True, help="输出 xlsx 路径")
 ap.add_argument("--coverage-json", default=None, help="用户裁决后的覆盖范围 JSON（可选）")
+ap.add_argument("--count-box-json", default=None,
+                help="count_box_icons.py 产物（可选）。户数由图标法得出时传入："
+                     "本脚本只读其「户数构成」分级（总户数/待核对/可信），"
+                     "**不读其户数本身**（出表仍以 --dxf-json 的楼层表为源）。"
+                     "作用是把「合计里有多少户落在自述不可信列上」写进成品尾行 ——"
+                     "不传则无此行（老调用零影响）。")
 ap.add_argument("--template", default=None, help="标准地址模板 xlsx/xls（可选，仅取表头与格式）")
 ap.add_argument("--addr", default=None,
                 help="前5级地址，逗号分隔：省,市,区,街道,小区。"
@@ -785,6 +791,42 @@ if src_households > 0 and output_rows != src_households:
         log.error(f"  输入回显：--dxf-json={args.dxf_json!r} --coverage-json={getattr(args, 'coverage_json', None)!r} --out={args.out!r}")
         sys.exit(2)
 
+# ---------- 户数可信度透传（2026-10-02 会审整改 P1-4） ----------
+# count_box_icons.py 已输出「户数构成 = {总户数, 待核对户数, 可信户数, 待核对列[]}」——
+# 云峰实测 331 户里 231 户落在自述不可信的列上（共用刻度列组 / 刻度偏移异常）。
+# 这个分级**只躺在产物里**，出表侧不消费，于是下游拿到 331 就当定案。
+# 此处把它读进来，作为**尾行**写进成品（不改数据列、不改行数恒等式）：
+#   · 不新增列 —— 24 列 A~X 是定稿模板，加列即破坏表结构契约；
+#   · 写成首列为「AI生成-户数可信度」的注释行，与既有 AIGC 尾行同类，
+#     且被尾行去重逻辑按标识前缀处理（同一前缀只留一条）。
+# 不传 --count-box-json 时完全无此行（老调用零影响）。
+_hh_grade = {}
+if getattr(args, "count_box_json", None):
+    try:
+        with open(args.count_box_json, "r", encoding="utf-8") as _cbf:
+            _cb = json.load(_cbf) or {}
+        _hh_grade = _cb.get("户数构成") or {}
+        _hh_grade["_口径"] = _cb.get("口径") or ""
+        _hh_grade["_共用刻度列组"] = len(_cb.get("共用刻度列组") or [])
+        _hh_grade["_刻度偏移异常列"] = len(_cb.get("刻度偏移异常列") or [])
+    except (OSError, ValueError) as _e:
+        log.error("读取 --count-box-json 失败：%s（该行将缺失；不影响数据列）" % _e)
+        _hh_grade = {}
+if _hh_grade:
+    _tot = _hh_grade.get("总户数")
+    _wait = _hh_grade.get("待核对户数") or 0
+    _trust = _hh_grade.get("可信户数") or 0
+    _pct = ("%.0f%%" % (100.0 * _wait / _tot)) if isinstance(_tot, (int, float)) and _tot else "?"
+    log.info("户数可信度（写入成品尾行）：口径=%s 总户数=%s 其中待核对 %s 户（%s）／可信 %s 户；"
+             "共用刻度列组 %s 组、刻度偏移异常列 %s 个"
+             % (_hh_grade.get("_口径") or "?", _tot, _wait, _pct, _trust,
+                _hh_grade.get("_共用刻度列组"), _hh_grade.get("_刻度偏移异常列")))
+    if isinstance(_tot, (int, float)) and _tot and _wait:
+        log.warning("**待核对户数占 %s —— 合计未剔除这些户（剔除=丢解），"
+                    "但人工核对前不得当作已核户数消费**。明细见 count_box.json「户数构成」。" % _pct)
+else:
+    _hh_note_row = None
+
 # ---------- 输出 xlsx ----------
 # 一百二十六：无安装楼层的箱在此汇总告警（不编造、不阻塞，列待确认交人）
 if args.fx_floor_suffix == "on" and _fx_missing_install:
@@ -838,6 +880,36 @@ for _tr in template_tail_rows:
     _tail_written += 1
 if _dup_tail:
     log.warning("本次共跳过 %d 条重复模板尾行（通常源于『以已有产物为模板再次出表』）" % _dup_tail)
+
+# 户数可信度尾行（2026-10-02 P1-4）：与 AIGC 尾行同类，按标识前缀参与去重
+_hh_note_row = None
+if _hh_grade:
+    _tot = _hh_grade.get("总户数")
+    _wait = _hh_grade.get("待核对户数") or 0
+    _trust = _hh_grade.get("可信户数") or 0
+    _pct = ("%.0f%%" % (100.0 * _wait / _tot)) if isinstance(_tot, (int, float)) and _tot else "?"
+    _sig = "户数可信度"
+    # 落位：**备注列**（模板第 24 列，与既有 AIGC 尾行同形态 —— 该行也是首列留空、
+    # 详情写备注列），首列放固定标识供尾行去重用。理由：模板的 24 列 A~X 是定稿
+    # 结构，任何新增数据列都破坏表结构契约；而「备注」列本就是给人看说明的。
+    _row_hh = [""] * len(headers)
+    if headers:
+        _row_hh[0] = _sig
+    _ci = ([i for i, f in enumerate(field_map) if f in ("备注", "别名")] or [len(headers) - 1])
+    _row_hh[_ci[-1]] = (
+        "户数可信度：口径=%s｜总户数=%s｜待核对 %s 户（%s）｜可信 %s 户"
+        "｜共用刻度列组 %s 组｜刻度偏移异常列 %s 个"
+        "｜合计未剔除待核对户（剔除=丢解）；人工核对前不得当作已核户数消费"
+        "｜明细见 count_box.json「户数构成」"
+        % (_hh_grade.get("_口径") or "?", _tot, _wait, _pct, _trust,
+           _hh_grade.get("_共用刻度列组"), _hh_grade.get("_刻度偏移异常列")))
+    if _sig in _seen_tail:
+        log.warning("户数可信度尾行已存在（同一标识前缀），按去重规则跳过"
+                    "（信息仍见日志与 count_box.json）")
+    else:
+        _seen_tail.add(_sig)
+        ws.append(_row_hh)
+        _tail_written += 1
 
 # 样式：表头蓝底白字，数据区边框
 header_font = Font(bold=True, color="FFFFFF", size=11)

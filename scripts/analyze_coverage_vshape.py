@@ -421,6 +421,56 @@ def pair_parse_boxes_to_valleys(pool, seg_meta, rows, obj):
     return boxes, rulings
 
 
+def build_scale_anchors(args, texts, log, is_floor, cbre):
+    """尺度锚：把一切绝对坐标阈值换成随图缩放的字高/层高锚。
+
+    2026-09-15 立。本脚本原先多处使用绝对坐标阈值（列容差 30、带容差下限 5000、
+    带跨度 500000、窗口 y 用整带高度…），这些值都是在某一版图纸的坐标尺度上标定的。
+    换一张图（实测另一项目坐标尺度差 ~10^3 倍）整图崩坏：一条米数列被切成几十段、
+    窗口吞进相邻地块的数据。现改为**双锚**：
+
+      · 字高锚（本图米数文字高度中位数）→ 一切「x 方向多近算同列」的判据
+      · 层高锚（本图楼层标注量出的竖向栅格）→ 一切「y 方向多远算同一块」的判据
+
+    两者都随图纸缩放，判据因此与坐标尺度无关。
+
+    **2026-10-02（会审整改 P2-2）从 main() 抽出**：本函数原为 main() 内联块，
+    而 main() 达 1,275 行、无任何单元测试边界 —— 改其中任一段都要冒烟三分钟才敢
+    确认。抽出后本块可被直接调用验证，且 fmcy 的 coverage.json md5 在 golden
+    回归（T14）锁定，抽前抽后须逐字节一致，否则本抽取即视为改变行为。
+
+    `cbre` = 皮线米数正则（main() 内由 --cable-pattern 编译）。**必须显式传入**：
+    它是 main() 的局部量，模块级取不到 —— 首次抽取时漏传，真机跑出
+    `NameError: CBRE`，fmcy coverage 阶段 rc=1，由 T14 golden 红灯当场抓住。
+    这也说明为什么这类抽取必须锁在真图回归之下做。
+
+    返回 (字高中位, 建列容差, 任意字高中位, 层高步长, 层高来源说明,
+          楼层列容差, 箱列容差, 人读摘要)
+    """
+    hmed = median_text_height(
+        [{'内容': s, '高': h} for _, _, s, h in texts],
+        pred=lambda s: bool(cbre.search(s)))
+    col_tol = (args.col_x_tol_factor * hmed) if hmed else args.x_tol
+    hmed_any = median_text_height([{'内容': s, '高': h} for _, _, s, h in texts])
+    fl_step, fl_why = floor_step_from_texts(
+        [{'内容': s, 'x': x, 'y': y} for x, y, s, _ in texts], is_floor)
+    if fl_step is None and hmed_any:
+        # 兜底：无楼层刻度时用字高推一个保守的竖向步长（实测层高 ≈ 5×字高）
+        # 退役条件：floor_scale 信号 absent 时改申报制跳过（rc=3）而非猜步长
+        # （需画像侧配合；当前为过渡态，分支预算纪律 §十一）。
+        fl_step, fl_why = 5.0 * hmed_any, '楼层刻度量不出，按 5×字高 兜底'
+    # 楼层列建列容差同样锚定字高（原先写死 3000）——取两者较大者，
+    # 保证「1F 与 15F 同列却因右对齐差 1.4×字高」不被切裂。
+    fl_col_tol = max(args.floor_x_tol, col_tol) if hmed else args.floor_x_tol
+    box_tol = max(args.box_x_tol, col_tol) if hmed else args.box_x_tol
+    note = ('字高中位=%s → 建列容差=%.4g；层高锚=%s（%s）'
+            % ('%.4g' % hmed if hmed else '量不出',
+               col_tol if hmed else args.x_tol,
+               '%.4g' % fl_step if fl_step else '量不出', fl_why))
+    log.info('尺度锚：%s', note)
+    return hmed, col_tol, hmed_any, fl_step, fl_why, fl_col_tol, box_tol, note
+
+
 def main():
     ap = argparse.ArgumentParser(description='皮线 V 形覆盖判定（V型计算）')
     ap.add_argument('dxf', help='输入 DXF 文件路径')
@@ -521,35 +571,8 @@ def main():
 
     texts = read_texts(args.dxf, layers, ttypes)
 
-    # ---------- 尺度锚（2026-09-15 立）----------
-    # 本脚本原先多处使用绝对坐标阈值（列容差 30、带容差下限 5000、带跨度 500000、
-    #   窗口 y 用整带高度…），这些值都是在某一版图纸的坐标尺度上标定的。换一张图
-    #   （实测另一项目坐标尺度差 ~10^3 倍）整图崩坏：一条米数列被切成几十段、
-    #   窗口吞进相邻地块的数据。
-    # 现改为**双锚**：
-    #   · 字高锚（本图米数文字高度中位数）→ 一切「x 方向多近算同列」的判据
-    #   · 层高锚（本图楼层标注量出的竖向栅格）→ 一切「y 方向多远算同一块」的判据
-    # 两者都随图纸缩放，判据因此与坐标尺度无关。
-    _hmed = median_text_height(
-        [{'内容': s, '高': h} for _, _, s, h in texts], pred=lambda s: bool(CBRE.search(s)))
-    _col_tol = (args.col_x_tol_factor * _hmed) if _hmed else args.x_tol
-    _hmed_any = median_text_height([{'内容': s, '高': h} for _, _, s, h in texts])
-    _fl_step, _fl_why = floor_step_from_texts(
-        [{'内容': s, 'x': x, 'y': y} for x, y, s, _ in texts], is_floor)
-    if _fl_step is None and _hmed_any:
-        # 兜底：无楼层刻度时用字高推一个保守的竖向步长（实测层高 ≈ 5×字高）
-        # 退役条件：floor_scale 信号 absent 时改申报制跳过（rc=3）而非猜步长
-        # （需画像侧配合；当前为过渡态，分支预算纪律 §十一）。
-        _fl_step, _fl_why = 5.0 * _hmed_any, '楼层刻度量不出，按 5×字高 兜底'
-    # 楼层列建列容差同样锚定字高（原先写死 3000）——取两者较大者，
-    #   保证「1F 与 15F 同列却因右对齐差 1.4×字高」不被切裂。
-    _fl_col_tol = max(args.floor_x_tol, _col_tol) if _hmed else args.floor_x_tol
-    _box_tol = max(args.box_x_tol, _col_tol) if _hmed else args.box_x_tol
-    _anchor_note = ('字高中位=%s → 建列容差=%.4g；层高锚=%s（%s）'
-                    % ('%.4g' % _hmed if _hmed else '量不出',
-                       _col_tol if _hmed else args.x_tol,
-                       '%.4g' % _fl_step if _fl_step else '量不出', _fl_why))
-    log.info('尺度锚：%s', _anchor_note)
+    (_hmed, _col_tol, _hmed_any, _fl_step, _fl_why, _fl_col_tol, _box_tol,
+     _anchor_note) = build_scale_anchors(args, texts, log, is_floor, CBRE)
 
     # 2026-09-13（P0-1）：楼号统一走 parse_bldg_nums。旧写法
     #   `int(TITLE.search(s).group(1))` 有两个硬伤：

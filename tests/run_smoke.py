@@ -121,7 +121,15 @@ _single = {'def unit_num(': 'ftth_naming.py', 'def bldg_num(': 'ftth_naming.py',
            'def compute_bldg_ranges_banded(': 'ftth_common.py',
            'def column_consensus_y(': 'ftth_common.py',
            'def floor_scales(': 'count_box_icons.py',
-           'def parse_col_scale_map(': 'count_box_icons.py'}
+           'def parse_col_scale_map(': 'count_box_icons.py',
+           # 2026-10-02（会审整改 P2-1）补三项此前漏锁的逻辑块：
+           #   C9 结果状态闭合曾是两份实现（conflict_engine.run_c9 + inspect_closure 内联），
+           #   靠 CHANGELOG 文字搬了家（131）—— 若日后有人在 inspect 里重写，T1b 不会拦。
+           #   本表治的正是这类「同一逻辑两份实现必然漂移」（注释里点名 norm_floor 漂移两轮、
+           #   verify 漏网到 113，都是靠人肉 grep 才发现的）。
+           'def run_c9(': 'conflict_engine.py',
+           'def hu_mult_of(': 'ftth_common.py',
+           'def sanitize_nonfinite(': 'ftth_common.py'}
 _single_bad = []
 for sig, owner in _single.items():
     hits = [f for f in sorted(os.listdir(SC))
@@ -255,6 +263,42 @@ if _t4d_ok and _r4.returncode != 3:
     _t4d_ok = False
     _t4d_notes.append('非法状态名未 rc=3（实得 %s）' % _r4.returncode)
 check('T4d 迁移门禁 #6 正反用例', _t4d_ok, '; '.join(_t4d_notes) or '4 项按预期')
+
+# T4e 调用链门禁（L1-C7，2026-10-02 会审整改 P2-4 新增）：C7 此前是本技能唯一
+#   无检查器契约（「业务脚本是否绕过 ftth_launcher.py 直调」是跨进程事实，机器判不了）。
+#   现已可判：启动器设 FTTH_VIA_LAUNCHER → write_json 在产物顶层写 _via_launcher
+#   → check_launch_path.py 反查。本项覆盖两项：
+#   ① 正例：经启动器跑的产物目录必须 rc=0；
+#   ② **形状覆盖率反查**：check_launch_path 的 `_FRESH_KEYS` 是穷举的，漏补一个键
+#      就等于「该产物被当成非产物跳过」（假绿）。故用真图产物目录反查 ——
+#      每个 *_GOLDEN_KEYS 产物都必须被判为「业务产物」，一个「跳过」都不许有。
+_t4e_dir = os.path.join(tempfile.gettempdir(), 'ftth_lp_neg')
+_r = subprocess.run([PY, os.path.join(SC, 'ftth_launcher.py'), 'ftth.py', 'budget'],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+_t4e_ok, _t4e_notes = True, []
+if _r.returncode != 0:
+    _t4e_ok, _t4e = False, '启动器跑 budget rc=%s' % _r.returncode
+    _t4e_notes.append(_t4e)
+else:
+    # 反例：裸调 ftth.py 产出的产物目录（无 _via_launcher）必须 rc=2
+    os.makedirs(_t4e_dir, exist_ok=True)
+    _rr = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'probe', '--dxf', 'none.dxf',
+                          '--out', os.path.join(_t4e_dir, 'parsed.json')],
+                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+    _rc = subprocess.run([PY, os.path.join(SC, 'check_launch_path.py'), _t4e_dir],
+                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if not (_rc.returncode in (2, 3) and ('_via_launcher' in _rc.stdout + _rc.stderr
+                                           or _rc.returncode == 3)):
+        _t4e_ok = False
+        _t4e_notes.append('裸调产物未被判违规（rc=%s）' % _rc.returncode)
+    # 空目录必须 rc=3（没核 ≠ 核过了）
+    _empty = tempfile.mkdtemp(prefix='ftth_lp_empty_')
+    _re = subprocess.run([PY, os.path.join(SC, 'check_launch_path.py'), _empty],
+                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if _re.returncode != 3:
+        _t4e_ok = False
+        _t4e_notes.append('空目录未判 rc=3（实得 %s）' % _re.returncode)
+check('T4e 调用链门禁（C7）正反用例', _t4e_ok, '; '.join(_t4e_notes) or '3 项按预期')
 
 # T5 语料冒烟（可选，需 ezdxf + 语料；语料缺失自动 SKIP，不阻断）
 if '--with-dxf' in sys.argv:
@@ -933,6 +977,29 @@ try:
         check('T17 产物契约词汇封闭', _ok17, '; '.join(_notes17) or '三图产物词汇全合规')
 except Exception as _e:
     check('T17 产物契约词汇封闭', False, '异常: %s' % _e)
+
+# T17b 调用链形状覆盖率反查（2026-10-02 P2-4 配套）：用 T14 的真图产物目录反查
+#   check_launch_path 的 _FRESH_KEYS 穷举是否漏补。漏补的后果是「该产物被判成
+#   非产物跳过」= 假绿（C7 门禁看着全绿，实际没核）。
+_t17b_ok, _t17b_notes = True, []
+if _REGEN or ('_T14_GDIR' not in dir() or not os.path.isdir(_T14_GDIR)):
+    print('[SKIP] T17b 真图产物缺失（随 T14）')
+else:
+    for _cn in _gm['cases']:
+        _od = os.path.join(_T14_GDIR, _cn)
+        if not os.path.isdir(_od):
+            continue
+        for _fn in _GOLDEN_KEYS:
+            if not os.path.isfile(os.path.join(_od, _fn)):
+                continue
+            _rc = subprocess.run([PY, os.path.join(SC, 'check_launch_path.py'), _od],
+                                 capture_output=True, text=True, encoding='utf-8',
+                                 errors='replace')
+            if ('%s 非业务产物形状，跳过' % _fn) in _rc.stdout:
+                _t17b_ok = False
+                _t17b_notes.append('%s/%s 被判非产物（_FRESH_KEYS 漏该键）' % (_cn, _fn))
+    check('T17b 调用链形状覆盖（无产物被判非产物）', _t17b_ok,
+          '; '.join(_t17b_notes) or '真图产物全部纳入 C7 核对')
 
 # ---------------- T15 台账确定性（2026-09-26 新增） ----------------
 #   专杀「ledger 每次 md5 必变」——此前 sort_keys 修了一半，_now() 时间戳仍是

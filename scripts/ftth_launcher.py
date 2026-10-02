@@ -178,7 +178,17 @@ def main():
         sys.stderr.write("[launch]   * 若怀疑缓存指向了坏解释器：删除 %s 后重跑。\n" % CACHE_FILE)
         sys.stderr.write("[launch] 详见 references/scripts_reference.md §解释器契约。\n")
         return 9
-    return subprocess.call([py] + list(py_extra) + [target] + argv)
+    # ---- L1-C7 调用契约的机器标记（2026-10-02 会审整改 P2-4 新增）----
+    #   C7 此前是本技能唯一 `declared`（无检查器）契约：「业务脚本是否绕过本启动器
+    #   直调」判不了 —— 调用链是跨进程事实，此前所有门禁都跑在单脚本内。
+    #   本行把调用链变成**产物上的可见事实**：经启动器派生的产物，顶层带
+    #   `_via_launcher: true`（ftth_common.write_json 依此环境变量写入）。
+    #   值刻意是**布尔真值而非时间戳/路径** —— 含变量的标记会让每次运行的产物
+    #   md5 都变，golden 回归将永久假红（这正是 T14 存在的意义）。
+    #   检查方 = scripts/check_launch_path.py。
+    env = dict(os.environ)
+    env["FTTH_VIA_LAUNCHER"] = "1"
+    return subprocess.call([py] + list(py_extra) + [target] + argv, env=env)
 
 
 if __name__ == "__main__":

@@ -124,7 +124,7 @@ check('D7 SKILL外链文件存在', not miss, '缺失=%s' % miss)
 #   NPY_EXPECTED 是**第三处**计数（另两处在 SKILL.md / README.md 的正文里）。
 #   此前本项把 41 写死在表达式里，新增脚本时它是唯一不会被 grep 找到的暗数 ——
 #   改了 SKILL/README 也会 FAIL，症状与「忘了改文档」完全一样，误导排查方向。
-NPY_EXPECTED = 42
+NPY_EXPECTED = 43
 import glob as _glob
 npy = len(_glob.glob(os.path.join(skill_root(), 'scripts', '*.py')))
 m8a = re.search(r'（(\d+) 个文件）', SKILL)
@@ -140,7 +140,14 @@ check('D8 脚本数文档==代码', npy == NPY_EXPECTED and bool(m8a) and int(m8
 # 且没有任何门禁会报（实测 8 条）。此处把链接体检扩到全仓 md。
 _badlinks = []
 for _p in _glob.glob(os.path.join(skill_root(), '**', '*.md'), recursive=True):
-    if os.path.basename(_p) == 'SKILL_CHANGELOG.md':
+    _bn = os.path.basename(_p)
+    if _bn == 'SKILL_CHANGELOG.md':
+        continue
+    # changelog/ 是**历史条目冻结副本**（2026-10-02 归档），不随代码维护。
+    #   排除理由不是「懒得查」：归档条目里大量正文含正则字面量（如
+    #   `([中文\d]+)层`），会被 D9 的 `](...)` 链接正则误判成断链 —— 实测
+    #   part01 因此恒假红。冻结副本的链接不修（改了即篡改历史），故整目录豁免。
+    if os.path.basename(os.path.dirname(_p)) == 'changelog':
         continue
     _rel = os.path.relpath(_p, skill_root()).replace(os.sep, '/')
     _txt = io.open(_p, encoding='utf-8', errors='replace').read()
