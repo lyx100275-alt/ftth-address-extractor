@@ -497,7 +497,7 @@ ledger_state.py state-get --project-dir D
 （同名不同物，SKILL.md L1-C9 标题已就此提醒），其双向对拍由 `check_docs.py` D4 负责。
 两轴混进同一登记表会重演「C9 有两个含义」的名目冲突。
 
-当前状态：L1-C1~C9 中 8 条 `enforced`、C7 `declared`（缺口已写明，见登记的 `gap` 字段）。
+当前状态（一百四十六起）：L1-C1~C9 **9 条全部 `enforced`**（C7 由 `check_launch_path.py` 补上检查器后升档，此前唯一的 `declared`）。
 
 ## 十一、分支预算纪律（2026-09-26 立，专治"老病治好又出新病"）
 

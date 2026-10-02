@@ -15,6 +15,19 @@ AIGC:
 > 追加规则：新条目加在**本文件顶部**（本说明之后、最新条目之前），编号沿用 SKILL.md 的序号体系。
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
 
+### 2026-10-02（一百四十六）：C7 登记翻转补齐 —— 契约 9/9 全 enforced + T1b 补锁
+
+**动因**：一百四十五 P2-4 落了 C7 转 enforced 的全部代码（`check_launch_path.py` + 启动器 `FTTH_VIA_LAUNCHER` + `write_json` 写 `_via_launcher` + T4e/T17b），但 `version.json` 登记与两处文档仍写 C7 `declared` —— 代码与登记不一致。本轮只翻登记、零代码改动。
+| # | 改动 | 文件 |
+|---|---|---|
+| 一 | C7 登记翻为 `enforced`：producer 补 `ftth_common.py`、checker 登 `check_launch_path.py`、`evidence` 写清标记链、`evidence_tokens` 登 `FTTH_VIA_LAUNCHER` / `_via_launcher`（门禁逐个核对标识，空即 FAIL） | `version.json` |
+| 二 | L1 节首两档表翻为 `enforced` 9 条 / `declared` 空；C7 就地标注改挂标记链与 T4e/T17b（去“唯一 declared”旧文） | `SKILL.md` |
+| 三 | §九·补状态句同步为 9 条全 `enforced` | `references/operations_discipline.md` |
+| 四 | T1b 补锁 `build_scale_anchors`（analyze_coverage_vshape 主循环抽出的第一组）与 `write_json`（ftth_common 产物标记出口）—— 单一实现核对，防 inspect 内重写 C9 式双实现重演 | `tests/run_smoke.py` |
+
+**验证**：`check_docs` D1~D12 ALL PASS（D8 43=43=43、D10 9/9 双向一致、declared 空、unenforced 空）；`check_contract_coverage` rc=0（9/9 enforced）；`budget` rc=0（SKILL.md 42305 B、operations_discipline.md 43460 B，均在预警线内）；`run_conflict_matrix` ALL PASS；`run_smoke` ALL PASS（含 T1b 新两锁、T4c/T4d/T4e、T17b、T14 三图 golden 默认回归）。
+- **版本**：`version.json` 0.145.0 → **0.146.0**
+
 ### 2026-10-02（一百四十五）：三方会审整改批 —— 真图回归转正 + 契约/调用链门禁落地 + 版本库建立
 
 **背景**：三方会审（0.144.0）给出 86/100，发现三个要紧问题：① **真图回归长期是红的且没人知道**

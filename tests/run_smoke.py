@@ -129,7 +129,12 @@ _single = {'def unit_num(': 'ftth_naming.py', 'def bldg_num(': 'ftth_naming.py',
            #   verify 漏网到 113，都是靠人肉 grep 才发现的）。
            'def run_c9(': 'conflict_engine.py',
            'def hu_mult_of(': 'ftth_common.py',
-           'def sanitize_nonfinite(': 'ftth_common.py'}
+           'def sanitize_nonfinite(': 'ftth_common.py',
+           # 2026-10-02（P2-2 续）补抽取函数：build_scale_anchors 系 analyze_coverage_vshape
+           #   main() 拆出的第一块（1245 行）。抽取时曾真发生 CBRE 漏传 NameError，
+           #   此处锁住它只此一份，防日后有人在 main 里重写一份。
+           'def build_scale_anchors(': 'analyze_coverage_vshape.py',
+           'def write_json(': 'ftth_common.py'}
 _single_bad = []
 for sig, owner in _single.items():
     hits = [f for f in sorted(os.listdir(SC))
