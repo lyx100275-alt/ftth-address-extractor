@@ -1,0 +1,19 @@
+byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# 编辑器/工具缓存
+.interpreter_cache.json
+*.bak
+*.bak_*
+*.tmp
+.*.swp
+
+# 运行产物（几何缓存 / 台账 / 出表中间件）—— 不入版本库
+*.geom.json
+*.pkl
+*.xlsx
+*_解析结果.json
+标准地址表*.xlsx
+_ftth_*.json

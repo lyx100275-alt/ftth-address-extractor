@@ -1,0 +1,127 @@
+{
+  "skill": "ftth-address-extractor",
+    "skill_version": "0.144.0",
+  "skill_version_basis": "minor 位 = SKILL_CHANGELOG 修订序号（0.143.0 对应「一百四十三」；0.142.0 对应「一百四十二」）；patch 位对应同一修订序号内的「·补」条目；major 位固定 0，待对外发布时由人工提升。不采用未经验证的语义化版本号，避免出现无据可查的版本事实。git 管理自一百零八起外置（技能目录不再携带 .git，版本库位于工作空间技能版本库）；一百零九起测试语料同样外置版本库（T5 支持 --corpus/FTTH_TEST_DXF，缺料自动 SKIP）",
+  "versioning_since": "2026-09-18",
+  "versioning_purpose": "使技能包输出可复现、可回滚、可 diff。此前追溯只能靠 SKILL_CHANGELOG 的中文修订序号，且真源不在任何版本控制下。",
+
+  "schema_version": {
+    "_note": "以下四项的值与 scripts/ledger_state.py 内的常量一一对应，是台账 JSON 的机器可校验标识。改台账结构时改代码常量，本文件同步；本文件不得被当作台账 schema 的独立来源。",
+    "understanding_snapshot": "ftth.understanding_snapshot/v1",
+    "ruling_ledger": "ftth.ruling_ledger/v1",
+    "alias_ledger": "ftth.alias_ledger/v1",
+    "session_state": "ftth.session_state/v1"
+  },
+
+  "contract_coverage": {
+    "_note": "契约落地登记：SKILL.md「L1 契约」每一条契约在此登记「谁产出、谁核、当前是否真被机器执行」。**执行方 = scripts/check_contract_coverage.py**。治的病是「只定义不产出」——L1-C8 立了半天而产出方零落地，inspect C9 恒 SKIP、从未拦下任何东西，而文字上读起来一切正常。本段把这件事从 changelog 里的口头警告变成 rc≠0 的硬信号。",
+    "_do_not": "本段**不得**当作契约正文的来源；契约条款唯一出处是 SKILL.md「L1 契约」。新增 C11 时必须同刻在此登记，否则 check_contract_coverage.py 判 FAIL。",
+    "_coverage_enum": "enforced=有产出方且有检查器，二者均已核实;declared=已定义但无独立检查器（仅靠产出方自检或人工执行，WARN 且必须带 gap 说明）;unenforced=尚无产出方（FAIL）。**禁止用 declared 掩盖未落地**——这是本段存在的全部意义。",
+    "_drift_rule": "producer_scripts / checker_scripts 里的文件名若在仓库中不存在，或 checker_scripts 为空而 coverage=enforced，一律 FAIL；这正是「只定义不产出」的机械形态。",
+    "enforced_since": "2026-10-02",
+    "checker": "scripts/check_contract_coverage.py",
+    "contracts": {
+      "C1": {
+        "title": "输入契约：信号状态与选法",
+        "producer_scripts": ["scripts/plan_methods.py", "scripts/ftth.py"],
+        "checker_scripts": ["tests/run_conflict_matrix.py"],
+        "coverage": "enforced",
+        "evidence": "plan_methods.py 逐信号判定并写 evidence；run_conflict_matrix.py S1~S12 对拍 present/absent/variant/unknown 与选法顺序、户数三口径。",
+        "verified_at": "2026-10-02"
+      },
+      "C2": {
+        "title": "门禁契约：退出码语义",
+        "producer_scripts": ["scripts/ftth_launcher.py", "scripts/ftth.py"],
+        "checker_scripts": ["scripts/check_transitions.py", "tests/run_smoke.py"],
+        "coverage": "enforced",
+        "evidence": "全部业务脚本 sys.exit 处标注 L1-C2 语义；check_transitions.py 以 rc=0/2/3 表达门禁结论；run_smoke.py 逐阶段核对 rc。",
+        "verified_at": "2026-10-02"
+      },
+      "C3": {
+        "title": "交接契约：handoff 申报制",
+        "producer_scripts": ["scripts/plan_methods.py"],
+        "checker_scripts": ["scripts/ftth.py"],
+        "coverage": "enforced",
+        "evidence": "plan_methods.py 写 profile.handoff 的「①分纤箱总图」「②系统图选法」与 completeness（L1-C3 字段级定义见 references/measurement_methods.md §4.4）；ftth.py pipeline 据 handoff 决定各阶段跑不跑（titleblock / fxmap / fx_locations / count_box 四处申报制分支），申报 unreadable 时 fail-closed 报人而非静默择法。",
+        "evidence_tokens": ["handoff", "completeness", "系统图选法", "分纤箱总图"],
+        "verified_at": "2026-10-02"
+      },
+      "C4": {
+        "title": "判定契约：对照表判据",
+        "producer_scripts": ["scripts/parse_dxf_structured.py"],
+        "checker_scripts": ["tests/run_conflict_matrix.py"],
+        "coverage": "enforced",
+        "evidence": "parse 侧 |dy|≤行距 / |dx|≤主体 x 跨度 15% 判对照表形态；conflict_matrix 对拍 absent/variant 不推算与不静默丢数。",
+        "verified_at": "2026-10-02"
+      },
+      "C5": {
+        "title": "异常契约：待确认项四列格式",
+        "producer_scripts": ["scripts/ledger_state.py"],
+        "checker_scripts": ["scripts/ledger_state.py"],
+        "coverage": "enforced",
+        "evidence": "ledger_state.py 的 C5_COLS 是四列的唯一权威常量，pending 子命令按它打印与导出 Markdown；四列缺项补「（待补）」而非留空。",
+        "verified_at": "2026-10-02"
+      },
+      "C6": {
+        "title": "输出契约：表结构与行数恒等式",
+        "producer_scripts": ["scripts/gen_addressbook.py", "scripts/gen_9level_addressbook.py"],
+        "checker_scripts": ["scripts/gen_9level_addressbook.py", "scripts/gen_addressbook.py"],
+        "coverage": "enforced",
+        "evidence": "九级树内置行数恒等式校验（1+1+楼栋+单元+Σ层+Σ户），不成立报错停止；gen_addressbook.py 出表后回读校验 + --inspect 闭合绑定。",
+        "verified_at": "2026-10-02"
+      },
+      "C7": {
+        "title": "调用契约：路径、解释器与命令纪律",
+        "producer_scripts": ["scripts/ftth_launcher.py"],
+        "checker_scripts": [],
+        "coverage": "declared",
+        "evidence": "ftth_launcher.py 以真实 `import ezdxf` 决定可用解释器，探测不到返回 rc=9；业务脚本的调用纪律（禁绕开启动器直调、禁内联、禁 pip）由 C7 文字条款约束并在 scripts_reference.md §解释器契约 展开。",
+        "gap": "**无独立检查器**：启动器只保证「自己能找到解释器」，无法判定「业务脚本是否绕开启动器直调」—— 调用链是跨进程事实，本技能现有门禁都跑在单脚本内，机器判不了。这是当前契约覆盖的最大缺口；新增能观察调用链的检查器（如产物写入 launcher 标记位）前，本条不得改判 enforced。",
+        "verified_at": "2026-10-02"
+      },
+      "C8": {
+        "title": "结果状态契约：两字段正交",
+        "producer_scripts": ["scripts/parse_dxf_structured.py", "scripts/analyze_coverage.py", "scripts/analyze_coverage_vshape.py", "scripts/assemble_households.py", "scripts/apply_ruling.py"],
+        "checker_scripts": ["scripts/check_contracts.py", "scripts/inspect_closure.py", "scripts/conflict_engine.py"],
+        "coverage": "enforced",
+        "evidence": "产出方五处均落地 result_origin/result_confirmation；check_contracts.py R1/R2 词汇封闭 + R4 判定依据首段 ∈ COVERAGE_METHODS；inspect C9 与 conflict_engine C9 递归扫描并对「已提供但零字段」的来源判 WARN 点名。",
+        "verified_at": "2026-10-02"
+      },
+      "C9": {
+        "title": "证据来源等级",
+        "producer_scripts": ["scripts/evidence_builder.py", "scripts/parse_dxf_structured.py", "scripts/analyze_coverage.py", "scripts/analyze_coverage_vshape.py"],
+        "checker_scripts": ["scripts/conflict_engine.py"],
+        "coverage": "enforced",
+        "evidence": "等级表本体在 references/operations_discipline.md §五·补（L1-C9 是该表的指针）。产出方：evidence_builder.py 持封闭枚举（SOURCE_DIRECT/DERIVED/MAP_FILL/UNRESOLVED + CONF_HIGH/MEDIUM/LOW）供证据对象打标；三个产出脚本在箱级写「依据来源」并用 E-DXF-TEXT: / E-DXF-GEOM: 前缀标证据类别。检查器：conflict_engine.py 出冲突议题时按域与等级输出明细。人工裁决等级 E-HUMAN-RULING/E-HUMAN-GUESS 由 apply_ruling.py 与裁决台账承载（当前无脚本内字面量，登记在此以免被误判为缺落地）。",
+        "evidence_tokens": ["SOURCE_DIRECT", "依据来源", "E-DXF"],
+        "verified_at": "2026-10-02"
+      }
+    },
+    "_axis_note": "本段**只登记 SKILL.md「L1 契约」轴的 C1~C9**。Step 2 自检的 C1~C10 是**另一根轴**（同名不同物，见 SKILL.md L1-C9 标题的提醒），其双向对拍由 `scripts/check_docs.py` D4 负责，**不在此登记** —— 两轴混进同一登记表会重演「C9 有两个含义」的名目冲突。"
+  },
+
+  "runtime_tested_with": {
+    "_note": "实测事实，非版本要求。实测口径：真实执行 `import ezdxf` 并读取其 __version__。",
+    "python": "3.13.12",
+    "ezdxf": "1.4.4",
+    "measured_at": "2026-09-18"
+  },
+  "runtime_note": "解释器一律经 scripts/ftth_launcher.py 探测后调用 —— 它以真实 `import ezdxf` 决定可用解释器（本机实测存在无 ezdxf 的解释器排在 PATH 前面），探测不到返回 rc=9；启动器入口的 python 无需带 ezdxf（启动器自身不 import ezdxf），但业务脚本禁止绕过启动器直调；见 L1-C7 调用契约。",
+
+  "budget": {
+    "_note": "SKILL.md 与 references 单文件的体量阈值（字节）。**执行方 = scripts/check_budget.py（ftth.py budget）**，本段是阈值的唯一权威来源，脚本内只保留缺段兜底值并会显式标注实际来源。依据：SKILL.md 是每次会话首屏全量加载的唯一文件，宿主对工具输出有通用截断、实测 51,200 B 且无开关 —— 超出即静默截断（实测曾切掉体量纪律条文后半段与整张 references 索引表）。",
+    "warning_bytes": 47000,
+    "hard_limit_bytes": 49000,
+    "host_truncation_bytes": 51200,
+    "applies_to": ["SKILL.md", "references/*.md"],
+    "enforced_since": "2026-09-18",
+    "measured_at": "2026-09-18"
+  },
+
+  "traceability": {
+    "result_fields": "脚本产物须带 result_origin / result_confirmation 两字段（L1-C8），并由 inspect_closure.py C9 校验闭合。",
+    "state_carrier": "跨阶段状态由三本台账承载（理解快照 / 裁决台账 / 别名台账）+ **一个当前态字段**（`状态.json`，schema 见 schema_version.session_state）。当前态只由 scripts/ledger_state.py state-set/state-get 读写；**状态机定义仍在 SKILL.md，节点枚举唯一权威 = ledger_state.py 的 STATES**（check_docs.py D11 与文档图双向对拍）。迁移门禁由 scripts/check_transitions.py 核对（禁止迁移 6 条，含判据 #6 申报态与证据对拍）。",
+    "contract_coverage": "契约落地登记见本文件 contract_coverage 段；执行方 = scripts/check_contract_coverage.py，登记对拍的轻量版在 scripts/check_docs.py D10。**新增/改动 SKILL.md「L1 契约」必须同刻登记**，漏登判 rc=2。",
+    "changelog": "SKILL_CHANGELOG.md（完整修订记录，中文序号追溯）"
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "_note": "version=2 起 baseline 由 tests/run_smoke.py --regen-golden 重生（手工改此文件不被察觉）；T14 默认不再 SKIP。",
+  "cases": {
+    "fmcy": {
+      "dxf": "Desktop/凤鸣朝阳/凤鸣朝阳小区.dxf",
+      "expect": {
+        "files_md5": {
+          "coverage.json": "b9f9e6e76c5f48b9fc2646ff036778d5",
+          "parsed.json": "5cf42d0782ee148dc3d0fc3829b940b8",
+          "titleblock.json": "654b8ad4c96bcc05fbca465d47a3b72f",
+          "unit_box_gaps.json": "7828ab5a72037036a2bee516936b5d6e"
+        },
+        "inspect": {
+          "fails_h": "d41d8cd98f00",
+          "fails_n": 0,
+          "rc": 0,
+          "warns_h": "8d4b9a54b6c8",
+          "warns_n": 3
+        }
+      }
+    },
+    "lxz14": {
+      "dxf": "Desktop/柳辛庄/柳辛庄1-4地块布线工程施工图.dxf",
+      "expect": {
+        "files_md5": {
+          "fx_locations.json": "5687d8bad04233edd72871c3f5346d5e",
+          "titleblock.json": "5689d4118e986c7dd8579990c43f0309",
+          "unit_box_gaps.json": "368932440622a77bd9529f1a560c839e"
+        }
+      }
+    },
+    "yf": {
+      "dxf": "Desktop/云峰/云峰.dxf",
+      "expect": {
+        "count_box": {
+          "cols": 13,
+          "outliers": 1,
+          "shared": 4,
+          "total": 331,
+          "unassigned": 0
+        },
+        "files_md5": {
+          "count_box.json": "7b8dbe5ec1b2c654a5f3ea536c842ce2",
+          "coverage.json": "06b3e5e474162924acd6144f6a85a621",
+          "fxmap.json": "18f7a9f4294cf8d026701d0dbd43136a",
+          "parsed.json": "55d77ae7349773054a7c9433355b6d34",
+          "unit_box_gaps.json": "1329c0915708cd3ef94a024cf08cc78b"
+        },
+        "inspect": {
+          "fails_h": "37532c67a743",
+          "fails_n": 5,
+          "rc": 2,
+          "warns_h": "bbf7e82e06b3",
+          "warns_n": 11
+        }
+      }
+    }
+  },
+  "generated_from": "skill 0.145.0 + 会审整改批（household_annotation 形态检验落地后），三图 fresh 全链重跑",
+  "version": 2
+}
