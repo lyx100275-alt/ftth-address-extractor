@@ -1,23 +1,20 @@
 # tests —— 回归语料与校验方法
 
 本目录存放**回归测试入口**（`run_smoke.py`）与校验规范。
-语料 DXF 自 0.109.0 起**外置到版本库**（`技能版本库/ftth-address-extractor/tests/corpus/`），技能目录不再携带语料，避免体积膨胀。语料只含代号（`a小区` / `b小区`），不含任何真实项目名、企业名、人名、联系方式。
+语料 DXF 自 0.109.0 起**外置到版本库**（`技能版本库/ftth-address-extractor/tests/corpus/`），技能目录不再携带语料，避免体积膨胀。语料文件名为通用代号（`test_a.dxf` / `test_b.dxf` / `test_c.dxf`），不含任何真实项目名、企业名、人名、联系方式。
 
 ## T5 点亮（2026-09-26 已验证通过）
 
 ```bash
 # 本机版本库语料位置（TeleAgent 工作空间）：
-#   <工作空间>/技能版本库/ftth-address-extractor/tests/corpus/a小区.dxf
-python tests/run_smoke.py --with-dxf --corpus "<版本库>/ftth-address-extractor/tests/corpus/a小区.dxf"
+#   <工作空间>/技能版本库/ftth-address-extractor/tests/corpus/test_a.dxf
+python tests/run_smoke.py --with-dxf --corpus "<版本库>/ftth-address-extractor/tests/corpus/test_a.dxf"
 # 或设环境变量 FTTH_TEST_DXF 再跑（等效，CI 推荐，避免命令行写绝对路径）
 ```
 
 > 注意：上例目录名以本机实际 `技能版本库` 为准，换机先 `dir` 确认；
 > 三处解析顺序为 `--corpus` > `FTTH_TEST_DXF` > 技能内置路径，三者皆无则 T5 自动 SKIP（不阻断）。
 > CI 如需缺料即失败：置 `FTTH_REQUIRE_CORPUS=1` 后跑冒烟，T5/T14 的缺料 SKIP 转 FAIL；结尾另打印 SKIP 清单。
-
-
-
 
 
 ## 脱敏规则（通用原则）
@@ -57,5 +54,3 @@ python tests/run_smoke.py --with-dxf --corpus "<版本库>/ftth-address-extracto
    ```
    通过判据：两次均 rc=0；产物**键集合差异为 0**；
    同键值差异**只出现在被替换的字面量上**。
-
-

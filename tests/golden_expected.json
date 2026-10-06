@@ -1,12 +1,12 @@
 {
   "_note": "本文件由 `tests/run_smoke.py --regen-golden` 重生，请勿手工编辑；行为变更须同步更新基线并在 SKILL_CHANGELOG 记明原因。",
   "cases": {
-    "fmcy": {
-      "dxf": "凤鸣朝阳/凤鸣朝阳小区.dxf",
+    "test_a": {
+      "dxf": "C:\\Users\\Alpha\\.config\\TeleAgent\\users\\v1_public_1903017811319390212\\技能版本库\\ftth-address-extractor\\tests\\corpus\\test_a.dxf",
       "expect": {
         "files_md5": {
-          "coverage.json": "0a6c966614b9c268c073c68f008f2fec",
-          "parsed.json": "716b54fc67bccffeace1eb8bf4f80c3f",
+          "coverage.json": "cf3d826a1b0c3bd12a444a6df6bf6345",
+          "parsed.json": "69b01dcf373927fe4fc2d5ab12a4c8fc",
           "titleblock.json": "654b8ad4c96bcc05fbca465d47a3b72f",
           "unit_box_gaps.json": "7828ab5a72037036a2bee516936b5d6e"
         },
@@ -19,8 +19,8 @@
         }
       }
     },
-    "lxz14": {
-      "dxf": "柳辛庄/柳辛庄1-4地块布线工程施工图.dxf",
+    "test_b": {
+      "dxf": "C:\\Users\\Alpha\\.config\\TeleAgent\\users\\v1_public_1903017811319390212\\技能版本库\\ftth-address-extractor\\tests\\corpus\\test_b.dxf",
       "expect": {
         "files_md5": {
           "fx_locations.json": "5687d8bad04233edd72871c3f5346d5e",
@@ -29,8 +29,8 @@
         }
       }
     },
-    "yf": {
-      "dxf": "云峰/云峰.dxf",
+    "test_c": {
+      "dxf": "C:\\Users\\Alpha\\.config\\TeleAgent\\users\\v1_public_1903017811319390212\\技能版本库\\ftth-address-extractor\\tests\\corpus\\test_c.dxf",
       "expect": {
         "count_box": {
           "cols": 13,
@@ -40,10 +40,10 @@
           "unassigned": 0
         },
         "files_md5": {
-          "count_box.json": "a0e6d11c66e292d269904d2222a19273",
-          "coverage.json": "cbb3d371a5c5aa6556bedf5a47ac0784",
-          "fxmap.json": "18f7a9f4294cf8d026701d0dbd43136a",
-          "parsed.json": "5800bc5ea9da9d92c303c2c430445c17",
+          "count_box.json": "6d8eb0e858cfcf5b498e71dbab675fc6",
+          "coverage.json": "fc82118a6534477d735f08684532f384",
+          "fxmap.json": "fddbb5d2f3442860dbae2c12d88a4680",
+          "parsed.json": "6413330d60e43babc3d83e6dd0e8baf7",
           "unit_box_gaps.json": "1329c0915708cd3ef94a024cf08cc78b"
         },
         "inspect": {
@@ -56,6 +56,6 @@
       }
     }
   },
-  "generated_from": "0.159.0",
+  "generated_from": "0.161.0",
   "version": 2
 }

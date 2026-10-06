@@ -835,7 +835,7 @@ except (ImportError, AttributeError) as _e:
 #   齐备时跑（约 3 分钟），否则 SKIP。指纹设计（防假红）：md5 只锁跨目录逐位一致
 #   的文件（parsed/coverage/titleblock/fxmap/fx_locations/unit_box_gaps/count_box）；
 #   profile/timing/inspect 内嵌路径与耗时走语义比对（rc/条数/归一化文本哈希，浮点
-#   与路径归一）。lxz14 config.json 有探查浮点抖动（已证实），不锁 md5。
+#   与路径归一）。test_b config.json 有探查浮点抖动（已证实），不锁 md5。
 #   指纹基线见 tests/golden_expected.json；行为变更须同步更新基线并记 CHANGELOG。
 #
 # 2026-10-02（会审整改 P0-1）三处改：
@@ -861,14 +861,14 @@ try:
         """基线里的 dxf 相对路径 → 绝对路径。
 
         相对基准 = **用户桌面**（语料外置的约定），但为每次运行留两个后手：
-        ① 基线里写绝对路径（异地机器复现用）；② 相对 `技能目录/../../..` 等常见
+        ① 基线里写绝对路径（异地机器复现用）；② 相对 `技能目录` 或 `技能目录/../../..` 等常见
         语料库位置。找不到则返 None → T14 SKIP 并说清缺哪张图，不静默跳过。
         """
         if os.path.isabs(rel):
             return rel if os.path.isfile(rel) else None
         for base in (os.path.join(os.path.expanduser('~'), 'Desktop'),
                      os.path.join(os.path.expanduser('~')),
-                     os.path.dirname(SK), os.path.dirname(os.path.dirname(SK))):
+                     SK, os.path.dirname(SK), os.path.dirname(os.path.dirname(SK))):
             p = os.path.normpath(os.path.join(base, rel.replace('/', os.sep)))
             if os.path.isfile(p):
                 return p
