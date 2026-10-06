@@ -65,16 +65,16 @@
         "candidates": [
           {"role": "primary", "method": "区间法（皮线标注落楼层带计数）", "requires": ["floor_scale"], "script": "count_households.py"}
         ],
-        "cross_check": "户数以系统图为准：系统图 INSERT 为示意画法（如画1个家居配线箱图标+乘数标注代表N户），不作户数依据；每层户数 = 归属该层的皮线标注条数（或『X户』直读）"
+        "cross_check": "户数以系统图为准：系统图 INSERT 为示意画法（如画1个家居配线箱图标+乘号标注代表N户），不作户数依据；每层户数按 L1-C1 优先级取首个可用者 —— ①『X户』或乘号式 `*N`/`xN`（乘号后数字即该处户数）**直读**；②无直读才数归属该层的皮线标注条数"
       },
       "覆盖判定": {
         "candidates": [
-          {"role": "primary", "method": "竖线法（竖干断口/端点直推·三步走）", "requires": ["dedicated_wire_layer", "vertical_bus_traceable"], "script": "analyze_coverage.py",
+          {"role": "primary", "method": "V型计算（皮线米数谷底）", "requires": ["fiber_length_vshape"], "script": "analyze_coverage_vshape.py"},
+          {"role": "alternate", "method": "竖线法（竖干断口/端点直推·三步走）", "requires": ["dedicated_wire_layer", "vertical_bus_traceable"], "script": "analyze_coverage.py",
            "description": "三步走：①每层y坐标；②区间法求分纤箱安装楼层；③从安装楼层沿竖线向上/下延伸，竖线断头落在哪层就覆盖到哪层；断口是区间，用断头端点做区间法测层，不用中点",
-           "params": {"wire_layer": "必须显式传入连线图层名", "bldg_map": "图纸含分纤箱总图时必须传（extract_fx_map.py 输出）", "fx_symbol_layer": "系统图里分纤箱只画符号、不写编号时必须传"}},
-          {"role": "alternate", "method": "V型计算（皮线米数谷底）", "requires": ["fiber_length_vshape"], "script": "analyze_coverage_vshape.py"}
+           "params": {"wire_layer": "必须显式传入连线图层名", "bldg_map": "图纸含分纤箱总图时必须传（extract_fx_map.py 输出）", "fx_symbol_layer": "系统图里分纤箱只画符号、不写编号时必须传"}}
         ],
-        "cross_check": "两者 requires 同时成立时必须并跑比对：覆盖楼层集合一致才通过；不一致列入待确认。仅一个前置成立时用该法，并在输出中标注『无第二来源』",
+        "cross_check": "**按候选顺序取首个可用者，非并跑**（2026-09-27 用户裁决）：有皮线米数标注（fiber_length_vshape）→ 优先 V型计算；米数缺而竖干可追踪 → 竖线法。选定一法即出结论，不再要求并跑互证、不因单来源降级；结论与实际不符时交人工修正",
         "notes": [
           "覆盖表（光交配纤表+楼栋覆盖标注）不作为覆盖判据，仅作参考线索",
           "严禁用『按安装楼层排序切分』或『取箱附近全部竖干min~max』判覆盖",
@@ -107,7 +107,7 @@
         "方法不混用检查：竖线法/V型计算只测覆盖、区间法只测户数/箱位",
         "分纤箱编号总图vs逐栋一致性",
         "覆盖表仅作参考线索，不作覆盖判据",
-        "覆盖范围第二来源核对（两法前置都成立时必须双跑）",
+        "覆盖范围方法选择（有米标取 V型法；单源采信，出错交人工修正）",
         "楼层完整性",
         "矛盾检查"
       ]

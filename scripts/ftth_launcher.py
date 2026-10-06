@@ -163,6 +163,14 @@ def main():
             if norm.lower().startswith("scripts/"):
                 norm = norm[len("scripts/"):]
             cand = os.path.normpath(os.path.join(HERE, norm))
+            # 2026-10-04（十轮迭代 R1 修复）：HERE 即 scripts/ 目录，对**技能根**
+            # 下的相对路径（如文档写的 `tests/run_smoke.py`）会拼成
+            # scripts/tests/run_smoke.py 而误判不存在（rc=2「找不到脚本」）。
+            # 回退：再按技能根拼一次，存在即采用。绝对路径行为不变。
+            if not os.path.exists(cand):
+                _alt = os.path.normpath(os.path.join(os.path.dirname(HERE), norm))
+                if os.path.exists(_alt):
+                    cand = _alt
         if not os.path.exists(cand):
             sys.stderr.write("[launch] 找不到脚本: %s\n" % cand)
             return 2
@@ -178,7 +186,27 @@ def main():
         sys.stderr.write("[launch]   * 若怀疑缓存指向了坏解释器：删除 %s 后重跑。\n" % CACHE_FILE)
         sys.stderr.write("[launch] 详见 references/scripts_reference.md §解释器契约。\n")
         return 9
-    return subprocess.call([py] + list(py_extra) + [target] + argv)
+    # ---- L1-C7 调用契约的机器标记（2026-10-02 会审整改 P2-4 新增）----
+    #   C7 此前是本技能唯一 `declared`（无检查器）契约：「业务脚本是否绕过本启动器
+    #   直调」判不了 —— 调用链是跨进程事实，此前所有门禁都跑在单脚本内。
+    #   本行把调用链变成**产物上的可见事实**：经启动器派生的产物，顶层带
+    #   `_via_launcher: true`（ftth_common.write_json 依此环境变量写入）。
+    #   值刻意是**布尔真值而非时间戳/路径** —— 含变量的标记会让每次运行的产物
+    #   md5 都变，golden 回归将永久假红（这正是 T14 存在的意义）。
+    #   检查方 = scripts/check_launch_path.py。
+    env = dict(os.environ)
+    env["FTTH_VIA_LAUNCHER"] = "1"
+    # ---- 复现性第二道根因：固定子进程哈希种子（2026-10-04，一百五十四）----
+    #   实测：`split-band` 写出的子 DXF 在同一输入下**跨轮不可逐位复现**，差异定位到
+    #   CLASSES 段两条 CLASS 的顺序互换（`LAYOUT` ↔ `ACDBPLACEHOLDER`，132 B）；
+    #   本变量置 0 后两次产物逐位一致（同一实验组，仅此一个变量不同）。
+    #   成因：ezdxf 收集「本次用到的类」经 set/dict 迭代，顺序随字符串哈希随机种子变化。
+    #   影响面：只改 set 迭代序与 hash() 序，**不改 dict 插入序**；对「已实测跨轮逐位
+    #   一致」的其余产物无影响（若有产物依赖 set 序，它本就跨轮不一致，实测并非如此）。
+    #   位置约束：哈希种子只在解释器**启动时**读取，运行期改无效 —— 启动器是唯一可行点
+    #   （业务脚本一律经本启动器派生，见 L1-C7）。已显式设置者尊重其选择。
+    env.setdefault("PYTHONHASHSEED", "0")
+    return subprocess.call([py] + list(py_extra) + [target] + argv, env=env)
 
 
 if __name__ == "__main__":

@@ -8,9 +8,13 @@
     --corpus 参数 > 环境变量 FTTH_TEST_DXF > 内置路径，均缺失则 T5 自动 SKIP。
 
 T1 单一源守卫：_txt_fields 恰 1 份实现；无本地 bldg_num 重复定义（同名异义防线）
+T1b 委托锁：归一包装（norm_unit/norm_floor/floor_num_local）必须调共享入口；
+    权威实现（unit_num/bldg_num/floor_num/配对/分带）恰 1 份（gen_9level.norm_units
+    是另一语义「单元配置→层户数」且零依赖设计，不在此列）
 T2 注册面=分发面：ftth.py 每个 add_parser 的子命令在分发段有分支（差集 ∅）
-T3 纯函数语义：bldg_num / bldg_num_or_none / _txt_fields 两态出口
+T3 纯函数语义：bldg_num / bldg_num_or_none / _txt_fields 两态出口 + floor_num 楼层归一
 T4 体量闸门：ftth.py budget rc=0
+T4b 文档一致性门：scripts/check_docs.py rc=0（D1~D7：子命令/阶段/冒烟范围/C项/指针链）
 T5 语料冒烟（可选）：语料 DXF probe rc=0（语料缺失自动 SKIP）
 T0 全仓编译：scripts/*.py py_compile 全过（语法级）
 T6 出表链黄金路径（合成料，无需 DXF/ezdxf）：assemble 组装（全名单元键+中文单元+共享克隆）
@@ -26,7 +30,18 @@ T10 多列并排图签（合成料）：同一 y 带内并列 3 列是**不同�
     （专杀「同排共享」把 3 列并给同一楼名的回归：实测采信 18→4）。
 T11 楼名画在本行格组横向跨度之外（合成料，按实测几何）：无横向覆盖时不得直接弃权，
     须按「最近格 + 优势闸」采信并登记；优势不足时才不认领（反向验证判别力）。
+T12 格组适用性闸门（合成料）：认领率过低整体判不适用且不弃解 + 偏置留痕 + 优势闸判别力。
+T13 多栋合并楼名登记（合成料）：只登记不解析 + 反向不误收。
+T14 三图 golden 回归（需 --with-dxf + 桌面三图）：fresh 全链对拍产物指纹与门禁行为，
+    基线 tests/golden_expected.json（约 3 分钟，缺图自动 SKIP）。
+T15 台账确定性：FTTH_FIXED_TIME 冻结时钟后同序列写入逐位一致（生产默认系统时间不变）。
+T23 产物路径无关性：复现基准产物（golden 指纹集 + profile.json）不得内嵌绝对路径
+    （T23a 动态扫 T14 产物）+ 产出脚本路径语义字段须经 basename（T23b 静态扫
+    scripts/*.py）+ 用 os.* 者必须 import os（T23c AST 级，专杀 py_compile 与
+    静态 lint 都判不出的运行期 NameError）。
+T17 产物契约门（需 T14 本轮产物）：L1-C8 词汇封闭静态检查（check_contracts.py）。
 """
+import ast as _ast
 import io
 import os
 import re
@@ -64,21 +79,107 @@ def read(rel):
     return io.open(os.path.join(SK, rel), encoding='utf-8').read()
 
 
-# T1 单一源守卫
+# T1 单一源守卫（权威住处：命名归一域住 ftth_naming.py，P1-2 起）
 fc = read('scripts/ftth_common.py')
-check('T1 _txt_fields 恰1份', fc.count('def _txt_fields(') == 1)
-check('T1 bldg_num_or_none 存在', 'def bldg_num_or_none(' in fc)
+fn = read('scripts/ftth_naming.py')
+check('T1 _txt_fields 恰1份', fn.count('def _txt_fields(') == 1 and fc.count('def _txt_fields(') == 0)
+check('T1 bldg_num_or_none 存在', 'def bldg_num_or_none(' in fn)
 dups = []
 for f in sorted(os.listdir(SC)):
-    if f.endswith('.py') and f != 'ftth_common.py':
+    # 权威住处豁免：bldg_num 住 ftth_naming.py（P1-2 起），经 ftth_common re-export
+    if f.endswith('.py') and f not in ('ftth_common.py', 'ftth_naming.py'):
         if re.search(r'^def bldg_num\(', read('scripts/' + f), re.M):
             dups.append(f)
 check('T1 无本地 bldg_num 重复实现', not dups, str(dups))
 
+# T1b 委托锁（2026-09-26 新增，2026-09-26 P1-2 更新归属表）：归一包装必须调共享入口，
+#   禁自写正则分支。权威实现住处：命名归一域 2026-09-26 起住 ftth_naming.py
+#   （此前住 ftth_common.py），配对/分带仍住 ftth_common.py / count_box_icons.py。
+#   专杀「同一逻辑多份实现必然漂移」——此前 norm_floor 漂移两轮（八十五收 bldg、
+#   九十八收 inspect、verify 漏网到一百一十三），每次都靠人肉 grep 发现。
+#   豁免：gen_9level_addressbook.norm_units 是另一语义（单元配置→层数/每层户数）
+#   且该文件刻意零依赖（八十九），unit_label/bldg_label 仅显示层，不在此列。
+_wrap_bad = []
+for f in sorted(os.listdir(SC)):
+    if not f.endswith('.py'):
+        continue
+    src = read('scripts/' + f)
+    for wn, shared in (('norm_unit', ('unit_num(',)), ('norm_floor', ('floor_num(',)),
+                       ('floor_num_local', ('floor_num(',)),
+                       # fl_num 两种合法形态：直调 floor_num（V型，-9999 哨兵）/
+                       # floor_num_or_zero（竖线法，0 回退），注释须写明选哪种。
+                       ('fl_num', ('floor_num(', 'floor_num_or_zero('))):
+        for mm in re.finditer(r'(?m)^def %s\(' % wn, src):
+            body = src[mm.start():]
+            nx = re.search(r'(?m)^def ', body[1:])
+            body = body[:nx.start() + 1] if nx else body
+            if not any(s in body for s in shared):
+                _wrap_bad.append('%s:%s' % (f, wn))
+check('T1b 归一包装必须委托共享入口', not _wrap_bad, str(_wrap_bad))
+_single = {'def unit_num(': 'ftth_naming.py', 'def bldg_num(': 'ftth_naming.py',
+           'def bldg_num_or_none(': 'ftth_naming.py', 'def floor_num(': 'ftth_naming.py',
+           'def parse_floor_label(': 'ftth_naming.py',
+           'def parse_bldg_nums(': 'ftth_naming.py',
+           'def parse_unit_key(': 'ftth_naming.py',
+           'def cn2num(': 'ftth_naming.py', 'def _txt_fields(': 'ftth_naming.py',
+           'def cluster_by_y(': 'ftth_common.py',
+           'def compute_bldg_ranges_banded(': 'ftth_common.py',
+           'def column_consensus_y(': 'ftth_common.py',
+           'def floor_scales(': 'count_box_icons.py',
+           'def parse_col_scale_map(': 'count_box_icons.py',
+           # 2026-10-02（会审整改 P2-1）补三项此前漏锁的逻辑块：
+           #   C9 结果状态闭合曾是两份实现（conflict_engine.run_c9 + inspect_closure 内联），
+           #   靠 CHANGELOG 文字搬了家（131）—— 若日后有人在 inspect 里重写，T1b 不会拦。
+           #   本表治的正是这类「同一逻辑两份实现必然漂移」（注释里点名 norm_floor 漂移两轮、
+           #   verify 漏网到 113，都是靠人肉 grep 才发现的）。
+           'def run_c9(': 'conflict_engine.py',
+           'def hu_mult_of(': 'ftth_common.py',
+           'def sanitize_nonfinite(': 'ftth_common.py',
+           # 2026-10-02（P2-2 续）补抽取函数：build_scale_anchors 系 analyze_coverage_vshape
+           #   main() 拆出的第一块（1245 行）。抽取时曾真发生 CBRE 漏传 NameError，
+           #   此处锁住它只此一份，防日后有人在 main 里重写一份。
+           'def build_scale_anchors(': 'analyze_coverage_vshape.py',
+           # 2026-10-02（一百四十七）第二块：merge_pending_items（待裁决去重+同形态合并，
+           #   C8 产出方第一段）。只碰 result['需人工裁决']，无 main 局部依赖。
+           'def merge_pending_items(': 'analyze_coverage_vshape.py',
+           'def write_json(': 'ftth_common.py'}
+_single_bad = []
+for sig, owner in _single.items():
+    hits = [f for f in sorted(os.listdir(SC))
+            if f.endswith('.py') and re.search(r'(?m)^%s' % re.escape(sig), read('scripts/' + f))]
+    if hits != [owner]:
+        _single_bad.append('%s->%s' % (sig, hits))
+check('T1b 权威实现恰1份', not _single_bad, str(_single_bad))
+
+# T1c 出口锁（2026-09-26 新增）：JSON 出口统一走 write_json，控制台统一走
+#   ensure_console_utf8。豁免各有去处：ftth_common（实现本体）、ftth_geom
+#   （禁 import ftth_common，否则循环）、ftth_launcher/check_budget/
+#   check_transitions（刻意零依赖的启动/门禁入口）、ledger_state（自带等效
+#   守卫 + sort_keys canonical 出口）、ftth.py（仅 pipeline_timing.json 计时
+#   日志，需 newline="\n" 防 Windows CRLF，write_json 无此参数）。
+#   新增直调即冒烟变红。
+_json_ok, _json_bad, _con_ok, _con_bad = True, [], True, []
+for f in sorted(os.listdir(SC)):
+    if not f.endswith('.py'):
+        continue
+    src = read('scripts/' + f)
+    if f not in ('ftth_common.py', 'ftth_geom.py', 'ftth_launcher.py',
+                 'check_budget.py', 'check_transitions.py', 'ledger_state.py',
+                 'ftth.py'):
+        if re.search(r'json\.dump\(', src):
+            _json_ok = False
+            _json_bad.append(f)
+    if f not in ('ftth_common.py', 'ledger_state.py'):
+        if 'sys.stdout.reconfigure(' in src:
+            _con_ok = False
+            _con_bad.append(f)
+check('T1c JSON出口统一走write_json', _json_ok, str(_json_bad))
+check('T1c 控制台统一走ensure', _con_ok, str(_con_bad))
+
 # T2 注册面=分发面
 ft = read('scripts/ftth.py')
 regs = re.findall(r'sub\.add_parser\("([a-z0-9-]+)"', ft)
-check('T2 子命令数=16', len(regs) == 16, str(len(regs)))
+check('T2 子命令数=19', len(regs) == 19, str(len(regs)))
 i = ft.index('# 分发')
 missing = [c for c in regs if ('"%s"' % c) not in ft[i:]]
 check('T2 注册面=分发面(差集∅)', not missing, '缺分支: %s' % missing)
@@ -96,6 +197,10 @@ try:
     check('T3 _txt_fields 四元组', _r[0] == '层A' and _r[3] == 'b', repr(_r))
     _r = C._txt_fields([1.0, 2.0])
     check('T3 _txt_fields 短四元组不炸', isinstance(_r, tuple), repr(_r))
+    check('T3 floor_num B1→-1', C.floor_num('B1', use_fullmatch=True) == -1)
+    check('T3 floor_num 十七层→17', C.floor_num('十七层', use_fullmatch=True) == 17)
+    check('T3 floor_num WF→900', C.floor_num('WF', use_fullmatch=True) == C.FLOOR_WF_VALUE)
+    check('T3 floor_num 非楼层返None', C.floor_num('3#楼', use_fullmatch=True) is None)
 except ImportError as _e:
     print('[SKIP] T3（缺依赖: %s）' % _e)
 
@@ -113,6 +218,100 @@ check('T0 全仓 py_compile', not _bad, '; '.join(_bad[:3]))
 # T4 体量闸门
 r = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'budget'], capture_output=True, text=True, encoding='utf-8', errors='replace')
 check('T4 budget rc=0', r.returncode == 0, 'rc=%s' % r.returncode)
+
+# T4b 文档一致性门（2026-09-26 新增）：SKILL/README 声称的数字必须与代码现实一致。
+#   专杀「文档声称已改、代码里其实没有」（本项目反复复现的老毛病）——此前靠 opencode
+#   人眼审计，今后跑冒烟即审。细则见 scripts/check_docs.py（D1~D12）。
+r = subprocess.run([PY, os.path.join(SC, 'check_docs.py')], capture_output=True, text=True, encoding='utf-8', errors='replace')
+check('T4b check_docs rc=0', r.returncode == 0, 'rc=%s' % r.returncode)
+
+# T4c 契约落地门（2026-10-02 会审整改 P0-3 新增）：核 version.json 的 contract_coverage
+#   登记与仓库现实一致（L1 契约 C 编号双向对拍 / 产出方·检查器文件须存在 /
+#   enforced 不得无检查器 / declared 必带 gap）。
+#   **接进冒烟链是必须的**：本门禁治的病正是「没人记得手动跑」——
+#   此前它只存在于 scripts/ 里，run_smoke / README 对它 0 次命中，
+#   等于「新增门禁却永不执行」，比没有门禁更坏（制造已覆盖的错觉）。
+r = subprocess.run([PY, os.path.join(SC, 'check_contract_coverage.py')],
+                   capture_output=True, text=True, encoding='utf-8', errors='replace')
+check('T4c 契约落地门 rc=0', r.returncode == 0, 'rc=%s' % r.returncode)
+
+# T4d 迁移门禁（2026-10-02 会审整改 P0-3 新增）：check_transitions 的 6 条禁止迁移
+#   此前也不在冒烟链里。判据 #6（申报态与证据对拍）的**正反用例**由本项覆盖 ——
+#   手工验过但没沉淀成回归的门禁等于不存在。
+#   覆盖：① 无台账 → rc=3（刻意不给「通过」）；② 有 pending 且申报 ≥ LOCKED → rc=2；
+#   ③ 申报 ≥ OUTPUT 而无成品 → rc=2；④ 状态名非法 → rc=2；⑤ 状态回退合法受理 → rc=0。
+_t4d_ok, _t4d_notes = True, []
+_t4d_dir = tempfile.mkdtemp(prefix='ftth_trans_')
+for _a in (['init', '--project-dir'],
+           ['snapshot-set', '--project-dir', '--key', 'K', '--value', 'V',
+            '--source', 'S', '--status', '待裁决'],
+           ['state-set', '--project-dir', '--state', 'LOCKED BASELINE']):
+    _a[_a.index('--project-dir') + 1:_a.index('--project-dir') + 1] = [_t4d_dir]
+    _r = subprocess.run([PY, os.path.join(SC, 'ledger_state.py')] + _a,
+                        capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if _r.returncode != 0:
+        _t4d_ok, _t4d = False, 'setup %s rc=%s' % (_a[0], _r.returncode)
+        _t4d_notes.append(_t4d)
+        break
+_r = subprocess.run([PY, os.path.join(SC, 'check_transitions.py'), '--project-dir', _t4d_dir],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+if _t4d_ok and not (_r.returncode == 2 and '#6' in _r.stdout):
+    _t4d_ok = False
+    _t4d_notes.append('判据#6 未按预期 rc=2（实得 rc=%s）' % _r.returncode)
+# 清掉 pending 后同一目录必须转绿（证明是 pending 触发，不是目录本身坏）
+_r2 = subprocess.run([PY, os.path.join(SC, 'ledger_state.py'), 'snapshot-set',
+                      '--project-dir', _t4d_dir, '--key', 'K', '--value', 'V',
+                      '--source', 'S', '--status', '已确认'],
+                     capture_output=True, text=True, encoding='utf-8', errors='replace')
+_r3 = subprocess.run([PY, os.path.join(SC, 'check_transitions.py'), '--project-dir', _t4d_dir],
+                     capture_output=True, text=True, encoding='utf-8', errors='replace')
+if _t4d_ok and not (_r2.returncode == 0 and _r3.returncode == 0):
+    _t4d_ok = False
+    _t4d_notes.append('清 pending 后未转绿（%s/%s）' % (_r2.returncode, _r3.returncode))
+# 非法状态名必须 rc=3（state-set 侧），不得静默写入
+_r4 = subprocess.run([PY, os.path.join(SC, 'ledger_state.py'), 'state-set',
+                      '--project-dir', _t4d_dir, '--state', '随便写'],
+                     capture_output=True, text=True, encoding='utf-8', errors='replace')
+if _t4d_ok and _r4.returncode != 3:
+    _t4d_ok = False
+    _t4d_notes.append('非法状态名未 rc=3（实得 %s）' % _r4.returncode)
+check('T4d 迁移门禁 #6 正反用例', _t4d_ok, '; '.join(_t4d_notes) or '4 项按预期')
+
+# T4e 调用链门禁（L1-C7，2026-10-02 会审整改 P2-4 新增）：C7 此前是本技能唯一
+#   无检查器契约（「业务脚本是否绕过 ftth_launcher.py 直调」是跨进程事实，机器判不了）。
+#   现已可判：启动器设 FTTH_VIA_LAUNCHER → write_json 在产物顶层写 _via_launcher
+#   → check_launch_path.py 反查。本项覆盖两项：
+#   ① 正例：经启动器跑的产物目录必须 rc=0；
+#   ② **形状覆盖率反查**：check_launch_path 的 `_FRESH_KEYS` 是穷举的，漏补一个键
+#      就等于「该产物被当成非产物跳过」（假绿）。故用真图产物目录反查 ——
+#      每个 *_GOLDEN_KEYS 产物都必须被判为「业务产物」，一个「跳过」都不许有。
+_t4e_dir = os.path.join(tempfile.gettempdir(), 'ftth_lp_neg')
+_r = subprocess.run([PY, os.path.join(SC, 'ftth_launcher.py'), 'ftth.py', 'budget'],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+_t4e_ok, _t4e_notes = True, []
+if _r.returncode != 0:
+    _t4e_ok, _t4e = False, '启动器跑 budget rc=%s' % _r.returncode
+    _t4e_notes.append(_t4e)
+else:
+    # 反例：裸调 ftth.py 产出的产物目录（无 _via_launcher）必须 rc=2
+    os.makedirs(_t4e_dir, exist_ok=True)
+    _rr = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'probe', '--dxf', 'none.dxf',
+                          '--out', os.path.join(_t4e_dir, 'parsed.json')],
+                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+    _rc = subprocess.run([PY, os.path.join(SC, 'check_launch_path.py'), _t4e_dir],
+                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if not (_rc.returncode in (2, 3) and ('_via_launcher' in _rc.stdout + _rc.stderr
+                                           or _rc.returncode == 3)):
+        _t4e_ok = False
+        _t4e_notes.append('裸调产物未被判违规（rc=%s）' % _rc.returncode)
+    # 空目录必须 rc=3（没核 ≠ 核过了）
+    _empty = tempfile.mkdtemp(prefix='ftth_lp_empty_')
+    _re = subprocess.run([PY, os.path.join(SC, 'check_launch_path.py'), _empty],
+                         capture_output=True, text=True, encoding='utf-8', errors='replace')
+    if _re.returncode != 3:
+        _t4e_ok = False
+        _t4e_notes.append('空目录未判 rc=3（实得 %s）' % _re.returncode)
+check('T4e 调用链门禁（C7）正反用例', _t4e_ok, '; '.join(_t4e_notes) or '3 项按预期')
 
 # T5 语料冒烟（可选，需 ezdxf + 语料；语料缺失自动 SKIP，不阻断）
 if '--with-dxf' in sys.argv:
@@ -157,13 +356,38 @@ _T6_COUNT = {"列": [{"列x": 1.0, "逐层": [["1F", 2], ["2F", 2]]},
 _T6_COV = {"楼栋": {
     "3#楼": {"单元": {
         "3#楼1单元": {"分纤箱": [{"编号": "FX01#", "安装楼层": "2F",
-                                "覆盖范围线索": {"覆盖楼层": ["1F", "2F"]}}]},
+                                "覆盖范围线索": {"覆盖楼层": ["1F", "2F"]},
+                                "判定依据": "竖线法（冒烟合成料）",
+                                "依据来源": "E-SMOKE",
+                                "result_origin": "derived",
+                                "result_confirmation": "settled"}]},
         "3#楼二单元": {"分纤箱": [{"编号": "FX02#", "安装楼层": "1F",
-                                 "覆盖范围线索": {"覆盖楼层": ["1F"]}}]}}},
+                                "覆盖范围线索": {"覆盖楼层": ["1F"]},
+                                "判定依据": "竖线法（冒烟合成料）",
+                                "依据来源": "E-SMOKE",
+                                "result_origin": "derived",
+                                "result_confirmation": "settled"}]}}},
     "7#楼": {"单元": {"7#楼1单元": {"分纤箱": [{"编号": "FX17#", "安装楼层": "1F",
-        "覆盖范围线索": {"覆盖楼层": ["1F", "2F"]}}]}}},
+        "覆盖范围线索": {"覆盖楼层": ["1F", "2F"]},
+        "判定依据": "竖线法（冒烟合成料）", "依据来源": "E-SMOKE",
+        "result_origin": "derived", "result_confirmation": "settled"}]}}},
     "8#楼": {"单元": {"8#楼1单元": {"分纤箱": [{"编号": "FX18#", "安装楼层": "1F",
-        "覆盖范围线索": {"覆盖楼层": ["1F", "2F"]}}]}}}}}
+        "覆盖范围线索": {"覆盖楼层": ["1F", "2F"]},
+        "判定依据": "竖线法（冒烟合成料）", "依据来源": "E-SMOKE",
+        "result_origin": "derived", "result_confirmation": "settled"}]}}}}}
+# T6 合成 parse（2026-09-29 一百二十七：gen 强制绑定闭合，T6 须先 inspect rc=0 再出表；}
+# T6 合成 parse（2026-09-29 一百二十七：gen 强制绑定闭合，T6 须先 inspect rc=0 再出表；
+#   夹具同步到现行契约：安装楼层与 coverage 双源一致，楼层表全非空且一致）
+_T6_PARSE = {"楼栋": {
+    "3#楼": {"单元": {
+        "1单元": {"楼层表": {"1F": {"户数": 2}, "2F": {"户数": 2}},
+                  "分纤箱": [{"编号": "FX01#", "安装楼层": "2F"}]},
+        "2单元": {"楼层表": {"1F": {"户数": 2}, "2F": {"户数": 2}},
+                  "分纤箱": [{"编号": "FX02#", "安装楼层": "1F"}]}}},
+    "7#楼": {"单元": {"1单元": {"楼层表": {"1F": {"户数": 2}, "2F": {"户数": 2}},
+                  "分纤箱": [{"编号": "FX17#", "安装楼层": "1F"}]}}},
+    "8#楼": {"单元": {"1单元": {"楼层表": {"1F": {"户数": 2}, "2F": {"户数": 2}},
+                  "分纤箱": [{"编号": "FX18#", "安装楼层": "1F"}]}}}}}
 _T6_COLMAP = '0=3#楼/1单元;1=3#楼/2单元;2=7#楼/1单元,8#楼/1单元'
 with tempfile.TemporaryDirectory() as _td:
     _cp = os.path.join(_td, 'count.json')
@@ -207,14 +431,124 @@ with tempfile.TemporaryDirectory() as _td:
             if _HASXL:
                 _xp = os.path.join(_td, 'out.xlsx')
                 _tpl = os.path.join(SK, 'assets', '标准地址表模板.xlsx')
+                # 2026-09-29（一百二十七·P0）：gen 强制绑定闭合——先 inspect rc=0，
+                #   再带 --inspect 出表； antiguos直调裸出在本版必须 rc=2（见 T19）。
+                _pp2 = os.path.join(_td, 'parse.json')
+                _ip = os.path.join(_td, 'insp.json')
+                io.open(_pp2, 'w', encoding='utf-8').write(_json.dumps(_T6_PARSE, ensure_ascii=False))
+                _ri = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'inspect',
+                                      '--parse', _pp2, '--coverage', _vp,
+                                      '--json', _ip],
+                                     capture_output=True, text=True, encoding='utf-8', errors='replace')
+                check('T6 inspect rc=0', _ri.returncode == 0 and os.path.exists(_ip),
+                      'rc=%s' % _ri.returncode)
                 _r3 = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'gen',
                                       '--parse', _pp, '--coverage', _vp,
+                                      '--inspect', _ip,
                                       '--template', _tpl, '--out', _xp],
                                      capture_output=True, text=True, encoding='utf-8', errors='replace')
                 _ok3 = _r3.returncode == 0 and os.path.exists(_xp)
-                check('T6 gen rc=0', _ok3, 'rc=%s' % _r3.returncode)
+                check('T6 gen带闭合 rc=0', _ok3, 'rc=%s' % _r3.returncode)
             else:
                 print('[SKIP] T6 gen（缺 openpyxl）')
+
+# ---------------- T19/T20/T22 出口门禁负向测试（2026-09-29 一百二十七·P0） ----------------
+#   专杀「gen 绕过 inspect 直出」：正确输入→正确输出（T6）之外，必须证明
+#   错误状态→绝对禁止输出。三个互补方向：
+#     T19 无闭合直调 gen（Layer1：缺 --inspect 即 rc=2）；
+#     T20 陈旧闭合（Layer2：inspect 后改了 coverage，指纹对不上即 rc=2）；
+#     T22 pending 覆盖 + 伪造的 rc=0 闭合（Layer3：gen 自身重扫独立拦下）。
+#   另带 T22b：真 inspect rc=2 的闭合直达 gen（Layer1 rc 门）。
+try:
+    import openpyxl  # noqa: F401
+    _HASXL2 = True
+except ImportError:
+    _HASXL2 = False
+if not _HASXL2:
+    print('[SKIP] T19/T20/T22（缺 openpyxl）')
+else:
+    import hashlib as _hl
+    _N_P = {"楼栋": {"9#楼": {"单元": {"1单元": {
+        "楼层表": {"1F": {"户数": 2}},
+        "分纤箱": [{"编号": "FX99#", "安装楼层": "1F"}]}}}}}
+    _N_C = {"楼栋": {"9#楼": {"单元": {"9#楼1单元": {"分纤箱": [{
+        "编号": "FX99#", "安装楼层": "1F",
+        "覆盖范围线索": {"覆盖楼层": ["1F"]},
+        "判定依据": "竖线法（冒烟合成料）", "依据来源": "E-SMOKE",
+        "result_origin": "derived", "result_confirmation": "settled"}]}}}}}
+    with tempfile.TemporaryDirectory() as _td:
+        _np = os.path.join(_td, 'p.json')
+        _nc = os.path.join(_td, 'c.json')
+        _ni = os.path.join(_td, 'i.json')
+        _nx = os.path.join(_td, 'o.xlsx')
+        _tpl9 = os.path.join(SK, 'assets', '标准地址表模板.xlsx')
+        io.open(_np, 'w', encoding='utf-8').write(_json.dumps(_N_P, ensure_ascii=False))
+        io.open(_nc, 'w', encoding='utf-8').write(_json.dumps(_N_C, ensure_ascii=False))
+        # T19：无 --inspect 直调
+        _r19 = subprocess.run([PY, os.path.join(SC, 'gen_addressbook.py'),
+                               '--dxf-json', _np, '--coverage', _nc,
+                               '--template', _tpl9, '--out', _nx],
+                              capture_output=True, text=True, encoding='utf-8', errors='replace')
+        check('T19 无闭合直调gen rc=2且无出表',
+              _r19.returncode == 2 and not os.path.exists(_nx),
+              'rc=%s 出表=%s' % (_r19.returncode, os.path.exists(_nx)))
+        # T20：先 inspect（rc=0），再改 coverage 文件 → 指纹过期
+        _ri20 = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'inspect',
+                                '--parse', _np, '--coverage', _nc, '--json', _ni],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        _ok20 = _ri20.returncode == 0 and os.path.exists(_ni)
+        check('T20 inspect基线 rc=0', _ok20, 'rc=%s' % _ri20.returncode)
+        if _ok20:
+            _c2 = _json.load(io.open(_nc, encoding='utf-8'))
+            _c2['楼栋']['9#楼']['单元']['9#楼1单元']['分纤箱'][0]['安装楼层'] = '2F'
+            io.open(_nc, 'w', encoding='utf-8').write(_json.dumps(_c2, ensure_ascii=False))
+            _r20 = subprocess.run([PY, os.path.join(SC, 'gen_addressbook.py'),
+                                   '--dxf-json', _np, '--coverage', _nc,
+                                   '--inspect', _ni,
+                                   '--template', _tpl9, '--out', _nx],
+                                  capture_output=True, text=True, encoding='utf-8', errors='replace')
+            check('T20 陈旧闭合gen rc=2且无出表',
+                  _r20.returncode == 2 and not os.path.exists(_nx),
+                  'rc=%s 出表=%s' % (_r20.returncode, os.path.exists(_nx)))
+        # T22：pending 覆盖 + 伪造 rc=0 且指纹吻合的闭合 → Layer3 重扫必须独立拦下
+        _cp = {"楼栋": {"9#楼": {"单元": {"9#楼1单元": {"分纤箱": [{
+            "编号": "FX99#", "安装楼层": "1F",
+            "覆盖范围线索": {"覆盖楼层": ["1F"]},
+            "判定依据": "竖线法（冒烟合成料）", "依据来源": "E-SMOKE",
+            "result_origin": "derived", "result_confirmation": "pending"}]}}}},
+            "需人工裁决": [{"对象": "9#楼/FX99#", "事项": "合成料待裁决",
+                            "阻塞": True}]}
+        _cpp = os.path.join(_td, 'cp.json')
+        _cpi = os.path.join(_td, 'ci.json')
+        io.open(_cpp, 'w', encoding='utf-8').write(_json.dumps(_cp, ensure_ascii=False))
+        _sh = lambda p: _hl.sha256(io.open(p, 'rb').read()).hexdigest()
+        io.open(_cpi, 'w', encoding='utf-8').write(_json.dumps(
+            {"rc": 0, "inputs_sha256": {"parse": _sh(_np), "coverage": _sh(_cpp)},
+             "checks": [], "fails": [], "warns": []}, ensure_ascii=False))
+        _r22 = subprocess.run([PY, os.path.join(SC, 'gen_addressbook.py'),
+                               '--dxf-json', _np, '--coverage', _cpp,
+                               '--inspect', _cpi,
+                               '--template', _tpl9, '--out', _nx],
+                              capture_output=True, text=True, encoding='utf-8', errors='replace')
+        check('T22 pending覆盖+伪造闭合gen rc=2且无出表',
+              _r22.returncode == 2 and not os.path.exists(_nx),
+              'rc=%s 出表=%s' % (_r22.returncode, os.path.exists(_nx)))
+        # T22b：真 inspect（rc=2）直达 gen → Layer1 rc 门
+        _cpi2 = os.path.join(_td, 'ci2.json')
+        _ri22 = subprocess.run([PY, os.path.join(SC, 'ftth.py'), 'inspect',
+                                '--parse', _np, '--coverage', _cpp, '--json', _cpi2],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        _ok22 = _ri22.returncode == 2 and os.path.exists(_cpi2)
+        check('T22 真inspect pending判rc=2', _ok22, 'rc=%s' % _ri22.returncode)
+        if _ok22:
+            _r22b = subprocess.run([PY, os.path.join(SC, 'gen_addressbook.py'),
+                                    '--dxf-json', _np, '--coverage', _cpp,
+                                    '--inspect', _cpi2,
+                                    '--template', _tpl9, '--out', _nx],
+                                   capture_output=True, text=True, encoding='utf-8', errors='replace')
+            check('T22 非0闭合直达gen rc=2且无出表',
+                  _r22b.returncode == 2 and not os.path.exists(_nx),
+                  'rc=%s 出表=%s' % (_r22b.returncode, os.path.exists(_nx)))
 
 # ---------------- T7 图签格组判据（2026-09-23 新增） ----------------
 #   专杀「单元标注归属只靠容差窗」的两个实测坑：
@@ -480,6 +814,412 @@ try:
           '8#楼' not in _got13 and '15层/3户' not in _got13, str(_got13))
 except (ImportError, AttributeError) as _e:
     print('[SKIP] T13（缺依赖: %s）' % _e)
+
+# ---------------- T14 三图 golden 回归（2026-09-26 新增） ----------------
+#   专杀「退化发现晚、靠人工兜」——此前云峰刻度漂移跨 14 版本逐字一致无人拦。
+#   口径：fresh 全链跑桌面三图，对拍产物指纹 + 门禁行为；只在 --with-dxf 且三图
+#   齐备时跑（约 3 分钟），否则 SKIP。指纹设计（防假红）：md5 只锁跨目录逐位一致
+#   的文件（parsed/coverage/titleblock/fxmap/fx_locations/unit_box_gaps/count_box）；
+#   profile/timing/inspect 内嵌路径与耗时走语义比对（rc/条数/归一化文本哈希，浮点
+#   与路径归一）。lxz14 config.json 有探查浮点抖动（已证实），不锁 md5。
+#   指纹基线见 tests/golden_expected.json；行为变更须同步更新基线并记 CHANGELOG。
+#
+# 2026-10-02（会审整改 P0-1）三处改：
+#   ① **默认即跑**，不再只在 `--with-dxf` 下跑。此前三图 golden 长期 SKIP，
+#      而基线本身已陈旧（skill 0.113.0 生成，跨 30 个修订从未重生成）——于是
+#      「全部门禁通过」这个绿灯**从来不含真图**，md5 漂移持续累积无人察觉。
+#      现在默认跑；三图不齐才 SKIP（外置语料的机器上仍可跳过）。
+#   ② `pipeline_rc` 从基线移除：它已由「各阶段 rc」与 inspect rc 蕴含，重复断言
+#      只会在阶段划分调整时给出误导性的第二个红灯。
+#   ③ 新增 `--regen-golden`：基线**只能由本命令重生**，手工改 json 不会被任何
+#      门禁察觉（此前无任何机制保证基线与代码同批）。
+_REGEN = '--regen-golden' in sys.argv
+_GOLDEN_PATH = os.path.join(HERE, 'golden_expected.json')
+_GOLDEN_KEYS = ('parsed.json', 'coverage.json', 'titleblock.json', 'fxmap.json',
+                'fx_locations.json', 'count_box.json', 'unit_box_gaps.json')
+try:
+    import hashlib as _hl
+    import json as _json
+    _gm = _json.load(io.open(_GOLDEN_PATH, encoding='utf-8'))
+    _cases = _gm['cases']
+
+    def _resolve_dxf(rel):
+        """基线里的 dxf 相对路径 → 绝对路径。
+
+        相对基准 = **用户桌面**（语料外置的约定），但为每次运行留两个后手：
+        ① 基线里写绝对路径（异地机器复现用）；② 相对 `技能目录/../../..` 等常见
+        语料库位置。找不到则返 None → T14 SKIP 并说清缺哪张图，不静默跳过。
+        """
+        if os.path.isabs(rel):
+            return rel if os.path.isfile(rel) else None
+        for base in (os.path.join(os.path.expanduser('~'), 'Desktop'),
+                     os.path.join(os.path.expanduser('~')),
+                     os.path.dirname(SK), os.path.dirname(os.path.dirname(SK))):
+            p = os.path.normpath(os.path.join(base, rel.replace('/', os.sep)))
+            if os.path.isfile(p):
+                return p
+        return None
+
+    _resolved, _missing = {}, []
+    for _cn, _c in _cases.items():
+        _abs = _resolve_dxf(_c['dxf'])
+        if _abs:
+            _resolved[_cn] = _abs
+        else:
+            _missing.append('%s(%s)' % (_cn, _c['dxf']))
+    if _missing:
+        print('[SKIP] T14 真图缺失：%s（基线 relative 于用户桌面；可用 --corpus/基线绝对路径调整）'
+              % '、'.join(_missing))
+    else:
+        _gdir = tempfile.mkdtemp(prefix='ftth_golden_')
+        _T14_GDIR = _gdir  # T17 只验本轮产物，不碰历史残留目录
+        _regen_cases, _all_ok, _notes = {}, True, []
+
+        def _norm(_s, _od):
+            _s = _s.replace(_od, '$OUT')
+            return re.sub(r'\d+\.\d+(e[+-]?\d+)?', '#', _s)
+
+        for _cn, _c in _cases.items():
+            _od = os.path.join(_gdir, _cn)
+            # 2026-10-04（十轮迭代 R1 修复）：子进程必须显式剔除 FTTH_VIA_LAUNCHER。
+            # 本测试直调 ftth.py（不经启动器）；若父进程本身经 launcher 启动
+            # （launcher 会置 FTTH_VIA_LAUNCHER=1），子进程继承该变量后产物会多写
+            # `_via_launcher` 键，而 golden 基线（直调口径）不含该键 → T14 永久假红。
+            # 实测：经 launcher 跑 smoke 时 12 个产物全红；直跑时全绿。
+            _env14 = {k: v for k, v in os.environ.items() if k != 'FTTH_VIA_LAUNCHER'}
+            _r = subprocess.run(
+                [PY, os.path.join(SC, 'ftth.py'), 'pipeline', '--dxf',
+                 _resolved[_cn], '--outdir', _od, '--quiet'],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                env=_env14)
+            # ---- 无论重生与否，都按同一套判据算实测值 ----
+            _files = {}
+            for _fn in _GOLDEN_KEYS:
+                _p = os.path.join(_od, _fn)
+                if os.path.isfile(_p):
+                    _files[_fn] = _hl.md5(io.open(_p, 'rb').read()).hexdigest()
+            _ij = os.path.join(_od, 'inspect.json')
+            _d = _json.load(io.open(_ij, encoding='utf-8')) if os.path.isfile(_ij) else {}
+            _fb = sorted(_norm(x, _od) for x in _d.get('fails', []))
+            _wb = sorted(_norm(x, _od) for x in _d.get('warns', []))
+            _actual = {'files_md5': _files}
+            if _d:
+                _actual['inspect'] = {
+                    'rc': _d.get('rc'), 'fails_n': len(_fb), 'warns_n': len(_wb),
+                    'fails_h': _hl.md5('|'.join(_fb).encode('utf-8')).hexdigest()[:12],
+                    'warns_h': _hl.md5('|'.join(_wb).encode('utf-8')).hexdigest()[:12]}
+            _cb = os.path.join(_od, 'count_box.json')
+            if os.path.isfile(_cb):
+                _b = _json.load(io.open(_cb, encoding='utf-8'))
+                _actual['count_box'] = {
+                    'cols': len(_b.get('列', [])), 'total': _b.get('归层后总户数'),
+                    'unassigned': _b.get('未归属图标数'),
+                    'outliers': len(_b.get('刻度偏移异常列', [])),
+                    'shared': len(_b.get('共用刻度列组', []))}
+
+            # 相对基线 dxf 路径的存放形态：能写成桌面子路径就写子路径（可移植）
+            _rel = _resolved[_cn]
+            _desk = os.path.join(os.path.expanduser('~'), 'Desktop')
+            _rel_store = (_rel[len(_desk) + 1:].replace(os.sep, '/')
+                          if _rel.lower().startswith(_desk.lower()) else _rel)
+            _regen_cases[_cn] = {'dxf': _rel_store, 'expect': _actual}
+
+            if _REGEN:
+                continue  # 重生模式：只收集，不判
+            _exp = _c['expect']
+            _ok = True
+            for _fn, _h in (_exp.get('files_md5') or {}).items():
+                _got = _files.get(_fn, 'MISSING')
+                if _got != _h:
+                    _ok = False
+                    _notes.append('%s %s md5 %s≠%s' % (_cn, _fn, str(_got)[:12], str(_h)[:12]))
+            if 'inspect' in _exp:
+                _ei, _ai = _exp['inspect'], _actual.get('inspect') or {}
+                if not (_ai.get('rc') == _ei['rc'] and _ai.get('fails_n') == _ei['fails_n']
+                        and _ai.get('warns_n') == _ei['warns_n']
+                        and _ai.get('fails_h') == _ei['fails_h']
+                        and _ai.get('warns_h') == _ei['warns_h']):
+                    _ok = False
+                    _notes.append('%s inspect 不符（rc=%s F=%s W=%s / 基线 rc=%s F=%s W=%s）'
+                                  % (_cn, _ai.get('rc'), _ai.get('fails_n'), _ai.get('warns_n'),
+                                     _ei['rc'], _ei['fails_n'], _ei['warns_n']))
+            if 'count_box' in _exp and _actual.get('count_box') != _exp['count_box']:
+                _ok = False
+                _notes.append('%s count_box %s≠%s'
+                              % (_cn, _actual.get('count_box'), _exp['count_box']))
+            _all_ok = _all_ok and _ok
+
+        if _REGEN:
+            _gm2 = {'cases': _regen_cases, 'version': 2,
+                    'generated_from': os.path.basename(
+                        _json.load(io.open(os.path.join(SK, 'version.json'),
+                                           encoding='utf-8')).get('skill_version', '?')),
+                    '_note': '本文件由 `tests/run_smoke.py --regen-golden` 重生，请勿手工编辑；'
+                             '行为变更须同步更新基线并在 SKILL_CHANGELOG 记明原因。'}
+            with io.open(_GOLDEN_PATH, 'w', encoding='utf-8', newline='\n') as _gf:
+                _gf.write(_json.dumps(_gm2, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
+            print('[PASS] T14 golden 基线已重生（%d 图）→ %s' % (len(_regen_cases), _GOLDEN_PATH))
+        else:
+            check('T14 三图golden回归', _all_ok, '; '.join(_notes) or '三图全对拍一致')
+except Exception as _e:
+    check('T14 三图golden回归', False, '异常: %s' % _e)
+
+# ---------------- T17 产物契约门（2026-09-26 新增） ----------------
+#   L1-C8 词汇封闭的静态执行方：凡带 result_origin / result_confirmation 的
+#   产物项，其值必须在契约词汇内；未知词汇 = 第四种状态，上游按三态解释必错。
+#   跑 T14 的三个 fresh 产物目录（缺 T14 即 SKIP，不单独跑管线）。
+#   pending/unresolved 只盘点不判 FAIL —— 语义判定权在 C9。
+#   2026-10-02：随 T14 一并改为默认执行（原仅 --with-dxf）—— 它消费 T14 的产物，
+#   T14 默认跑之后它若还 SKIP，就等于「产物已产出却不验词汇」，是纯漏洞。
+try:
+    _gm17 = __import__('json').load(io.open(os.path.join(HERE, 'golden_expected.json'), encoding='utf-8'))
+    if not _REGEN and ('_T14_GDIR' not in dir() or not os.path.isdir(_T14_GDIR)):
+        print('[SKIP] T17（本轮 T14 未产出——真图缺失或处于 --regen-golden 模式）')
+    elif _REGEN:
+        print('[SKIP] T17（--regen-golden 模式：只重生基线，不跑下游门禁）')
+    else:
+        _ok17, _notes17 = True, []
+        for _cn in _gm17['cases']:
+            _od = os.path.join(_T14_GDIR, _cn)
+            if not os.path.isdir(_od):
+                continue
+            _r = subprocess.run([PY, os.path.join(SC, 'check_contracts.py'), _od],
+                                capture_output=True, text=True, encoding='utf-8', errors='replace')
+            if _r.returncode == 3:
+                # 2026-09-27（P0-3 附带）：rc=3 = 该案例目录**无可核对象**
+                #   （T14 未产出 / 产物为空）。这既不是通过也不是契约违约 ——
+                #   「没核」不得输出成「通过」，故登记但不判 FAIL（判 FAIL 会与
+                #   T17 自己的前置「缺 T14 即 SKIP」自相矛盾）。
+                _notes17.append('%s rc=3(无可核对象，未核)' % _cn)
+            elif _r.returncode != 0:
+                _ok17 = False
+                _notes17.append('%s rc=%s' % (_cn, _r.returncode))
+        check('T17 产物契约词汇封闭', _ok17, '; '.join(_notes17) or '三图产物词汇全合规')
+except Exception as _e:
+    check('T17 产物契约词汇封闭', False, '异常: %s' % _e)
+
+# T17b 调用链形状覆盖率反查（2026-10-02 P2-4 配套）：用 T14 的真图产物目录反查
+#   check_launch_path 的 _FRESH_KEYS 穷举是否漏补。漏补的后果是「该产物被判成
+#   非产物跳过」= 假绿（C7 门禁看着全绿，实际没核）。
+_t17b_ok, _t17b_notes = True, []
+if _REGEN or ('_T14_GDIR' not in dir() or not os.path.isdir(_T14_GDIR)):
+    print('[SKIP] T17b 真图产物缺失（随 T14）')
+else:
+    for _cn in _gm['cases']:
+        _od = os.path.join(_T14_GDIR, _cn)
+        if not os.path.isdir(_od):
+            continue
+        for _fn in _GOLDEN_KEYS:
+            if not os.path.isfile(os.path.join(_od, _fn)):
+                continue
+            _rc = subprocess.run([PY, os.path.join(SC, 'check_launch_path.py'), _od],
+                                 capture_output=True, text=True, encoding='utf-8',
+                                 errors='replace')
+            if ('%s 非业务产物形状，跳过' % _fn) in _rc.stdout:
+                _t17b_ok = False
+                _t17b_notes.append('%s/%s 被判非产物（_FRESH_KEYS 漏该键）' % (_cn, _fn))
+    check('T17b 调用链形状覆盖（无产物被判非产物）', _t17b_ok,
+          '; '.join(_t17b_notes) or '真图产物全部纳入 C7 核对')
+
+# ---------------- T23 产物路径无关性（2026-10-04 新增） ----------------
+#   执行技能**既有的**设计原则（见 check_launch_path.py 开篇第 1 条：
+#   「标记是布尔真值，不是时间戳/路径。含变量的标记会让每次运行的产物 md5 都变，
+#   golden 回归（T14）将永久假红 —— 一个门禁不能毒化另一个门禁」）。
+#   此前这条原则**只写在文档里，没有任何机器执行方**，于是：coverage.json 的
+#   「来源」写 args.fx_locations 原文、profile.json 的 source_dxf / source_probe /
+#   param_source_actual.params_json_path 写绝对路径 —— 同一张图换 outdir 跑，
+#   产物指纹必变（实测：柳辛庄八带 R1↔R2 coverage.json 全部不一致，唯一差异就是
+#   这一行路径），T14 的「逐位一致」在这些产物上形同虚设。
+#
+#   两段互补：
+#     A 动态 —— 扫 T14 本轮 fresh 产物中「复现基准集」（golden 指纹集 + profile.json）
+#       内嵌的绝对路径。**刻意不含** inspect.json / pipeline_timing.json：前者是门禁
+#       报告（记录「我读了哪些产物」是本分），后者是耗时记录，二者天然含运行环境
+#       信息、属审计类，不进复现基准。
+#     B 静态 —— 扫产出脚本里「路径语义字段」被直接赋 args.* / Path(args.*) 的位置。
+#       A 只覆盖 T14 真跑到的分支（如 --fx-locations 分支 T14 不经过），B 兜住这类
+#       测试跑不到的代码路径 —— 「规则写了没人执行」的缺口按静态 lint 关。
+try:
+    _T23_PROD = tuple(_GOLDEN_KEYS) + ('profile.json',)
+    _T23_FIELDS = ('DXF文件', '输入', '来源', 'source_dxf', 'source_probe',
+                   'params_json_path')
+    _ABS_RE = re.compile(r'[A-Za-z]:[\\/]|\\\\[^\\]|/(?:home|Users|root|mnt|media|tmp|var|opt)/')
+    _FLD_RE = re.compile(r"['\"](?:%s)['\"]\s*:\s*(.+)$" % '|'.join(_T23_FIELDS))
+
+    def _t23_walk(obj, p=''):
+        out = []
+        if isinstance(obj, dict):
+            for _k, _v in obj.items():
+                out += _t23_walk(_v, '%s.%s' % (p, _k) if p else str(_k))
+        elif isinstance(obj, list):
+            for _i, _v in enumerate(obj):
+                out += _t23_walk(_v, '%s[%d]' % (p, _i))
+        elif isinstance(obj, str) and _ABS_RE.search(obj):
+            out.append((p, obj[:90]))
+        return out
+
+    _t23a_ok, _t23a_notes, _t23a_n = True, [], 0
+    if _REGEN or ('_T14_GDIR' not in dir() or not os.path.isdir(_T14_GDIR)):
+        print('[SKIP] T23a 真图产物缺失（随 T14）')
+    else:
+        for _cn in _gm['cases']:
+            _od = os.path.join(_T14_GDIR, _cn)
+            if not os.path.isdir(_od):
+                continue
+            for _fn in _T23_PROD:
+                _p = os.path.join(_od, _fn)
+                if not os.path.isfile(_p):
+                    continue
+                try:
+                    _obj = _json.load(io.open(_p, encoding='utf-8'))
+                except (OSError, ValueError):
+                    continue
+                _t23a_n += 1
+                for _fld, _val in _t23_walk(_obj):
+                    _t23a_ok = False
+                    _t23a_notes.append('%s/%s.%s=%s' % (_cn, _fn, _fld, _val))
+        check('T23a 复现基准产物无绝对路径', _t23a_ok,
+              ('; '.join(_t23a_notes[:4]) + ('…' if len(_t23a_notes) > 4 else ''))
+              if _t23a_notes else '已核 %d 个产物，无路径泄漏' % _t23a_n)
+
+    _t23b_viol = []
+    for _fn2 in sorted(os.listdir(SC)):
+        if not _fn2.endswith('.py'):
+            continue
+        for _ln, _line in enumerate(io.open(os.path.join(SC, _fn2), encoding='utf-8'), 1):
+            _m = _FLD_RE.search(_line)
+            if not _m:
+                continue
+            _rhs = _m.group(1)
+            if 'basename' in _rhs:          # 已是 basename → 合规
+                continue
+            if 'args.' in _rhs or 'Path(' in _rhs:
+                _t23b_viol.append('%s:%d' % (_fn2, _ln))
+    check('T23b 产出脚本路径字段无原文泄漏', not _t23b_viol,
+          ('; '.join(_t23b_viol[:6])) if _t23b_viol else
+          '路径语义字段 %d 种，全部经 basename 归一' % len(_T23_FIELDS))
+
+    # T23c：产出脚本「用了 os.* 却没 import os」——AST 级，零误报。
+    #   由来（2026-10-04 实测教训）：F7/F8 把写进产物的路径改成
+    #   `os.path.basename(...)`，而 plan_methods.py 顶层**没有** import os ——
+    #   `py_compile` 与 T23b 均判不出（编译不解析名字；静态 lint 只看 basename
+    #   是否出现），直到 T14 真跑 pipeline 才炸 NameError。本项补这个盲区：
+    #   「字符串/注释里的 os. 不算，真正的属性访问才算」用 AST 判，不用正则。
+    _t23c_bad = []
+    _t23c_n = 0
+    for _fn3 in sorted(os.listdir(SC)):
+        if not _fn3.endswith('.py'):
+            continue
+        try:
+            _tree = _ast.parse(io.open(os.path.join(SC, _fn3), encoding='utf-8').read())
+        except SyntaxError as _ex:
+            _t23c_bad.append('%s 语法错: %s' % (_fn3, _ex))
+            continue
+        _t23c_n += 1
+        _imported = set()
+        for _n in _ast.walk(_tree):
+            if isinstance(_n, _ast.Import):
+                for _a in _n.names:
+                    _imported.add(_a.asname or _a.name.split('.')[0])
+        _uses_os = any(isinstance(_n, _ast.Attribute) and isinstance(_n.value, _ast.Name)
+                       and _n.value.id == 'os' for _n in _ast.walk(_tree))
+        if _uses_os and 'os' not in _imported:
+            _t23c_bad.append(_fn3)
+    check('T23c 用 os.* 者必须 import os', not _t23c_bad,
+          ('; '.join(_t23c_bad[:6])) if _t23c_bad else '全仓 %d 个脚本名字解析自洽' % _t23c_n)
+except Exception as _e23:
+    check('T23 产物路径无关性', False, '异常: %s' % _e23)
+
+# ---------------- T15 台账确定性（2026-09-26 新增） ----------------
+#   专杀「ledger 每次 md5 必变」——此前 sort_keys 修了一半，_now() 时间戳仍是
+#   唯一变量字段。生产行为不变（默认系统时间）；FTTH_FIXED_TIME 冻结时钟后，
+#   同序列写入必须逐位一致，否则回归对拍全是假红。
+try:
+    import hashlib as _hl15
+    _env15 = dict(os.environ)
+    _env15['FTTH_FIXED_TIME'] = '2026-09-26T00:00:00'
+    _d15 = [tempfile.mkdtemp(prefix='ftth_ledger_det_') for _i in range(2)]
+    _seq15 = [
+        ['init', '--project-dir'],
+        ['snapshot-set', '--project-dir', '--key', 'K', '--value', 'V', '--source', 'S'],
+        ['ruling-add', '--project-dir', '--question', 'Q', '--ruling', 'R', '--by', 'T'],
+        ['alias-add', '--project-dir', '--canonical', 'C', '--raw', 'r1,r2', '--evidence', 'E'],
+    ]
+    _det_ok, _det_note = True, ''
+    for _args in _seq15:
+        for _dd in _d15:
+            _a = list(_args)
+            _a[_a.index('--project-dir') + 1:_a.index('--project-dir') + 1] = [_dd]
+            _r = subprocess.run([PY, os.path.join(SC, 'ledger_state.py')] + _a,
+                                capture_output=True, text=True, encoding='utf-8',
+                                errors='replace', env=_env15)
+            if _r.returncode != 0:
+                _det_ok, _det_note = False, '%s rc=%s' % (' '.join(_a[:1]), _r.returncode)
+    import filecmp as _fc15
+    for _fn in ('理解快照.json', '裁决台账.json', '别名台账.json'):
+        _p1, _p2 = os.path.join(_d15[0], _fn), os.path.join(_d15[1], _fn)
+        _same = _fc15.cmp(_p1, _p2, shallow=False) if os.path.isfile(_p1) and os.path.isfile(_p2) else False
+        if not _same:
+            _det_ok, _det_note = False, '%s 两次写入不一致' % _fn
+    # 锁定守卫：已裁决项无 --by 改值 -> rc=3；带 --by -> rc=0（L0-I4⑤/P3）。
+    _g15 = _d15[0]
+    _r = subprocess.run([PY, os.path.join(SC, 'ledger_state.py'), 'ruling-add',
+                         '--project-dir', _g15, '--question', 'Q2', '--ruling', 'R2',
+                         '--by', 'T', '--key', 'K'],
+                        capture_output=True, text=True, encoding='utf-8',
+                        errors='replace', env=_env15)
+    _r1 = subprocess.run([PY, os.path.join(SC, 'ledger_state.py'), 'snapshot-set',
+                          '--project-dir', _g15, '--key', 'K', '--value', 'V2',
+                          '--source', 'S'],
+                         capture_output=True, text=True, encoding='utf-8',
+                         errors='replace', env=_env15)
+    _r2 = subprocess.run([PY, os.path.join(SC, 'ledger_state.py'), 'snapshot-set',
+                          '--project-dir', _g15, '--key', 'K', '--value', 'V2',
+                          '--source', 'S', '--by', 'T'],
+                         capture_output=True, text=True, encoding='utf-8',
+                         errors='replace', env=_env15)
+    if not (_r.returncode == 0 and _r1.returncode == 3 and _r2.returncode == 0):
+        _det_ok, _det_note = False, '锁定守卫 rc=%s/%s/%s（期望 0/3/0）' % (
+            _r.returncode, _r1.returncode, _r2.returncode)
+    # trace 导出：rc=0 + JSON 可解析 + 项数与快照一致（机械导出零推理）。
+    _r3 = subprocess.run([PY, os.path.join(SC, 'ledger_state.py'), 'trace',
+                          '--project-dir', _g15],
+                         capture_output=True, text=True, encoding='utf-8',
+                         errors='replace', env=_env15)
+    try:
+        _td = __import__('json').loads(_r3.stdout) if _r3.returncode == 0 else {}
+        _tok = (_r3.returncode == 0 and isinstance(_td.get('traces'), list)
+                and len(_td['traces']) >= 1
+                and all(set(t) >= {'element', 'candidates', 'evidence', 'conflicts',
+                                   'decision', 'decision_origin', 'confirmation'}
+                        for t in _td['traces']))
+    except Exception:
+        _tok = False
+    if not _tok:
+        _det_ok, _det_note = False, 'trace 导出异常 rc=%s' % _r3.returncode
+    check('T15 台账确定性（固定时钟逐位一致）', _det_ok, _det_note or '三本台账两次写入md5一致')
+except Exception as _e:
+    check('T15 台账确定性（固定时钟逐位一致）', False, '异常: %s' % _e)
+
+# ---------------- T18 冲突矩阵回归（2026-09-27 新增，报告 §12.4） ----------------
+#   故意制造矛盾的输入，验证覆盖来源状态机闭环：降级/登记/unimplemented/absent/unknown
+#   /枚举漂移/人工裁决可区分。**纯函数级，不需要 DXF 语料**，故任何时候都能跑。
+#   退出码 0=全过 / 2=有失败（沿用 L1-C2）。
+try:
+    _r18 = subprocess.run([PY, os.path.join(HERE, 'run_conflict_matrix.py')],
+                          capture_output=True, text=True, encoding='utf-8',
+                          errors='replace')
+    # 汇总文案**从矩阵自身的打印行现取**，不再在冒烟里另抄一份计数 ——
+    # 抄一份即漂移：2026-09-27 增 S13 段后，此处仍写「12 场景 + 2 元断言」（单一真源纪律）。
+    _sum18 = ''
+    for _ln in (_r18.stdout or '').splitlines():
+        if '冲突矩阵回归' in _ln:
+            _sum18 = _ln.strip()
+    check('T18 冲突矩阵回归（覆盖来源状态机闭环）', _r18.returncode == 0,
+          ('rc=%s' % _r18.returncode) if _r18.returncode
+          else (_sum18 or '矩阵未打印汇总行'))
+except Exception as _e:
+    check('T18 冲突矩阵回归（覆盖来源状态机闭环）', False, '异常: %s' % _e)
 
 print()
 print('== 冒烟结果: %s（失败 %d 项）==' % ('ALL PASS' if not fails else 'FAIL', len(fails)))

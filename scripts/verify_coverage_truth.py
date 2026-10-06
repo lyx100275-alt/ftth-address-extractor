@@ -45,31 +45,9 @@ except ImportError:
 # 上提理由：该逻辑原先仅存在于本脚本，任何新脚本要用就只能再抄一份 ——
 # 「同一逻辑多份实现必然漂移，且漂移后没有任何东西会报错」是本技能反复踩过的坑。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ftth_common import cn2num, ensure_console_utf8  # noqa: E402
+from ftth_common import cn2num, ensure_console_utf8, floor_num, norm_floor  # noqa: E402  # norm_floor全技能唯一实现，2026-09-27收敛双副本
 
 ensure_console_utf8()
-
-
-def norm_floor(name):
-    """楼层名归一化 → 整数（B1/地下一层/-1F → -1；十七层/17F → 17）。无法识别返回 None。"""
-    if name is None:
-        return None
-    t = str(name).replace("　", "").replace(" ", "").strip()
-    t = re.sub(r"室$", "", t)
-    m = re.fullmatch(r"(?:地下|负)([一二三四五六七八九十\d]+)层?", t)
-    if m:
-        v = cn2num(m.group(1))
-        return -v if v else None
-    m = re.fullmatch(r"[Bb](\d+)(?:层|F)?", t)
-    if m:
-        return -int(m.group(1))
-    m = re.fullmatch(r"([一二三四五六七八九十\d]+)层", t)
-    if m:
-        return cn2num(m.group(1))
-    m = re.fullmatch(r"(-?\d+)\s*[Ff]", t)
-    if m:
-        return int(m.group(1))
-    return None
 
 
 def summarize(floors):

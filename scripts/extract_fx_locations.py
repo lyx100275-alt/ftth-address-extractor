@@ -57,12 +57,12 @@ def main(argv=None):
     loc_re = re.compile(a.pattern) if a.pattern else re.compile(
         r'(\d+)\s*(?:号楼|#\s*楼)\s*(\d+)\s*单元\s*(?:安装(?:在|于)?\s*)?(\d+)\s*(?:层|F(?!\w))')
 
-    from ftth_common import load_geom
+    from ftth_common import load_geom, write_json
     try:
         g = load_geom(a.dxf)
     except Exception as ex:                                        # noqa: BLE001
         sys.stderr.write('[ERROR] 读取 DXF 失败: %s\n' % ex)
-        return 1
+        return 2  # C2 rc=2：DXF读取失败（与:89零匹配一致）
 
     layers = None
     if a.text_layer:
@@ -124,9 +124,7 @@ def main(argv=None):
                    '与系统图标题楼号集合比对可定位',
     }
 
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
-    with open(a.out, 'w', encoding='utf-8') as fp:
-        json.dump(result, fp, ensure_ascii=False, indent=1)
+    write_json(a.out, result, indent=1)
 
     print('[提取] 标注实例 %d 条 → 唯一箱位 %d 个（图层分布 %s）'
           % (len(instances), len(unique), dict(layer_stat)))

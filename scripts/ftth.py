@@ -24,7 +24,7 @@ from pathlib import Path
 
 # 2026-09-25（评审 P2-14）：入口编码改用 ftth_common.ensure_console_utf8（幂等、
 #   有 try 守卫），替代裸 reconfigure（被替换流会炸）。
-from ftth_common import ensure_console_utf8
+from ftth_common import ensure_console_utf8, write_json, floor_num, floor_num_or_zero
 ensure_console_utf8()
 
 
@@ -203,7 +203,7 @@ _CMD_EXAMPLES = {
     "count-box":
         "ftth.py count-box --dxf \"<图.dxf>\" --config \"<probe.json>\" --out \"<count_box.json>\"",
     "gen":
-        "ftth.py gen --parse \"<parse.json>\" --coverage \"<coverage.json>\" --template \"<模板.xlsx>\" --out \"<标准地址表.xlsx>\"",
+        "ftth.py gen --parse \"<parse.json>\" --inspect \"<inspect.json>\" --template \"<模板.xlsx>\" --out \"<标准地址表.xlsx>\"",
     "assemble":
         "ftth.py assemble --count \"<count.json>\" --col-map \"0=1#楼/1单元;8=7#楼/1单元,8#楼/1单元\" --coverage \"<coverage.json>\" --out \"<assembly.json>\"",
     "pipeline":
@@ -304,27 +304,82 @@ _COV_SCRIPT_TO_CMD = {
     "analyze_coverage.py": "coverage",
 }
 
+# 本入口各子任务**实际接得上**的脚本（能力表；2026-09-27 P0-1 立）。
+#   与 plan_methods 的「候选表」是两个不同的东西：候选表 = 方法学上**有哪些路**，
+#   本表 = 本入口**实际执行得了哪几条**。二者不一致时必须**报人**，不得静默跳过。
+#   退出条件：某子任务新增产出口（新阶段或并入既有阶段）即补进本表。
+# 唯一来源纪律（operations_discipline §十二）：覆盖一栏由 _COV_SCRIPT_TO_CMD 派生，
+#   **禁止另抄一份** —— 两处各写一份必然漂移，漂移即等于门禁失效。
+#   键名口径：用 **handoff 子任务名**（画像里的写法），不是 build_steps 的步骤名 ——
+#   同一子任务两处叫法不同（画像「覆盖范围」/ 步骤「覆盖判定」），取画像侧以免对不上。
+_PIPE_CAPABILITY = {
+    "覆盖范围": frozenset(_COV_SCRIPT_TO_CMD),
+}
+
+
+def _pipe_capability_problems(profile_path):
+    """校验画像申报的脚本是否在本入口能力表内；返回问题清单（空 = 通过）。
+
+    背景（2026-09-27，P0-1 实跑核证）：此前 plan 可申报一个本入口**没有映射**的脚本
+    —— 实测覆盖判定 primary = `parse_dxf_structured.py`（生产侧对该标注零实现）。
+    调用点把「映射不到」当成「本图不适用」**静默跳过**，后果是：
+      ① 覆盖零产出，直到 `inspect` C6 才 FAIL，报错文案还指向画像，误导排查方向；
+      ② 同可用备选（V型/竖线）**不会自动兜底** —— 最优证据反而把结果拦死。
+    故本函数在 plan **之后**立即对拍，不一致即 rc=2 停下报人（fail-closed，不静默）。"""
+    try:
+        with open(profile_path, "r", encoding="utf-8") as f:
+            prof = json.load(f)
+    except Exception as e:                                          # noqa: BLE001
+        return ["画像不可读(%s) —— 无法核对选法与本入口能力表是否一致" % e]
+    sysm = ((prof.get("handoff") or {}).get("②系统图选法") or {})
+    probs = []
+    for sub, cap in _PIPE_CAPABILITY.items():
+        sel = sysm.get(sub) or {}
+        decl = str(sel.get("申报") or sel.get("状态") or "").strip().lower()
+        script = str(sel.get("脚本") or "").strip()
+        # absent/missing/none ⇒ 本图不提供该子任务，本阶段合法缺席（rc=3），不核
+        if not script or decl in ("absent", "missing", "none"):
+            continue
+        if script not in cap:
+            probs.append(
+                "②系统图选法·%s：画像申报脚本 %r **不在本入口能力表** %s 内 —— "
+                "该路 plan 声明了、流水线却接不上（无执行方）。不得当「本图不适用」"
+                "静默跳过；须接入产出口，或改用能力表内的方法。"
+                % (sub, script, sorted(cap)))
+    return probs
+
 
 def _pipe_coverage_choice(profile_path):
     """从画像读出覆盖判定选中的脚本，映射为本入口子命令名。
 
-    返回 (子命令名 或 None, 说明文本)。None 表示两者之一：
-      ① 画像不可读（须显式暴露，不得静默挑一个方法）；
-      ② 画像申报本图不提供覆盖范围数据（absent）—— 该阶段合法缺席。
+    返回 `(子命令名 或 None, 说明文本, blocked)`。`blocked=True` ⇒ 调用方**不得**
+    当「本图不适用」跳过，须 rc=2 停下报人。四种情形：
+      ① `blocked=True` 画像申报 unimplemented（图上有该证据、本技能无产出口）；
+      ② `blocked=True` 申报了脚本但本入口映射不到（如 `parse_dxf_structured.py`）
+         —— 与 `_pipe_capability_problems` 同一判据（能力表唯一来源）；
+      ③ 画像不可读 → 同 ②（须显式暴露，不得静默挑一个方法）；
+      ④ `(None, note, False)` 画像申报本图不提供覆盖范围（absent）—— 该阶段合法缺席。
+      2026-09-27（P0-1）：② 此前被静默当成「不适用」跳过（回 rc=3），导致覆盖零产出、
+      直到 inspect C6 才 FAIL 且文案指向画像；现改为 fail-closed 报人。
     """
     try:
         with open(profile_path, "r", encoding="utf-8") as f:
             prof = json.load(f)
-    except Exception as e:
-        return None, "画像不可读: %s" % e
+    except Exception as e:                                          # noqa: BLE001
+        return None, "画像不可读: %s" % e, True
     sel = (((prof.get("handoff") or {}).get("②系统图选法") or {}).get("覆盖范围") or {})
     decl = str(sel.get("申报") or sel.get("状态") or "").strip().lower()
+    if decl == "unimplemented":
+        return None, ("画像申报覆盖判定=unimplemented（信号成立但本技能未接入产出口："
+                      "%s）" % (sel.get("阻塞原因") or sel.get("脚本"))), True
     if decl in ("absent", "missing", "none"):
-        return None, "画像申报本图不提供覆盖范围数据(%s) -> 该阶段合法缺席" % decl
+        return None, "画像申报本图不提供覆盖范围数据(%s) -> 该阶段合法缺席" % decl, False
     cmd = _COV_SCRIPT_TO_CMD.get(sel.get("脚本"))
     if cmd:
-        return cmd, "%s <- %s" % (sel.get("选定方法") or cmd, sel.get("脚本"))
-    return None, "画像未给出可识别的覆盖判定脚本(脚本=%r)" % sel.get("脚本")
+        return cmd, "%s <- %s" % (sel.get("选定方法") or cmd, sel.get("脚本")), False
+    return None, ("画像申报的覆盖判定脚本 %r 不在本入口能力表 %s 内 —— 该路无执行方，"
+                  "不得当「本图不适用」跳过"
+                  % (sel.get("脚本"), sorted(_PIPE_CAPABILITY["覆盖范围"]))), True
 
 
 def _pipe_countbox_choice(profile_path):
@@ -364,9 +419,261 @@ def _cb_fingerprint_ok(cb_path, dxf):
             recorded = str((json.load(f) or {}).get("输入") or "").strip()
     except (IOError, json.JSONDecodeError, OSError):                 # noqa: BLE001
         return True  # 读不了/无字段：不阻止复用（旧产物兼容），风险由 WARN 提示兜底
+        # 退役条件：count_box 产物指纹字段全覆盖 + stale 守卫接管后，改为读失败即 False
+        # （须 fresh-run 重算）。fail-open 是过渡态，静默复用错图即喂错数据（分支预算纪律 §十一）。
     if not recorded:
         return True
     return os.path.basename(recorded) == os.path.basename(dxf)
+
+
+def _fb_floor_key(name):
+    """回落转换逐层排序键：已知楼层按数值排（B1/-1F为负，WF=900在末），
+    未知排最后。2026-09-27二轮改走 floor_num 统一入口（旧手写正则不认
+    WF/中文层/N层/室尾缀，与主链口径不一致）。仅排序用，不作判定。"""
+    v = floor_num(str(name or "").strip(), use_fullmatch=True)
+    if v is not None:
+        return (0, v)
+    return (1, 0)
+
+
+def _cb_convert_wire_fallback(fb_path, dxf, cb_out):
+    """count 产物 → count_box.json 的「列」格式（2026-09-26，示意画法 L1-C1 回落）。
+
+    逐楼栋的「皮线列」每一项转成一个「列」条目（列x / x范围 / y范围 / 逐层 /
+    合计 / 图标数，其中「图标数」语义为皮线文字条数）；列→楼栋归属是裁决项，
+    转换不携带楼栋归属（col-map 由 assemble 阶段人工裁决映射，含共享列克隆）。
+    「同一端点多候选」/「未归属图标数」补空值，仅为与 inspect C5 质量透传字段
+    对齐（皮线口径下这两项无意义，恒空/零）。
+    返回 (True, 总户数) / (False, 原因)。
+    """
+    try:
+        with open(fb_path, "r", encoding="utf-8") as f:
+            fb = json.load(f) or {}
+    except Exception as e:                                          # noqa: BLE001
+        return False, "回落产物 %s 不可读：%s" % (fb_path, e)
+    bldgs = fb.get("楼栋") or {}
+    if not bldgs:
+        return False, "回落产物 %s 无「楼栋」数据" % fb_path
+    # 2026-09-26（第4轮 Bug A）：逐层改从各线归属明细按列聚合，不再用楼栋级每层户数线索（多列楼栋会被双计）。
+    try:
+        _tol = float((fb.get("参数") or {}).get("x_cluster") or 0) or None
+    except (TypeError, ValueError):
+        _tol = None
+    if not _tol or _tol <= 0:
+        _tol = 20.0  # count_households.DEFAULT_X_CLUSTER 回退（产物无参数时）
+    cols = []
+    _conv_warns = []
+    for _bname in sorted(bldgs):
+        _b = bldgs[_bname] or {}
+        _details = _b.get("各线归属明细") or []
+        for _c in (_b.get("皮线列") or []):
+            try:
+                _x = float(_c.get("x"))
+            except (TypeError, ValueError):
+                return False, "回落产物皮线列缺 x：%r" % (_c,)
+            _ymin, _ymax = _c.get("y_min"), _c.get("y_max")
+            if _ymin is None or _ymax is None:
+                return False, "回落产物皮线列 x=%s 缺 y_min/y_max" % (_c.get("x"),)
+            try:
+                _units = int(_c.get("折算户数"))
+                _n = int(_c.get("条数"))
+            except (TypeError, ValueError):
+                return False, "回落产物皮线列 x=%s 缺 折算户数/条数" % (_c.get("x"),)
+            _agg = {}
+            for _d in _details:
+                try:
+                    _dx = float((_d or {}).get("x"))
+                except (TypeError, ValueError):
+                    continue
+                if abs(_dx - _x) > _tol:
+                    continue
+                _fl = (_d or {}).get("归属")
+                if not _fl:
+                    continue
+                try:
+                    _hu = int((_d or {}).get("户数", 1))
+                except (TypeError, ValueError):
+                    _hu = 1
+                _agg[_fl] = _agg.get(_fl, 0) + _hu
+            _floors = [[_fn, _agg[_fn]] for _fn in
+                       sorted(_agg, key=lambda n: (_fb_floor_key(n), str(n)))]
+            _s = sum(_v for _, _v in _floors)
+            if _s != _units:
+                _w = ("列x=%s（栋%s）：Σ逐层=%d ≠ 折算户数=%d（|明细x-列x|≤%s 聚合；差值多为未归属皮线）"
+                      % (round(_x, 1), _bname, _s, _units, _tol))
+                _conv_warns.append(_w)
+            cols.append({"列x": round(_x, 1), "x范围": [_x, _x],
+                         "y范围": [round(_ymin, 2), round(_ymax, 2)],
+                         "逐层": _floors, "合计": _units, "图标数": _n})
+    if not cols:
+        return False, "回落产物皮线列为空（无户数可转）"
+    total = sum(_c["合计"] for _c in cols)
+    _note = ("示意画法确认（count_box_icons.py [DIAG-SCHEMATIC-ICONS]，rc=3）后按 "
+             "L1-C1（2026-09-16 裁决）回落皮线：本文件由 %s 格式转换而来，"
+             "「图标数」语义为皮线文字条数；列→楼栋归属未携带，由 assemble "
+             "阶段人工 col-map 裁决（含共享列克隆）；逐层按 |明细x-列x|≤列聚类容差(%s) "
+             "从各线归属明细聚合（楼栋级每层户数线索不进转换）。" % (fb_path, _tol))
+    if _conv_warns:
+        _note += "转换守卫Σ逐层≠折算户数（不中断）：%s" % "；".join(_conv_warns)
+        print("[count_box] ! 回落转换守卫：Σ逐层≠该列折算户数（不中断，已登记）：%s"
+              % "；".join(_conv_warns), flush=True)
+    out = {
+        "口径": "皮线回落（示意画法；L1-C1 2026-09-16 裁决）",
+        "输入": os.path.abspath(dxf),
+        "乘号式户数标注": [],
+        "刻度偏移异常列": [],
+        "共用刻度列组": [],
+        "同一端点多候选": [],
+        "未归属图标数": 0,
+        "归层后总户数": total,
+        "列": cols,
+        "说明": _note,
+    }
+    try:
+        write_json(cb_out, out)
+    except OSError as e:
+        return False, "写 %s 失败：%s" % (cb_out, e)
+    return True, total
+
+
+def _pipe_hint_fx_symbol_cands(profile_path):
+    """箱符号层「未推荐」时把候选明细摆出来 —— 解决「有答案但不可达」。
+
+    **入参是画像文件路径**（与同级 `_pipe_effective_layers` / `_pipe_profile_status`
+    保持一致）；此处不假设调用方已把 JSON 读成 dict —— 实测按 dict 取值直接
+    AttributeError 让整条流水线 rc=1，比原来的 rc=2 更难排查。
+
+    背景（2026-10-05，P1）：探查侧确实给每个候选层打过分并落进了
+    profile.probe_signals.fx_symbol_layer_candidates，但只有达到「推荐」门槛
+    （一致性>=0.8 且 标题区重叠>=0.8 且 数量吻合）的才会写进 suggested_params 下传。
+    未达标者被埋着，而 coverage 的失败文案却把人导向「去核对图层名是不是不对」——
+    排错方向错了，且猜图层名本身就在踩「靠猜不当」的坑。
+
+    此处**只 print 不决策**：候选连同其未达标分项一并给出，供人据此显式指定或
+    确认本图确无符号画法；未达门槛者绝不由本函数自动采信下发。
+
+    返回 bool：是否打印了候选（供调用方判断是否还需别的提示）。
+    """
+    try:
+        with open(profile_path, "r", encoding="utf-8") as _f:
+            prof = json.load(_f)
+    except Exception as _e:                                            # noqa: BLE001
+        print("[pipeline] ! 画像不可读，无法给出箱符号层候选明细：%s" % _e, flush=True)
+        return False
+    _cands = ((prof or {}).get("probe_signals") or {}).get(
+        "fx_symbol_layer_candidates") or []
+    if not isinstance(_cands, list):
+        _cands = []
+    if not _cands:
+        print("[pipeline] ! 本画像**没有任何**箱符号层候选 —— coverage 将扫全图找符号，"
+              "很可能因此找不到（若本图箱体只写编号、不画符号，加 --allow-low-pairing "
+              "强行继续，结果须人工复核）", flush=True)
+        return False
+    _rec = [c for c in _cands if c.get("推荐")]
+    print("[pipeline] 探查给出 %d 个箱符号层候选，其中达「推荐」门槛 %d 个 —— "
+          "未达门槛者不予下发（门槛：一致性>=0.8 且 标题区重叠>=0.8 且 数量吻合）："
+          % (len(_cands), len(_rec)), flush=True)
+    for _cd in _cands[:3]:
+        print("    · 层=%s 得分%.2f 推荐=%s（一致性%.2f｜标题区重叠%.2f｜闭合矩形%d｜"
+              "众数簇%d｜众数尺寸%s）"
+              % (_cd.get("层"), _cd.get("得分", 0.0), _cd.get("推荐"),
+                 _cd.get("一致性", 0.0), _cd.get("标题区重叠", 0.0),
+                 _cd.get("闭合四点矩形", 0), _cd.get("众数簇", 0),
+                 _cd.get("众数尺寸")), flush=True)
+    print("[pipeline] 处置二选一（均须人工核对，脚本不代判）：", flush=True)
+    print("    ① 若经人工核对确认其中某层确为符号层 → 用 --fx-symbol-layer <层名> 显式指定；",
+          flush=True)
+    print("    ② 若本图箱体确为「只写编号、不画符号」 → 加 --allow-low-pairing 继续"
+          "（箱位会回退编号文字坐标，结果须人工复核）", flush=True)
+    return True
+
+
+def _pipe_fanout_bands(args, dxf, outdir, cfg, pdir, brief_keep=None):
+    """多地块图：**自动分带 + 对每个子带跑完整 pipeline**（扇形展开）。
+
+    背景（2026-10-05）：`split-band` 此前只作为**独立子命令**存在，pipeline 阶段链里
+    根本没有这一环 —— 源码注释自承「规则写了、尺寸量了、**执行环节零接线**」。后果是
+    任何多地块图跑到 parse 必然撞「多地块同名楼」守卫 rc=2（该守卫本身正确：全图解析
+    会让同名楼栋按楼名去重、静默串号），而**被提示的正确路径（split-band）在串跑里
+    走不到**，只能人工手搓。
+
+    设计（最小侵入）：
+      * 仅在 plan 之后、parse 之前介入；**单地块图不受影响**（子带数 < 2 即原路返回）。
+      * 子带各跑一条完整 pipeline（递归调本入口），产物落在 <outdir>/bands/<带名>/。
+      * 递归时**必须关掉分带**（--no-auto-split-band），否则子图可能二次分带。
+      * 汇总退出码 = 各子带最严重者；任一子带失败即非 0（不把部分成功当整体成功）。
+
+    返回 None = 未触发（调用方继续单地块原路径）；否则返回汇总退出码。
+    """
+    if not getattr(args, "auto_split_band", True):
+        return None
+    bands_dir = os.path.join(outdir, "bands")
+    _self = str(Path(__file__).resolve())
+    print("[pipeline] 多地块检测：先跑 split-band --auto 量分带方案 ……", flush=True)
+    _rc = subprocess.call([sys.executable, _self, "split-band", "--auto", "--yes",
+                           "--dxf", dxf, "--config", cfg, "--out-dir", bands_dir])
+    if _rc == 3:
+        print("[pipeline] 单地块图无需分带（split-band rc=3 不适用）→ 按单地块原路径继续"
+              "（若本图确为多地块，请人工跑 split-band 后逐带处理）", flush=True)
+        return None
+    if _rc != 0:
+        print("[pipeline] ! split-band 退出码 %d —— 不扇出，按单地块原路径继续（"
+              "若本图确为多地块，请人工跑 split-band 后逐带处理）" % _rc, flush=True)
+        return None
+    if not os.path.isdir(bands_dir):
+        return None
+    _subs = sorted(p for p in os.listdir(bands_dir) if p.lower().endswith(".dxf"))
+    if len(_subs) < 2:
+        print("[pipeline] 分带结果 %d 个子图 → 非多地块（或只有一带），按单地块原路径继续"
+              % len(_subs), flush=True)
+        return None
+    print("[pipeline] ✔ 检出 %d 个地块子图 → 逐个跑完整 pipeline（产物在 bands/<带名>/）"
+          % len(_subs), flush=True)
+    _worst = 0
+    _rows = []
+    for _s in _subs:
+        _name = _s[:-4]
+        _sub_out = os.path.join(bands_dir, _name)
+        _argv = ["pipeline", "--dxf", os.path.join(bands_dir, _s),
+                 "--outdir", _sub_out, "--no-auto-split-band",
+                 "--stop-at", (args.stop_at or "inspect")]
+        if pdir:
+            _argv += ["--project-dir", pdir]
+        if getattr(args, "project", None):
+            _argv += ["--project", args.project]
+        if args.quiet:
+            _argv += ["--quiet"]
+        elif getattr(args, "brief", False):
+            _argv += ["--brief"]
+        if getattr(args, "allow_low_pairing", False):
+            _argv += ["--allow-low-pairing"]
+        print("[pipeline] ── 子带 %s ──" % _name, flush=True)
+        _rc = subprocess.call([sys.executable, _self] + _argv)
+        if _rc > _worst:
+            _worst = _rc
+        _rows.append((_name, _rc, os.path.join(_sub_out, "inspect.json")))
+        print("[pipeline] ── 子带 %s 结束 rc=%d ──" % (_name, _rc), flush=True)
+    # 扇出汇总必须逐带点名（2026-10-05）：此前只给一个「最严重退出码」，
+    # 实测柳辛庄 5-9 地块 band5 在 coverage 阶段 rc=2 中止 → 20 箱覆盖未判定、
+    # 4 项 parse 待裁决从未进入任何报告，而汇总只有一个数字 —— 这正是本技能
+    # L0「不静默丢数」与 Step 2「空集合不得判 PASS」要禁的形态：未判定被
+    # 折进退出码，人要逐个翻目录才发现该带根本没出 inspect。
+    # 故此处逐带报 rc，并**显式点名「未出 inspect」的带**（缺产物 ≠ 通过）。
+    print("[pipeline] 多地块扇出汇总：%d 个带，最严重退出码 %d" % (len(_subs), _worst),
+          flush=True)
+    _missing = []
+    for _name, _rc, _ij in _rows:
+        if os.path.isfile(_ij):
+            print("[pipeline]   · %s：rc=%d，已出 inspect.json" % (_name, _rc), flush=True)
+        else:
+            _missing.append(_name)
+            print("[pipeline]   · %s：rc=%d，**未出 inspect.json —— 该带内容未判定**"
+                  "（不是通过；按该带 logs/ 末段给出的处置调参或人工核对后重跑）"
+                  % (_name, _rc), flush=True)
+    if _missing:
+        print("[pipeline] ⚠ %d 个带未判定（%s）—— 整图不得出表；逐带处置见上"
+              % (len(_missing), "、".join(_missing)), flush=True)
+    return _worst
 
 
 def _pipe_effective_layers(profile_path):
@@ -376,6 +683,7 @@ def _pipe_effective_layers(profile_path):
     老画像没有该字段时回退读 `param_source.must_probe`，但**必须过滤提示语** ——
     该字段历史上把「值」和「提示文案」混排（无候选时写的是整句中文说明），
     直接当参数传会把中文句子送进脚本。读不到一律返回空 dict：不猜。
+    退役条件：老画像自然消亡（effective_layers 全覆盖）后删除回退分支（分支预算纪律 §十一）。
     """
     try:
         with open(profile_path, "r", encoding="utf-8") as f:
@@ -539,6 +847,319 @@ def _scan_nonstd_json(outdir):
     return bad
 
 
+def cmd_summary(args) -> int:
+    """打印 parsed.json 的楼栋×单元×楼层×户数×分纤箱总览表。
+
+    2026-10-04（P1-E4）：Step 3 提交材料的半成品，取代手写汇总脚本。
+    内联实现，不产生子脚本依赖。可选合并 coverage.json 的覆盖楼层列。
+    """
+    with open(args.parse_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    buildings = data.get("楼栋", {})
+    if not isinstance(buildings, dict):
+        print("[summary] parsed.json 的「楼栋」字段不是字典，无法汇总")
+        return 1
+
+    # 可选：读 coverage.json 补覆盖楼层
+    cov_map = {}  # (楼栋, 单元, 箱号) -> 覆盖楼层
+    if args.coverage_json and os.path.isfile(args.coverage_json):
+        with open(args.coverage_json, "r", encoding="utf-8") as f:
+            cov = json.load(f)
+        for bname, b in (cov.get("楼栋") or {}).items():
+            for uname, u in (b.get("单元") or {}).items():
+                for fx in (u if isinstance(u, list) else u.get("分纤箱", [])):
+                    if isinstance(fx, dict):
+                        cov_map[(bname, uname, fx.get("编号", ""))] = fx.get("覆盖楼层", "")
+
+    total_hu = 0
+    total_units = 0
+    fx_rows = []
+    print("=" * 72)
+    for bname in sorted(buildings.keys(), key=lambda s: int(''.join(c for c in s if c.isdigit()) or '0')):
+        b = buildings[bname]
+        units = b.get("单元", {})
+        print(f"\n== {bname} ==  标题: {b.get('标题', '')}  单元数: {len(units)}")
+        for uname in sorted(units.keys(), key=lambda s: int(''.join(c for c in s if c.isdigit()) or '0')):
+            u = units[uname]
+            total_units += 1
+            fxs = u.get("分纤箱", [])
+            if isinstance(fxs, str):
+                fxs = []
+            ft = u.get("楼层表", {}) or {}
+            hu_sum = 0
+            anno_layers = []
+            null_layers = []
+            # 2026-10-04 实测修复（P0）：原为手写 `int(k.replace('F',''))`，只认 '18F'/
+            #   '-1F'，图上出现 'B1'（负楼层中文写法，naming 模块与 Step 1c 均列为已知
+            #   形态）即 ValueError 崩溃、整个总览不可用。此处是同一份实现的漏网手抄本，
+            #   现统一走 floor_num_or_zero（唯一入口，支持 B1/B2/WF/-1F/18F/中文层）。
+            for fl in sorted(ft.keys(), key=lambda k: floor_num_or_zero(k)):
+                rec = ft[fl]
+                hu = rec.get("户数")
+                if hu is None:
+                    null_layers.append(fl)
+                else:
+                    hu_sum += int(hu)
+                    anno_layers.append(f"{fl}={hu}")
+            total_hu += hu_sum
+            print(f"  {uname}: {hu_sum}户  {' '.join(anno_layers)}")
+            if null_layers:
+                print(f"    无户数层: {', '.join(null_layers)}")
+            for fx in fxs:
+                if isinstance(fx, dict):
+                    fxid = fx.get("编号", "")
+                    inst = fx.get("安装楼层", "")
+                    cov_fl = cov_map.get((bname, uname, fxid), "")
+                    cov_str = f"  覆盖={cov_fl}" if cov_fl else ""
+                    print(f"    {fxid} 安装={inst}{cov_str}")
+                    fx_rows.append((bname, uname, fxid, inst, cov_fl))
+    print("\n" + "=" * 72)
+    print(f"汇总: 楼栋={len(buildings)} 单元={total_units} 户数={total_hu} 分纤箱={len(fx_rows)}")
+    return 0
+
+
+def cmd_verify_answer(args) -> int:
+    """成品 xlsx vs 参考答案 xlsx 逐行对拍（楼栋/单元/楼层/户号/分纤箱 五列）。
+
+    2026-10-04（P1-E5）：用户固定工作流收尾步骤，取代手写对拍脚本。
+    按「楼栋列非空」过滤水印行；输出差异行 + 每栋汇总。
+    内联实现，不产生子脚本依赖。
+
+    2026-10-05（一百五十九）：五列**按表头名定位**，不再硬写列字母 —— 初版写的
+    H/J/L/N/P 只是 24 列定稿模板的布局，用在 11 列降级表上会整体错位。docstring
+    同步改写（原「（H/J/L/N/P 五列）」已与实现不符，文档层不得滞后于规则层）。
+    """
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        print("[verify-answer] 需要 openpyxl，请先安装")
+        return 1
+
+    # 2026-10-05（一百五十九，边界探针 E6）：开卷前先验输入。实测传一个**存在但
+    #   不是 Excel** 的路径（如 .dxf）时，openpyxl 抛 InvalidFileException 直接
+    #   穿透到顶层 ⇒ rc=1 + Traceback，用户看到的是第三方库堆栈而不是「你给错了
+    #   文件」。缺参与错型都属**用法错误**，在此拦下并给中文说明，返回 2。
+    for _p, _label in ((args.new_xlsx, "--new"), (args.answer_xlsx, "--answer")):
+        if not os.path.isfile(_p):
+            print("[参数错误] %s 指向的文件不存在：%s" % (_label, _p))
+            return 2
+        if os.path.splitext(_p)[1].lower() not in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+            print("[参数错误] %s 不是 Excel 工作簿（扩展名 %r）：%s"
+                  "—— 本子命令只比对 gen 产出的 .xlsx 与参考答案 .xlsx"
+                  % (_label, os.path.splitext(_p)[1], _p))
+            return 2
+
+    # 2026-10-05（P1）：同一语义在不同模板下的**表头写法**（长的排前面，避免
+    #   「分纤箱编号」被「分纤箱」抢先命中）。增加新模板时只改这里。
+    _CANON = (("楼栋", ("六级", "楼栋")),
+              ("单元", ("七级", "单元")),
+              ("楼层", ("八级", "楼层")),
+              ("户号", ("九级", "户号")),
+              ("分纤箱", ("分纤箱编号", "分纤箱")))
+
+    def _colmap(ws):
+        """按**表头名**定位五列 -> ({语义: 列号}, [缺失语义...])。
+
+        为什么不能硬写列字母（原实现 column=8/10/12/14/16，即 H/J/L/N/P）：
+        那只是**24 列定稿模板**的布局。未传 --template 时 gen 走内置 11 列降级表头
+        （楼栋/单元/楼层/户号/分纤箱编号），五列位置完全不同 —— 实测对拍取到的是
+        「单元/户号/越界空/越界空/越界空」，于是**逐行全 DIFF**，而现场逐行读两面
+        可知楼栋·单元·户号·分纤箱四项**完全一致**。这是把「列错位」呈现成「结果全错」，
+        属可机械识别的失准，必须修。缺列时报人，不静默取空（空值会让差异看起来像数据问题）。
+        """
+        hdr = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=1, column=c).value
+            if v is not None and str(v).strip():
+                hdr.setdefault(str(v).strip(), c)
+        mapping, missing = {}, []
+        for canon, aliases in _CANON:
+            col = next((hdr[a] for a in aliases if a in hdr), None)
+            if col is None:
+                missing.append(canon)
+            else:
+                mapping[canon] = col
+        return mapping, missing
+
+    def _load(path, tag):
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
+        mapping, missing = _colmap(ws)
+        if missing:
+            raise ValueError(
+                "%s：未在表头找到 %s 列（按名定位，不硬写列字母）。"
+                "当前表头：%s。若本表不是标准地址表或用了未登记的新模板，请先登记其表头写法"
+                "（cmd_verify_answer._CANON）。已中止，避免按错位列输出误导性差异。"
+                % (tag, "/".join(missing),
+                   "、".join(sorted(hdr_names(ws))[:16]) or "(空)"))
+        print("[verify-answer] %s 列定位：%s（数据行起于第 2 行）"
+              % (tag, "，".join("%s=%s" % (k, openpyxl_col(mapping[k]))
+                                for k in ("楼栋", "单元", "楼层", "户号", "分纤箱"))))
+        rows = []
+        for r in range(2, ws.max_row + 1):
+            h = ws.cell(row=r, column=mapping["楼栋"]).value
+            if h in (None, ""):
+                continue
+            vals = []
+            for canon in ("楼栋", "单元", "楼层", "户号", "分纤箱"):
+                v = ws.cell(row=r, column=mapping[canon]).value
+                vals.append(str(v) if v is not None else "")
+            rows.append(tuple(vals))
+        return rows
+
+    def hdr_names(ws):
+        out = []
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=1, column=c).value
+            if v is not None and str(v).strip():
+                out.append(str(v).strip())
+        return out
+
+    def openpyxl_col(idx):
+        """1-based 列号 -> Excel 列字母（仅用于给人看的定位回显）。"""
+        from openpyxl.utils import get_column_letter
+        return get_column_letter(idx)
+
+    try:
+        rows_new = _load(args.new_xlsx, "新表")
+        rows_ans = _load(args.answer_xlsx, "标准答案")
+    except ValueError as e:
+        print("[verify-answer] [失败] %s" % e)
+        return 1
+    print(f"新表数据行: {len(rows_new)} | 标准答案数据行: {len(rows_ans)}")
+
+    diff = []
+    for i in range(max(len(rows_new), len(rows_ans))):
+        a = rows_new[i] if i < len(rows_new) else None
+        b = rows_ans[i] if i < len(rows_ans) else None
+        if a != b:
+            diff.append((i + 2, a, b))
+    # 2026-10-05：把「只有楼层列不同」的差异单独归类。原因：两张表可能一个
+    #   用英文写型（1F）、一个用中文（一层）—— 那是**口径写法**差异，不是数据错。
+    #   不静默抹平（仍计入 diff），但要在汇总里点明，否则会淹没在成百上千行里。
+    _floor_only = [d for d in diff
+                   if d[1] and d[2]
+                   and d[1][0] == d[2][0] and d[1][1] == d[2][1]
+                   and d[1][3] == d[2][3] and d[1][4] == d[2][4]
+                   and d[1][2] != d[2][2]]
+    if _floor_only:
+        print("[verify-answer] 其中 %d 行**仅有楼层写型不同**（楼栋/单元/户号/分纤箱四项一致）"
+              " —— 属口径写法差异，非户数/归属错；样例：%s"
+              % (len(_floor_only),
+                 "、".join("新表%s vs 答案%s" % (d[1][2], d[2][2]) for d in _floor_only[:3])))
+
+    print(f"差异行数: {len(diff)}")
+    for d in diff[:50]:
+        print(f"  行{d[0]}: 新表={d[1]}  答案={d[2]}")
+    if len(diff) > 50:
+        print(f"  ...（还有 {len(diff) - 50} 行差异未显示）")
+
+    # 每栋汇总
+    from collections import Counter, defaultdict
+    def _stat(rows):
+        cnt = Counter(); fx = defaultdict(set)
+        for h, j, l, n, p in rows:
+            cnt[h] += 1
+            fx[h].add(p)
+        return cnt, fx
+    c_new, fx_new = _stat(rows_new)
+    c_ans, fx_ans = _stat(rows_ans)
+    print("\n=== 每栋户数对比 ===")
+    for b in sorted(c_new, key=lambda x: int(''.join(c for c in x if c.isdigit()) or '0')):
+        mark = "OK" if c_new[b] == c_ans.get(b) else f"DIFF(答案{c_ans.get(b)})"
+        fx_ok = "OK" if fx_new[b] == fx_ans.get(b) else f"DIFF(答案{fx_ans.get(b)})"
+        print(f"  {b}: 新表{c_new[b]}户 [{mark}]  分纤箱{fx_new[b]} [{fx_ok}]")
+    print(f"\n合计: 新表{sum(c_new.values())}户  答案{sum(c_ans.values())}户")
+    return 0 if not diff else 1
+
+
+def _newrun_keep(e) -> bool:
+    """new-run 归档时**原地保留**的判定：输入图纸 / 解析缓存 / 验证基准。
+
+    2026-10-04（P0-A3）：唯一实现，禁止在别处另抄一份保留名单。
+    为什么要有这张表：new-run 语义是「清掉历史产物」，但桌面项目里输入 DXF、
+    <DXF>.geom.json（技能明示可复用的无损投影缓存）、<DXF>.pkl（load_dxf 缓存）
+    与标准答案 xlsx（verify-answer 的比对基准）都和产物同目录 —— 一并归档等于
+    把下一轮的输入和判卷标准搬走。未知形态默认返回 False（照常归档），故本表
+    只需覆盖「已知不可搬」的输入类，宁可少列也不误判成品为输入。
+    """
+    low = e.name.lower()
+    if low.endswith((".dxf", ".dwg", ".pkl")):
+        return True
+    if low.endswith(".geom.json"):
+        return True
+    if low.endswith((".xlsx", ".xls")) and any(
+            h in e.name for h in ("标准答案", "参考答案", "answer")):
+        return True
+    return False
+
+
+def cmd_new_run(args) -> int:
+    """从零跑清场：项目目录内历史产物归档进 run_<时间戳>/，重建空三本台账。
+
+    2026-10-04（P0-A2）：三本台账是累计式，「从零跑」若不隔离，上一轮裁决会被
+    误当「已确认基准」（违反从零语义）。归档不删除、可追溯；旧 run_* 归档目录
+    不再二次归档（避免套娃）。
+
+    2026-10-04（P0-A3 实测修复）：归档范围由「非 run_* 全搬」改为**排除输入与基准**。
+    原实现的隐含前提是「project-dir 内只放产物」，该前提在本机桌面三项目上**不成立**
+    （DXF / <DXF>.geom.json / 标准答案 xlsx 与产物同目录）→ 输入被搬空，紧随其后的
+    pipeline 必然找不到 DXF（首轮即复现）。故：输入图纸、几何/解析缓存、**验证基准**
+    一律原地保留并显式打印，`unknown` 形态默认不动（宁可少搬，不可误伤输入）。
+    """
+    import shutil
+    from datetime import datetime
+
+    pdir = Path(args.project_dir)
+    if not pdir.is_dir():
+        # 2026-10-04（轮次实测）：原实现在目录不存在时 rc=1 直接返回、不建目录，
+        #   与 pipeline 自建 --outdir 的行为不一致 —— 文档「从零纪律」首步
+        #   「new-run → pipeline」在全新项目上必然失败（空目录 = 首跑最常见形态）。
+        #   空目录本无历史可归档，正确动作是建目录并交给 ledger_state init 落三本台账。
+        try:
+            pdir.mkdir(parents=True, exist_ok=True)
+        except OSError as ex:
+            print(f"[new-run] 无法创建项目目录 {pdir}: {ex}")
+            return 1
+        print(f"[new-run] 项目目录不存在，已创建: {pdir}")
+    entries = [e for e in sorted(pdir.iterdir())
+               if not (e.is_dir() and e.name.startswith("run_"))]
+    if entries:
+        # P0-A3：区分「历史产物」与「输入/基准」。保留类原地不动并登记（不静默）。
+        to_archive, kept = [], []
+        for e in entries:
+            (kept if _newrun_keep(e) else to_archive).append(e)
+        for e in kept:
+            print(f"[new-run] 保留原位（输入/基准/缓存，非产物）：{e.name}")
+        if to_archive:
+            arch = pdir / ("run_" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+            arch.mkdir(exist_ok=True)
+            moved, failed = [], []
+            for e in to_archive:
+                try:
+                    shutil.move(str(e), str(arch / e.name))
+                    moved.append(e.name)
+                except OSError as ex:
+                    failed.append((e.name, str(ex)))
+            print(f"[new-run] 已归档 {len(moved)} 项 → {arch.name}/（不删除，可追溯）")
+            for n in moved:
+                print(f"    · {n}")
+            if failed:
+                print(f"[new-run] 归档失败 {len(failed)} 项（保留原位，不阻塞）：")
+                for n, ex in failed:
+                    print(f"    ! {n}: {ex}")
+        else:
+            print("[new-run] 项目目录内仅剩输入与基准，无历史产物可归档")
+    else:
+        print("[new-run] 项目目录已干净，无需归档")
+    rc = run_script("ledger_state.py",
+                    ["init", "--project-dir", str(pdir)]
+                    + (["--project", args.project] if args.project else []))
+    print("[new-run] 从零定义：DXF 同目录的 <DXF>.geom.json 为无损投影缓存可复用；"
+          "本目录内产物一律重生成")
+    return rc
+
+
 def cmd_pipeline(args):
     """串跑多阶段，返回退出码。
 
@@ -600,8 +1221,26 @@ def cmd_pipeline(args):
     ledger = []
     t_all = time.time()
 
+    _BRIEF_TAIL = 30  # --brief 每阶段控制台最多保留的子进程输出尾行数
+    _BRIEF_KEYS = ("[WARNING]", "[ERROR]", "FAIL", "WARN", "[gate]")
+
+    def _brief_lines(text, tail=_BRIEF_TAIL):
+        """退役条件：当 pipeline 改为结构化事件流（子进程输出机读化）后可删除，改由事件订阅做摘要。
+
+        --brief 摘要过滤：只保留「最后 tail 行 + 含关键字的行」（关键字见
+        _BRIEF_KEYS，[pipeline] 阶段状态行由调用方始终打印，不在此列）。
+        其余输出仍在 logs/<stage>.log，不丢信息，只是不刷屏。
+        """
+        lines = (text or "").splitlines()
+        n = len(lines)
+        return [l for i, l in enumerate(lines)
+                if i >= n - tail or any(k in l for k in _BRIEF_KEYS)]
+
     def _sink(stage):
-        return os.path.join(logdir, "%s.log" % stage) if args.quiet else None
+        # 2026-10-01（优化①）：--brief 与 --quiet 同落盘；区别只在控制台是否
+        #   打摘要（见 _run/_run_capture 的 brief 分支）。--quiet 行为不变。
+        return os.path.join(logdir, "%s.log" % stage) \
+            if (args.quiet or getattr(args, "brief", False)) else None
 
     def _run(stage, argv, script=None):
         """起一个子进程；--quiet 时输出落 logs/<stage>.log，否则透传。"""
@@ -611,6 +1250,7 @@ def cmd_pipeline(args):
         else:
             cmd = [sys.executable, self_py] + argv
         sink = _sink(stage)
+        brief = bool(getattr(args, "brief", False)) and not args.quiet
         if sink:
             os.makedirs(logdir, exist_ok=True)
             with open(sink, "w", encoding="utf-8", newline="\n") as f:
@@ -620,7 +1260,58 @@ def cmd_pipeline(args):
         el = time.time() - t0
         ledger.append({"阶段": stage, "rc": rc, "秒": round(el, 2)})
         print("[pipeline] %-9s rc=%-2s %7.2fs" % (stage, rc, el), flush=True)
+        if brief:
+            # --brief：控制台只显示摘要（全文见 log）。阶段状态行已在上行打印，
+            #   不受 brief 影响；关键字行（_BRIEF_KEYS）已由 _brief_lines 透传。
+            try:
+                with open(sink, "r", encoding="utf-8", errors="replace") as _bf:
+                    _btxt = _bf.read()
+            except OSError:
+                _btxt = ""
+            _bl = _brief_lines(_btxt)
+            if _bl:
+                print("[pipeline] %s 摘要（全文见 %s）：" % (stage, sink), flush=True)
+                for _l in _bl:
+                    print(_l, flush=True)
         return rc
+
+    def _run_capture(stage, argv, script=None):
+        """起一个子进程并捕获合并输出；返回 (rc, 输出文本)。
+
+        2026-09-26（示意画法回落）：count_box 阶段需检查子进程 stdout 是否含
+        [DIAG-SCHEMATIC-ICONS] token，_run 只回 rc 不回输出，故单列此变体。
+        输出去向与 _run 同口径：--quiet 落 logs/<stage>.log，否则透传控制台
+        （经外层 tee 同步进 pipeline.log）。--brief 同 --quiet 落盘，但额外在
+        控制台打摘要（_brief_lines 过滤）。子进程 stdout 已由
+        ensure_console_utf8 重定向为 UTF-8，故按 UTF-8 解码（不用 locale，
+        中文 Windows 默认 GBK 会解错）。
+        """
+        t0 = time.time()
+        if script:
+            cmd = [sys.executable, str(Path(__file__).parent / script)] + argv
+        else:
+            cmd = [sys.executable, self_py] + argv
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        out = (proc.stdout or b"").decode("utf-8", errors="replace")
+        sink = _sink(stage)
+        brief = bool(getattr(args, "brief", False)) and not args.quiet
+        if sink:
+            os.makedirs(logdir, exist_ok=True)
+            with open(sink, "w", encoding="utf-8", newline="\n") as f:
+                f.write(out)
+            if brief:
+                # --brief：控制台只显示摘要（全文见 log，返回仍是全量 out）。
+                for _l in _brief_lines(out):
+                    print(_l, flush=True)
+        else:
+            sys.stdout.write(out)
+            sys.stdout.flush()
+        el = time.time() - t0
+        ledger.append({"阶段": stage, "rc": proc.returncode, "秒": round(el, 2)})
+        print("[pipeline] %-9s rc=%-2s %7.2fs" % (stage, proc.returncode, el),
+              flush=True)
+        return proc.returncode, out
 
     def _std_json_gate(rc):
         """产物 JSON 标准性闸门（2026-09-18）：非标准字面量 ⇒ rc 抬到 2，不得静默出关。"""
@@ -644,9 +1335,8 @@ def cmd_pipeline(args):
         """
         total = time.time() - t_all
         path = os.path.join(outdir, "pipeline_timing.json")
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"dxf": dxf, "outdir": outdir, "total_sec": round(total, 2),
-                       "stages": ledger}, f, ensure_ascii=False, indent=1)
+        write_json(path, {"dxf": dxf, "outdir": outdir, "total_sec": round(total, 2),
+                          "stages": ledger})
         print("")
         print("-" * 68)
         print("[pipeline] 合计 %.2fs（%d 阶段）  产物目录: %s" % (total, len(ledger), outdir))
@@ -703,8 +1393,20 @@ def cmd_pipeline(args):
     rc = _run("plan", plan_argv)
     if rc:
         return _dump(_std_json_gate(rc), "plan")
+    # 2026-09-27（P0-1，实跑修复）：plan 之后立即对拍「画像选法 × 本入口能力表」。
+    #   此前画像可申报一个本入口没有映射的脚本而**无人报错** —— 该路被静默跳过，
+    #   直到 inspect C6 才 FAIL，报错文案还指向画像（误导排查方向）。此处 fail-closed。
+    _cap_probs = _pipe_capability_problems(prof)
+    if _cap_probs:
+        print("[pipeline] ! 画像选法与本入口能力表不一致（禁止静默跳过）：", flush=True)
+        for _p in _cap_probs:
+            print("[pipeline]     - %s" % _p, flush=True)
+        ledger.append({"阶段": "plan.capability", "rc": 2, "秒": 0.0})
+        return _dump(2, "plan")
     if stop_idx < 3:
         return _dump(0)
+
+    # 注：多地块扇出**不在这里**（plan 之后），而在 unit_gaps 之后 —— 见 1568 行旁说明。
 
     # ---- ③b titleblock（图签第二来源；仅画像申报 present / variant 时跑）----
     # 2026-09-18（实跑修复，P1）：画像把 titleblock_annotation 判为 present 并明确写出
@@ -908,6 +1610,22 @@ def cmd_pipeline(args):
     if stop_idx < 7:
         return _dump(0)
 
+    # ---- ④c 多地块自动分带（2026-10-05）：把 split-band 接进串跑 ----
+    #   位置选在 **unit_gaps 之后、parse 之前**：串号风险只来自 parse 及下游（同名楼栋
+    #   按楼名去重），而 geom/probe/plan/titleblock/fxmap/fx_locations/unit_gaps 全是
+    #   parse 之前的整图级阶段，**无串号风险、且整图级有独立价值**（图签第二来源、
+    #   单元×箱预检）。若把扇出放在 plan 之后，这些整图产物会一起消失 —— 实测冒烟
+    #   golden 立刻报 lxz14 的 titleblock/fx_locations/unit_box_gaps 三项 MISSING。
+    if stop_idx >= _PIPE_STAGES.index("parse"):
+        _fanned = _pipe_fanout_bands(args, dxf, outdir, cfg, args.project_dir)
+        if _fanned is not None:
+            ledger.append({"阶段": "split_band.fanout", "rc": _fanned, "秒": 0.0})
+            print("[pipeline] 本图为多地块，已按带分别跑完；**各带产物分别在 "
+                  "<outdir>/bands/<带名>/**。整图级只保留 parse 之前的阶段产物"
+                  "（图签/箱清单/单元预检），**不产出整图级 parse/inspect** —— "
+                  "整图解析会让同名楼栋串号，是刻意不做的", flush=True)
+            return _dump(_fanned, "split_band.fanout")
+
     # ---- ⑤ parse ----
     parse_argv = ["parse", "--dxf", dxf, "--config", cfg,
                   "--profile", prof, "--out", parsed]
@@ -919,6 +1637,31 @@ def cmd_pipeline(args):
         parse_argv += ["--expand-bldg-ranges"]
         print("[pipeline] 已按 --expand-bldg-ranges 展开区间楼号（`N-M号楼` → N..M 全部）",
               flush=True)
+    # 2026-09-30（一百二十八，云峰P0-1机制①）：分离形态单元轴合成开关透传。
+    #   probe 已在 suggested_params.unit_split_keyword 给出建议（如`单元`），parse 侧
+    #   已支持 --unit-split-keyword，但 pipeline 从不转发 —— 云峰 2#/3#/6# 楼八单元
+    #   全丢即因此（marker 容器缺失，对照表单元号无处可挂）。此处按三级取值：
+    #   ① pipeline 显式 --unit-split-keyword 优先；② cfg 探查建议；③ 都没有则不传。
+    _usk = getattr(args, "unit_split_keyword", None)
+    if not _usk:
+        try:
+            with open(cfg, "r", encoding="utf-8") as _cf_usk:
+                _sp_usk = (json.load(_cf_usk).get("suggested_params") or {})
+            _usk = (_sp_usk.get("unit_split_keyword") or "").strip() if isinstance(
+                _sp_usk.get("unit_split_keyword"), str) else _sp_usk.get("unit_split_keyword")
+        except (IOError, json.JSONDecodeError, OSError):             # noqa: BLE001
+            _usk = None
+    if _usk and str(_usk).strip() and str(_usk).strip().lower() not in ("null", "none", "未提供"):
+        parse_argv += ["--unit-split-keyword", str(_usk).strip()]
+        print("[pipeline] 已下传 --unit-split-keyword %s（分离形态单元轴合成；来源：%s）"
+              % (str(_usk).strip(),
+                 "pipeline 参数" if getattr(args, "unit_split_keyword", None) else "探查建议"),
+              flush=True)
+    # 2026-09-30（一百三十二，V3 Phase A）：parse 去决策开关透传（默认关闭）。
+    if getattr(args, "parse_no_floor", False):
+        parse_argv += ["--floor-mode", "nofloor"]
+        print("[pipeline] 已按 --parse-no-floor 下传 parse --floor-mode nofloor"
+              "（只定归属不定安装楼层；C2/C3/gen 双模式消费）", flush=True)
     if _bmap:
         # 硬约束② 的落地：有总图对照表时，箱的楼栋/单元归属以它为准（不再按标题 x 中分）。
         # --fx-map 仍只做「缺失安装楼层回填」，不覆盖 parse 实测值。
@@ -938,8 +1681,13 @@ def cmd_pipeline(args):
 
     # ---- ⑥ coverage（方法由画像决定，不在此处二次推断）----
     _cov_produced = False  # 2026-09-25（评审 P0 stale 守卫）：本轮产出追踪标志
-    cov_cmd, cov_note = _pipe_coverage_choice(prof)
+    cov_cmd, cov_note, cov_blocked = _pipe_coverage_choice(prof)
     print("[pipeline] 覆盖判定选法: %s" % cov_note, flush=True)
+    if cov_blocked:
+        # 2026-09-27（P0-1）：申报了脚本但本入口接不上（或 unimplemented）——
+        #   不是「本图不适用」，不得 rc=3 放过（那会让覆盖零产出直到 C6 才暴露）。
+        ledger.append({"阶段": "coverage", "rc": 2, "秒": 0.0})
+        return _dump(2, "coverage")
     if cov_cmd is None:
         ledger.append({"阶段": "coverage", "rc": 3, "秒": 0.0})
         print("[pipeline] %-9s rc=3      0.00s  (本图不适用，非错误)" % "coverage", flush=True)
@@ -958,6 +1706,13 @@ def cmd_pipeline(args):
         elif cov_cmd == "coverage-vshape":
             print("[pipeline] 提示：本次无箱位直读标注(<outdir>/fx_locations.json)，"
                   "V 型法安装层缺独立第二来源，结论须照此标注", flush=True)
+        # 2026-09-26（第5轮迭代）：V 型法箱号锚缺席配对 —— parsed.json 存在时透传
+        # --parse，不存在不传、行为不变。仅 coverage-vshape 消费该参数
+        # （analyze_coverage.py 无此参数，传了即 unrecognized arguments rc=2），
+        # 故按子命令分派，与 --fx-locations 同处理。
+        if cov_cmd == "coverage-vshape" and os.path.isfile(parsed):
+            cov_argv += ["--parse", parsed]
+            print("[pipeline] 解析侧安装层已接入 V 型法锚缺席配对: %s" % parsed, flush=True)
         _lay, _lay_src = _pipe_effective_layers(prof)
         # 2026-09-18（实跑修复，P1）：**图层参数按子命令分派**。analyze_coverage_vshape.py
         #   （V 型法）只吃文字标注与米数列，**完全不消费 --wire-layer / --fx-symbol-layer**
@@ -972,6 +1727,15 @@ def cmd_pipeline(args):
                 cov_argv += ["--wire-layer", _want_wl]
             if _want_fx:
                 cov_argv += ["--fx-symbol-layer", _want_fx]
+            else:
+                _pipe_hint_fx_symbol_cands(prof)
+            # 2026-10-05（P1）：子脚本提示用户加的开关，统一入口必须能透传。
+            #   coverage 的硬失败文案原文让用户加 --allow-low-pairing，而 pipeline 此前
+            #   没有该参数 —— 用户照做只会得到 unrecognized arguments（接口断层）。
+            if getattr(args, "allow_low_pairing", False):
+                cov_argv += ["--allow-low-pairing"]
+                print("[pipeline] 已透传 --allow-low-pairing：符号配对率不足时不再硬失败，"
+                      "结果须人工复核", flush=True)
             if _lay:
                 print("[pipeline] 自画像下传图层(%s)：%s"
                       % (_lay_src, ", ".join("%s=%s" % (k, v) for k, v in _lay.items())),
@@ -1036,15 +1800,15 @@ def cmd_pipeline(args):
         print("[pipeline] %-9s rc=0      0.00s  (复用已有 count_box.json —— 手工调参产物"
               "优先不重算；如需重算请先删除该文件再跑)" % "count_box", flush=True)
         # 2026-09-25（云峰实跑 + opencode 审核返工，问题 2 配套）：复用轮次不重跑
-        #   count_box_icons.py，其质量告警（乘数/偏移异常/共用刻度列等）只躺在旧 log
+        #   count_box_icons.py，其质量告警（乘号式标注/偏移异常/共用刻度列等）只躺在旧 log
         #   里 —— 此处只读产物打一行摘要，不重算不覆盖；判定与裁决出口统一在
         #   inspect 的 C5 count-box 质量透传。
         try:
             with open(cb_out, "r", encoding="utf-8") as _cbf:
                 _cb = json.load(_cbf) or {}
-            print("[pipeline]   count_box 复用摘要：归层后总户数 %s；乘数 %d / 偏移异常列 %d / "
+            print("[pipeline]   count_box 复用摘要：归层后总户数 %s；乘号式标注 %d / 偏移异常列 %d / "
                   "共用刻度列组 %d / 多候选 %d / 未归属 %s（判定以 inspect C5 透传为准）"
-                  % (_cb.get("归层后总户数"), len(_cb.get("待裁决_乘数标注") or []),
+                  % (_cb.get("归层后总户数"), len(_cb.get("乘号式户数标注") or []),
                      len(_cb.get("刻度偏移异常列") or []), len(_cb.get("共用刻度列组") or []),
                      len(_cb.get("同一端点多候选") or []), _cb.get("未归属图标数")), flush=True)
         except (OSError, ValueError, TypeError):
@@ -1073,8 +1837,33 @@ def cmd_pipeline(args):
             _cb_argv += ["--wire-layer", _cb_wl]
             print("[pipeline] count_box 下传 wire-layer: %s（来源：画像 effective_layers）"
                   % _cb_wl, flush=True)
-        _rc_cb = _run("count_box", _cb_argv, script="count_box_icons.py")
-        if _rc_cb == 3:
+        _rc_cb, _cb_text = _run_capture("count_box", _cb_argv,
+                                           script="count_box_icons.py")
+        if _rc_cb == 3 and "[DIAG-SCHEMATIC-ICONS]" in _cb_text:
+            # 2026-09-26：示意画法确认 → 按 L1-C1（2026-09-16 裁决）回落皮线执行
+            # count_households.py（替换显式留痕，非静默择法）；格式转换后写
+            # count_box.json，该阶段记 rc=3（申报制）继续流水线（后续照跑）。
+            print("[count_box] 示意画法确认 → 按 L1-C1（2026-09-16 裁决）回落皮线执行 "
+                  "count_households.py（替换显式留痕，非静默择法）", flush=True)
+            _fb_path = os.path.join(outdir, "count_fallback.json")
+            _rc_fb = _run("count_fallback",
+                          ["count", "--dxf", dxf, "--config", cfg,
+                           "--profile", prof, "--out", _fb_path])
+            if _rc_fb:
+                print("[count_box] 皮线回落失败（rc=%d），原样停机，不硬凑；"
+                      "其输出见上方（非 --quiet/--brief）或 logs/count_fallback.log"
+                      "（--quiet/--brief）"
+                      % _rc_fb, flush=True)
+                return _dump(_std_json_gate(_rc_fb), "count_box")
+            _ok, _msg = _cb_convert_wire_fallback(_fb_path, dxf, cb_out)
+            if not _ok:
+                print("[count_box] 回落产物格式转换失败：%s —— 原样停机，不硬凑"
+                      % _msg, flush=True)
+                return _dump(_std_json_gate(2), "count_box")
+            print("[count_box] 回落完成：count_box.json 来源=皮线回落（%s），"
+                  "归层后总户数=%s —— 后续 coverage/inspect 照跑" % (_fb_path, _msg),
+                  flush=True)
+        elif _rc_cb == 3:
             print("[pipeline] count_box rc=3 = 本图不适用（申报制），按降级路径继续；"
                   "inspect 的 C5/C8 将按缺失如实判 SKIP", flush=True)
         elif _rc_cb:
@@ -1132,6 +1921,10 @@ def cmd_pipeline(args):
     elif not _cb_run and os.path.isfile(_cb_path):
         print("[pipeline] ! 检测到残留 count_box.json 但本轮画像非图标法 —— "
               "已忽略，避免 stale 文件污染；如需清除请删除 %s" % _cb_path, flush=True)
+    # 2026-09-30（一百三十二）：C3-nofloor 用对照表作第二来源。_bmap 创建时已有
+    #   “本轮产出/用户显式”守卫，此处只补 isfile（stale 残留早被置空，不会到这）。
+    if _bmap and os.path.isfile(_bmap):
+        insp_argv += ["--fx-map", _bmap]
     _rc_insp = _run("inspect", insp_argv)
     return _dump(_rc_insp, "inspect" if _rc_insp else None)
 
@@ -1203,10 +1996,21 @@ def main():
                               "对照表为准**（SKILL.md 硬约束②，禁用标题 x 中分）。"
                               "总图对照表形态的图纸不传它则逐栋 0 箱；只改归属不改安装楼层")
     p_parse.add_argument("--unit-pattern", default=None)
+    p_parse.add_argument("--unit-split-keyword", default=None,
+                         help="分离形态单元轴合成关键词（单元轴=纯数字+含关键词纯文字两个实体，"
+                              "如『1』+『单元电井』）；传入（如`单元`）后启用合成锚点")
+    p_parse.add_argument("--floor-mode", default=None, choices=["full", "nofloor"],
+                         help="安装楼层判定模式（2026-09-30 V3 Phase A）：full=现行判定照旧；"
+                              "nofloor=去决策（只定归属不定安装楼层；默认 full，老行为不变）")
     p_parse.add_argument("--cable-keywords", default=None, help="光缆识别关键词正则")
     p_parse.add_argument("--unit-cluster", type=float, default=None, help="留空=子脚本按层高自适应")
     p_parse.add_argument("--unit-range", type=float, default=None, help="留空=子脚本按层高自适应")
     p_parse.add_argument("--y-tol", type=float, default=None, help="留空=子脚本按层高自适应")
+    p_parse.add_argument("--clone-shared-hu", action="store_true", default=False,
+                         help="共用轴户数列落空时克隆进该栋每个单元（一百五十九，默认关）。"
+                              "属归属裁定：须先以图签第二来源（「层数×每层户数×单元数」）核对"
+                              "确为「每单元每层」口径后再开，否则会把「整栋每层」口径翻倍；"
+                              "仅对户数生效，箱编号/皮线米数仍不克隆")
     p_parse.add_argument("--insert-blocks", default=None, help="INSERT块名列表，逗号分隔")
     p_parse.add_argument("--insert-attrib-tag", default=None, help="ATTRIB属性tag名，逗号分隔")
     p_parse.add_argument("--insert-attrib-val", default=None)
@@ -1287,6 +2091,10 @@ def main():
     p_vs.add_argument("--fx-locations", default=None,
                       help="箱位直读标注 JSON（extract_fx_locations.py 产出，可选）；"
                            "提供后 vshape 做安装层两来源交叉校验")
+    p_vs.add_argument("--parse", default=None,
+                      help="结构化解析产物 parsed.json（可选）；箱号锚缺席时 vshape 按"
+                           "解析侧安装层（口径A′箱位直读）与 V 谷底配对归属"
+                           "（2026-09-26 第5轮迭代；文件不存在/无数据时行为不变）")
     p_vs.add_argument("--dev-gate-factor", type=float, default=None,
                       help="v底vs箱符号偏差可信门禁系数（×层高）；留空=vshape 默认 5.0")
     p_vs.add_argument("--profile", default=None,
@@ -1320,6 +2128,9 @@ def main():
     #   inspect 根本没跑、rc=2 而**没有任何检查项输出**（实测，冒烟测试只测本体测不到）。
     p_insp.add_argument("--titleblock", dest="titleblock_json", default=None,
                         help="read_titleblock_households.py 输出的图签读数 JSON（可选，供 C10）")
+    p_insp.add_argument("--fx-map", dest="fx_map_json", default=None,
+                        help="总图 FX 对照表 JSON（extract_fx_map.py 产物，可选；"
+                             "parse floor-mode=nofloor 时 C3 改比 coverage vs 对照表，需本输入）")
     p_insp.add_argument("--json", dest="json_out", default=None, help="机读结果输出路径（可选）")
 
     # count: 户数统计（皮线计数）
@@ -1385,6 +2196,10 @@ def main():
     # 旧名 --dxf-json / --coverage-json 保留为别名，既有调用不受影响（dest 不变）。
     p_gen.add_argument("--parse", "--dxf-json", dest="dxf_json", required=True,
                        help="parse 输出的 JSON（别名 --dxf-json）")
+    # 2026-09-29（一百二十七·P0）：gen 强制绑定闭合核查。缺省即 rc=2 禁出表，
+    #   不再允许直调裸出（此前 pending 可绕过 inspect 进入成品）。
+    p_gen.add_argument("--inspect", "--inspect-json", dest="inspect_json", required=True,
+                       help="inspect 输出的闭合 JSON（必传，rc==0 且输入指纹一致）")
     p_gen.add_argument("--out", required=True, help="输出 xlsx 路径")
     p_gen.add_argument("--coverage", "--coverage-json", dest="coverage_json",
                        help="用户裁决后的覆盖范围 JSON（别名 --coverage-json）")
@@ -1469,6 +2284,10 @@ def main():
                         help="几何缓存比 DXF 新时直接复用，不重跑 dump_geom")
     p_pipe.add_argument("--quiet", action="store_true",
                         help="各阶段输出写入 <outdir>/logs/<阶段>.log，不刷屏")
+    p_pipe.add_argument("--brief", action="store_true",
+                        help="日志落盘 + 控制台只显示摘要（每阶段最后 30 行 + "
+                             "[WARNING]/[ERROR]/FAIL/WARN/[gate] 行；全文见 "
+                             "<outdir>/logs/<阶段>.log）。--quiet 为完全静默")
     # 2026-09-18 整改：画像早已探明这两个图层，但流水线没有环节把它喂给 coverage，
     #   导致 coverage 裸跑（扫全图建筑 WALL 层 / 找不到箱符号层）实测 rc=3。
     #   留空则自动取自画像（effective_layers，兼容老画像的 param_source.must_probe）。
@@ -1479,9 +2298,29 @@ def main():
     p_pipe.add_argument("--bldg-map", default=None,
                         help="总图 FX 对照表 JSON；留空=自动用 <outdir>/fxmap.json（若存在）")
     p_pipe.add_argument("--expand-bldg-ranges", action="store_true", default=None,
-                        help="把标题里的区间楼号 `N-M号楼` 展开为 N..M 全部楼栋（默认关闭）。"
-                             "区间语义（`1-3号楼`=1、2、3 号 还是 1、3 号）只能由人裁决，"
-                             "**确认后**再开启；开启动作会透传给 parse。")
+                         help="把标题里的区间楼号 `N-M号楼` 展开为 N..M 全部楼栋（默认关闭）。"
+                              "区间语义（`1-3号楼`=1、2、3 号 还是 1、3 号）只能由人裁决，"
+                              "**确认后**再开启；开启动作会透传给 parse。")
+    p_pipe.add_argument("--unit-split-keyword", default=None,
+                         help="分离形态单元轴合成关键词（如`单元`）；留空=自动取探查建议 "
+                              "suggested_params.unit_split_keyword；显式给出优先。")
+    p_pipe.add_argument("--parse-no-floor", action="store_true", default=None,
+                        help="parse 去决策（V3 Phase A）：只定归属、不定安装楼层 "
+                             "（透传 parse --floor-mode nofloor；C2/C3/gen 双模式消费；"
+                             "默认关闭，老行为不变）。")
+    # 2026-10-05（P1）：同一处接口断层在 coverage 这个开关上重演过一次 —— 该处的报错
+    #   文案原文让用户「加 --allow-low-pairing 强行继续」，而流水线入口一直没有这个参数，
+    #   用户照做只会拿到 unrecognized arguments。凡子脚本提示用户加的开关，统一入口
+    #   必须同步具备，否则提示即死路。默认 False（保持原硬失败行为），仅透传不代判。
+    p_pipe.add_argument("--allow-low-pairing", action="store_true", default=False,
+                        help="本图确无箱图形符号（箱体只写编号）时，允许 coverage 在低/零"
+                             "配对率下强行继续（结果须人工复核）；仅透传给 coverage 子命令。")
+    # 2026-10-05：多地块图的分带此前**只在独立子命令里**，串跑撞同名楼守卫必然 rc=2
+    #   而正确路径走不到。默认开启（单地块图量出 <2 带即原路返回，零影响）。
+    p_pipe.add_argument("--no-auto-split-band", dest="auto_split_band",
+                        action="store_false", default=True,
+                        help="关闭「多地块自动分带并逐带跑完整 pipeline」（默认开启；"
+                             "子带数 <2 时自动退回单地块路径）")
 
     # budget: SKILL.md 体量闸门（2026-09-18 新增）
     #   阈值从 version.json 的 budget 段读（单一权威）；脚本内只留兜底值，且会标注实际来源。
@@ -1499,6 +2338,32 @@ def main():
     p_tr.add_argument("--closure", default=None,
                       help="inspect_closure.py --json 的机读结果（可选，用于判据 #4）")
     p_tr.add_argument("--json-out", default=None, help="机读结果输出路径（可选）")
+
+    # new-run: 从零跑清场（2026-10-04 新增，P0-A2）
+    #   动机：三本台账累计式，复跑不隔离会让上一轮裁决被误当「已确认基准」。
+    #   行为：项目目录内非 run_* 产物全部归档进 run_<时间戳>/（不删除），随后重建空台账。
+    p_nr = sub.add_parser("new-run", parents=[common],
+                          help="从零跑清场：归档项目目录内历史产物并重建三本台账")
+    p_nr.add_argument("--project-dir", required=True, help="项目产物目录（三本台账所在目录）")
+    p_nr.add_argument("--project", default=None, help="项目名（写入台账的项目字段，可选）")
+
+    # summary: 解析结果总览（2026-10-04 新增，P1-E4）
+    #   动机：每次跑完 parse 都手写汇总脚本才能看到楼栋×单元×户数×箱，浪费。
+    #   行为：读 parsed.json，打印总览表（Step 3 提交材料的半成品），内联实现无子脚本。
+    p_sum = sub.add_parser("summary", parents=[common],
+                          help="打印 parse.json 的楼栋×单元×户数×分纤箱总览表")
+    p_sum.add_argument("--parse", dest="parse_json", required=True,
+                       help="parse_dxf_structured.py 输出的 JSON")
+    p_sum.add_argument("--coverage", dest="coverage_json", default=None,
+                       help="coverage-vshape.py 输出 JSON（可选，附加覆盖楼层列）")
+
+    # verify-answer: 成品 vs 参考答案逐行对拍（2026-10-04 新增，P1-E5）
+    #   动机：跑完必核对是用户固定工作流，每次手写对拍脚本，口径可能不一致。
+    #   行为：openpyxl 逐行对比 H/J/L/N/P 五列，打印差异 + 每栋汇总，内联实现。
+    p_va = sub.add_parser("verify-answer", parents=[common],
+                         help="成品 xlsx vs 参考答案 xlsx 逐行对拍（H/J/L/N/P 五列）")
+    p_va.add_argument("--new", dest="new_xlsx", required=True, help="待验证的成品 xlsx")
+    p_va.add_argument("--answer", dest="answer_xlsx", required=True, help="标准答案 xlsx")
 
     args = ap.parse_args()
 
@@ -1628,8 +2493,16 @@ def main():
 
     # H3: 校验 --dxf 参数（gen / verify-truth / inspect / assemble / apply-ruling 子命令不需要）
     if args.cmd not in ("gen", "verify-truth", "inspect", "assemble", "apply-ruling",
-                        "budget", "transitions") and not args.dxf:
-        ap.error("--dxf 是必需参数（gen / verify-truth / inspect / assemble / apply-ruling / budget / transitions 除外）")
+                        "budget", "transitions", "new-run", "summary", "verify-answer") and not args.dxf:
+        ap.error("--dxf 是必需参数（gen / verify-truth / inspect / assemble / apply-ruling / budget / transitions / new-run / summary / verify-answer 除外）")
+
+    # H3.5: plan --project-dir 自动推断（2026-10-04 P1-E1）
+    #   plan 手动直调漏传 --project-dir → intake_table=unknown 阻塞（三次实测复发）。
+    #   pipeline 已透传；手动直调时从 --dxf 父目录自动推断。
+    if args.cmd == "plan" and getattr(args, "project_dir", None) is None and getattr(args, "dxf", None):
+        _inferred = os.path.dirname(os.path.abspath(args.dxf))
+        args.project_dir = _inferred
+        print(f"[param] --project-dir 未传，由 --dxf 路径推断 = {_inferred}")
 
     # 分发
     if args.cmd == "probe":
@@ -1726,6 +2599,8 @@ def main():
             cmd += ["--fx-pattern", args.fx_pattern]
         if getattr(args, "titleblock_json", None):
             cmd += ["--titleblock", args.titleblock_json]
+        if getattr(args, "fx_map_json", None):
+            cmd += ["--fx-map", args.fx_map_json]
         if args.json_out:
             cmd += ["--json", args.json_out]
         sys.exit(run_script("inspect_closure.py", cmd))
@@ -1764,6 +2639,13 @@ def main():
         if args.dry_run:
             _c += ["--dry-run"]
         sys.exit(run_script("apply_ruling.py", _c))
+    elif args.cmd == "new-run":
+        # 2026-10-04（P0-A2）：登记了入口就必须接得上派发分支（apply-ruling 的前车之鉴）
+        sys.exit(cmd_new_run(args))
+    elif args.cmd == "summary":
+        sys.exit(cmd_summary(args))
+    elif args.cmd == "verify-answer":
+        sys.exit(cmd_verify_answer(args))
 
 
 if __name__ == "__main__":

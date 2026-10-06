@@ -23,9 +23,9 @@ import os
 import re
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
+from ftth_common import setup_logger, bldg_num, ensure_console_utf8, write_json
 
-from ftth_common import setup_logger, bldg_num
+ensure_console_utf8()
 
 log = setup_logger("merge_json")
 
@@ -188,13 +188,12 @@ if conflicts and not args.allow_overwrite:
     else:
         conflict_path = conflict_path + "_conflict.json"
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(conflict_path)) or ".", exist_ok=True)
-        with open(conflict_path, "w", encoding="utf-8") as f:
-            json.dump({"status": "FAIL", "reason": "跨输入同名楼栋",
-                       "conflicts": conflicts}, f, ensure_ascii=False, indent=2)
+        write_json(conflict_path, {"status": "FAIL", "reason": "跨输入同名楼栋",
+                                   "conflicts": conflicts}, log=log)
         log.info(f"冲突详情已写入备查：{conflict_path}")
-    except IOError as e:
+    except OSError as e:  # C2 rc=4：写盘失败（同本文件正式产物出口；IOError 过窄）
         log.error(f"无法写入冲突详情文件：{conflict_path}\n{e}")
+        sys.exit(4)
     sys.exit(2)
 
 # 按楼栋编号排序
@@ -217,11 +216,9 @@ for bldg_name, bldg_data in merged["楼栋"].items():
 log.info(f"\n合并完成: {len(merged['楼栋'])} 栋楼, {total_units} 个单元, {total_floors} 个楼层记录, {total_boxes} 个分纤箱")
 
 # 写入
-os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
 try:
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
-except IOError as e:
+    write_json(args.out, merged, log=log)
+except OSError as e:  # C2 rc=4：写盘失败（含ensure_parent；IOError过窄）
     log.error(f"无法写入输出文件: {args.out}\n{e}")
-    sys.exit(1)
+    sys.exit(4)  # C2 rc=4：写盘失败
 log.info(f"已保存: {args.out}")

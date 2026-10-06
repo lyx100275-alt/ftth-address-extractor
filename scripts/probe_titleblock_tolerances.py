@@ -47,7 +47,7 @@ import re
 import sys
 
 from ftth_common import (ToleranceEstimateError, ensure_console_utf8,
-                         estimate_titleblock_tolerances, UNIT_RE_SRC)
+                         estimate_titleblock_tolerances, UNIT_RE_SRC, write_json)
 
 ensure_console_utf8()
 
@@ -237,11 +237,8 @@ def main(argv=None):
           '两者不一致时以显式传入为准。')
 
     if a.out:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
-        with io.open(a.out, 'w', encoding='utf-8') as f:
-            json.dump({'dxf': a.dxf, '图层': a.layer, '信号计数': ev,
-                       '建议几何容差': est, '分地块交叉校验': seg_checks or None}, 
-                      f, ensure_ascii=False, indent=2)
+        write_json(a.out, {'dxf': a.dxf, '图层': a.layer, '信号计数': ev,
+                           '建议几何容差': est, '分地块交叉校验': seg_checks or None})
         print('\n[写出] %s' % a.out)
     return 0
 

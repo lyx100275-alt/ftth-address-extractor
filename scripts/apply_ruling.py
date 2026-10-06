@@ -9,12 +9,20 @@
 
   · 不给的字段不改；
   · 找不到目标就硬失败并列出「现有键」，不猜、不静默跳过；
-  · 裁决值里出现乘号（* / × / 户*N）一律拒绝——乘数属于裁决项，须人工展开成绝对户数
-    （与 SKILL.md「未裁决值不得进入成品」同则）。
+  · 裁决值里出现乘号（* / × / 户*N）一律拒绝——裁决值是**绝对户数**，本脚本只落数、
+    不做乘法（`*N` 一类乘号标注属**直读**形态，读数在解析阶段已按「乘号后数字即该处
+    户数」取出，不在此处展开；两套口径不得混用）。
+
+**两种产物、两条通路**（2026-09-27 补）：
+  · 出表输入 JSON（assemble_households.py 产物，顶层「楼栋」含「楼层表」）
+    → 类型 {户数, 安装楼层, 覆盖范围, 删除楼层, 删除单元}
+  · 覆盖范围 JSON（analyze_coverage.py 产物，顶层含「需人工裁决」）
+    → 类型 {解除待裁决}（见下）
 
 用法（推荐经统一入口）：
     ftth.py apply-ruling --json assembly.json --ruling ruling.json
     ftth.py apply-ruling --json assembly.json --set "1#楼/1单元/3层=4" --dry-run
+    ftth.py apply-ruling --json coverage.json --ruling ruled_coverage.json --out coverage_ruled.json
 
 --ruling 清单格式（JSON，顶层键「裁决」为数组）：
     {
@@ -23,15 +31,35 @@
         {"类型": "安装楼层", "楼栋": "4#配套", "单元": "1单元", "箱": "FX01#", "值": "地下一层"},
         {"类型": "覆盖范围", "楼栋": "4#配套", "单元": "1单元", "箱": "FX01#", "值": "地下一层"},
         {"类型": "删除楼层", "楼栋": "9#楼",  "单元": "2单元", "楼层": "18层"},
-        {"类型": "删除单元", "楼栋": "9#楼",  "单元": "3单元"}
+        {"类型": "删除单元", "楼栋": "9#楼",  "单元": "3单元"},
+        {"类型": "解除待裁决", "对象": "4#配套楼/FX22#", "裁决原文": "取 -1F", "裁决人": "用户",
+         "适用范围": "4#配套楼 安装楼层冲突"}
       ]
     }
 
 字段说明：
-  · 「类型」∈ {户数, 安装楼层, 覆盖范围, 删除楼层, 删除单元}；
+  · 「类型」∈ {户数, 安装楼层, 覆盖范围, 删除楼层, 删除单元, 解除待裁决}；
   · 「单元」省略 = 对该楼栋**全部单元**生效（共享系统图克隆的全改场景）；
   · 「箱」按分纤箱「编号」精确匹配（不做模糊匹配）；
   · 「值」对户数为正整数，其余为字符串。
+
+**「解除待裁决」类型（2026-09-27 新增；出口见 operations_discipline.md §七.1）**
+
+契约：「**一次锁定，不再复议** —— 收到人工裁决后，该问题**不得再次列为待确认项**」。
+补此类型前，`coverage` 的「需人工裁决」清单**一轮一生成、无任何裁决输入入口**，
+而 `result_confirmation` 只由该清单驱动 ⇒ 已裁决项的 `pending` **永远消不掉**，
+C9 恒 FAIL、正式出表被硬门禁拦下。本类型把「已落盘的人工裁决」机械地作用回产物。
+
+判据与纪律：
+  · **只认「需人工裁决」清单内的对象串精确匹配**（复用 ftth_common.split_ruling_object
+    的分段口径）；匹配不到**硬失败并列出清单现有对象**，不猜、不静默跳过；
+  · 「裁决人」**必填** —— 没有裁决人的「裁决」不算落盘（同 §七.4）；
+  · 动作有两项且**同时生效**：① 该项 `阻塞` 置 `false`（不再驱动 pending，
+    留痕写 `解除裁决`/`裁决人`/`适用范围`）；② 命中该对象的箱
+    `result_confirmation` 置 `settled`（`result_origin` 不动 —— 两字段正交）；
+  · **不删条目、不改「事项」文字** —— 只改状态位，保留可见性（同 L426「不静默合并」）。
+    产物里留痕可复核，C7 仍会显示这些项，但不再判 pending；
+  · 本类型**只对带「需人工裁决」的 coverage 产物有意义**；对 assembly 产物使用即硬失败。
 
 --set 简写：`楼栋/单元/楼层=户数`（等价于一条「户数」裁决），可重复传；与 --ruling 可并用。
 
@@ -45,11 +73,13 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ftth_common import protect_out_path, unit_num
+from ftth_common import (protect_out_path, unit_num, ensure_console_utf8, write_json,
+                         pending_items_from_rulings)
 
-sys.stdout.reconfigure(encoding="utf-8")
+ensure_console_utf8()
 
-K_TYPES = ("户数", "安装楼层", "覆盖范围", "删除楼层", "删除单元")
+K_TYPES = ("户数", "安装楼层", "覆盖范围", "删除楼层", "删除单元", "解除待裁决")
+K_COVERAGE_TYPES = ("解除待裁决",)   # 只作用于 coverage 产物的类型
 MUL_RE = re.compile(r"[*xX×]")
 
 ap = argparse.ArgumentParser(
@@ -78,8 +108,12 @@ try:
 except (IOError, json.JSONDecodeError) as e:
     die("无法读取 JSON %s: %s" % (args.json, e))
 
-if not isinstance(data, dict) or not isinstance(data.get("楼栋"), dict):
-    die("%s 不是出表输入 JSON（缺顶层「楼栋」对象）" % args.json)
+if not isinstance(data, dict):
+    die("%s 不是 JSON 对象" % args.json)
+if not isinstance(data.get("楼栋"), dict):
+    die("%s 既非出表输入 JSON、也非覆盖范围 JSON（缺顶层「楼栋」对象）" % args.json)
+# 产物形态判定：决定「解除待裁决」类裁决能否作用
+HAS_PENDING_LIST = isinstance(data.get("需人工裁决"), list)
 
 # ---------- 收集裁决 ----------
 rulings = []
@@ -115,6 +149,17 @@ for i, r in enumerate(rulings, 1):
     if t not in K_TYPES:
         die("第 %d 条类型 %r 非法，应为 %s 之一" % (i, t, "/".join(K_TYPES)))
     r["类型"] = t
+    # ---- 「解除待裁决」：只作用于 coverage 产物，字段口径与出表类不同 ----
+    if t in K_COVERAGE_TYPES:
+        if not HAS_PENDING_LIST:
+            die("第 %d 条类型「%s」需作用于覆盖范围产物（含顶层「需人工裁决」数组），"
+                "但 %s 没有该数组——本类型对出表输入 JSON 无意义" % (i, t, args.json))
+        if not r.get("对象"):
+            die("第 %d 条（%s）缺「对象」（应为「楼栋/箱」形式，如 4#配套楼/FX22#）" % (i, t))
+        if not str(r.get("裁决人", "")).strip():
+            die("第 %d 条（%s）缺「裁决人」——没有裁决人的裁决不算落盘（见 §七.4）" % (i, t))
+        continue
+    # ---- 出表类 ----
     if not r.get("楼栋"):
         die("第 %d 条缺「楼栋」" % i)
     if t in ("户数", "删除楼层") and not r.get("楼层"):
@@ -126,8 +171,8 @@ for i, r in enumerate(rulings, 1):
     if t == "户数":
         raw = str(r.get("值", "")).strip()
         if MUL_RE.search(raw):
-            die("第 %d 条户数 %r 含乘号——乘数是裁决项，须人工展开为绝对户数后再写入"
-                "（例：4*16 应写成 64）。本脚本不做乘法。" % (i, raw))
+            die("第 %d 条户数 %r 含乘号——裁决值须为绝对户数（例：应写 64）。"
+                "本脚本不做乘法；乘号标注属直读形态、读数在解析阶段取出" % (i, raw))
         try:
             r["值"] = int(raw)
         except ValueError:
@@ -172,8 +217,133 @@ def pick_units(bkey, ukey):
 
 # ---------- 执行 ----------
 changes = []
+
+
+def _obj_tokens(entry):
+    """把某条「需人工裁决」的 `对象` 展开成对象串列表（**沿用全技能唯一口径**
+    `pending_items_from_rulings`：`对象` 既可能是单串、也可能是列表）。"""
+    return pending_items_from_rulings([entry])[0][0]
+
+
+def _match_entries(objs):
+    """对象串列表 → 命中的「需人工裁决」条目下标；用**分段精确匹配**（复用
+    `judge_pending_scope` 同款分段 `parse_ruling_scope`，不做子串包含）。
+
+    匹配不到时**硬失败并列出清单现有对象** —— 不猜、不静默跳过（本脚本总纪律）。
+    """
+    from ftth_common import parse_ruling_scope
+    want = []
+    for o in objs:
+        b, u, bx = parse_ruling_scope(o)
+        if not (b or u or bx):
+            die("解除待裁决：对象串 %r 无法分段（既非「楼栋[/单元][/箱]」写法）" % o)
+        want.append((b, u, bx))
+    hits = []
+    for idx, entry in enumerate(data["需人工裁决"]):
+        if not isinstance(entry, dict):
+            continue
+        have = []
+        for t in _obj_tokens(entry):
+            b, u, bx = parse_ruling_scope(t)
+            have.append((b, u, bx))
+        for (b, u, bx) in want:
+            for (hb, hu, hx) in have:
+                if (b, u, bx) == (hb, hu, hx):
+                    hits.append((idx, entry))
+                    break
+            else:
+                continue
+            break
+    if not hits:
+        cur = []
+        for entry in data["需人工裁决"]:
+            if isinstance(entry, dict):
+                cur.extend(_obj_tokens(entry))
+        die("解除待裁决：对象 %s 在「需人工裁决」清单中匹配不到。现有对象：%s"
+            "（对象串须逐段一致：楼栋/单元/箱，不做子串匹配）"
+            % ("、".join(objs), "、".join(sorted(set(cur))) or "(空)"))
+    return hits
+
+
+def _settle_boxes(objs):
+    """把命中对象对应的分纤箱 `result_confirmation` 置 `settled`（`result_origin` 不动）。
+
+    对象粒度：`楼栋/箱` ⇒ 该箱；`楼栋/单元` ⇒ 该单元全部箱；`楼栋` ⇒ 该楼栋全部箱。
+    找不到对应箱**不硬失败** —— 箱级状态由 coverage 产物自身承载，此处只作同步；
+    留痕列出实际改了几处，改不到即如实报 0（不得静默给绿灯）。
+
+    坑（实测踩）：coverage 产物的**单元键是「楼栋前缀式」**（`7#楼1单元`），
+    而裁决对象串里的单元段是**裸式**（`1单元`）——直接字符串比较**恒不相等**，
+    会静默同步 0 处、pending 消不掉。故一律走 ``unit_num`` 归一比较（两边都归一），
+    与 assemble_households.norm_unit 同则。
+
+    坑（2026-10-04 R1 缺陷 D1，实测踩）：共享窗**源节点**（键形如
+    `[共享]1-3号楼综合布线系统图`）的箱是「已展开到成员楼栋」的**证据副本**，
+    其状态由成员楼栋条目承载（见 analyze_coverage*：副本已去 result_origin/
+    result_confirmation、留 `副本归属` 指针）。旧口径按 `bldg_num` 近似匹配时，
+    `bldg_num('[共享]1-3号楼…')==1==bldg_num('1#楼')` ⇒ 裁决 `1#楼` 会连带改写
+    源节点副本、把已降级副本**重新写回 settled**，状态再次分裂（成员侧 pending /
+    源节点侧 settled）。故两条处置：① **共享标题楼栋整体跳过**（其一窗多栋、非单一
+    落盘主体）；② 已降级副本（带 `副本归属` 且无 `result_confirmation`）不回写。
+    楼栋段匹配改走共享入口 :func:`ruling_bldg_matches`（同键 / 同源窗 / 同楼号）。
+    """
+    from ftth_common import parse_ruling_scope, is_shared_title, ruling_bldg_matches
+    n = 0
+    for o in objs:
+        b, u, bx = parse_ruling_scope(o)
+        u_n = unit_num(u) if u else None
+        for bkey, bd in (data.get("楼栋") or {}).items():
+            # ① 共享窗源节点不做落盘：其箱为成员楼栋条目的证据副本，状态由成员侧承载。
+            #    即便裁决对象正是该窗名，也应落到带 `来源共享窗` 的成员条目上
+            #    （靠 ruling_bldg_matches 的第 ② 级「同源窗」命中），而非源节点本身。
+            if is_shared_title(bkey):
+                continue
+            for uk, ud in (bd.get("单元") or {}).items():
+                _src_win = (ud or {}).get("来源共享窗")
+                # 楼栋段比对走共享入口（同键 / 同源窗 / 同楼号；同楼号仅在非共享作用域下成立）
+                if b and not ruling_bldg_matches(b, bkey, _src_win):
+                    continue
+                if u:
+                    # 裸式单元段 vs 楼栋前缀式单元键 —— 走 unit_num 归一
+                    if unit_num(uk) != u_n:
+                        continue
+                for box in (ud.get("分纤箱") or []):
+                    if not isinstance(box, dict):
+                        continue
+                    # ② 已降级的证据副本不回写状态（否则把副本重新点亮，状态再分裂）
+                    if "副本归属" in box and "result_confirmation" not in box:
+                        continue
+                    if bx and str(box.get("编号", "")).strip() != bx:
+                        continue
+                    if box.get("result_confirmation") != "settled":
+                        box["result_confirmation"] = "settled"
+                        n += 1
+    return n
+
+
 for r in rulings:
     t = r["类型"]
+    # ---- 覆盖范围产物专用：解除待裁决（把已落盘的人工裁决回灌，消除 pending）----
+    if t in K_COVERAGE_TYPES:
+        objs = r["对象"] if isinstance(r["对象"], list) else [r["对象"]]
+        objs = [str(o).strip() for o in objs]
+        hits = _match_entries(objs)
+        n_box = _settle_boxes(objs)
+        for idx, entry in hits:
+            if entry.get("阻塞") is False:
+                changes.append("解除待裁决 %s（清单第 %d 条本已 阻塞=false，仅补留痕）"
+                               % ("/".join(objs), idx + 1))
+            else:
+                entry["阻塞"] = False
+                changes.append("解除待裁决 %s（清单第 %d 条 阻塞 -> false）"
+                               % ("/".join(objs), idx + 1))
+            entry["解除裁决"] = True
+            entry["裁决人"] = str(r["裁决人"]).strip()
+            entry["裁决原文"] = str(r.get("裁决原文", "") or "")
+            if r.get("适用范围"):
+                entry["适用范围"] = str(r["适用范围"])
+        changes.append("  ↳ 同步箱 result_confirmation=settled 共 %d 处" % n_box)
+        continue
     for uk, ud in pick_units(r["楼栋"], r.get("单元")):
         if t == "删除单元":
             del data["楼栋"][r["楼栋"]]["单元"][uk]
@@ -219,11 +389,20 @@ for c in changes:
     print("  · " + c)
 
 total = 0
+_n_floor_tables = 0
 for bkey in data["楼栋"]:
     for uk, ud in data["楼栋"][bkey].get("单元", {}).items():
-        total += sum(int(f.get("户数") or 0) for f in (ud.get("楼层表") or {}).values()
+        _ft = ud.get("楼层表")
+        if isinstance(_ft, dict):
+            _n_floor_tables += 1
+        total += sum(int(f.get("户数") or 0) for f in (_ft or {}).values()
                      if isinstance(f, dict))
-print("[apply-ruling] 改后合计户数 = %d" % total)
+if _n_floor_tables:
+    print("[apply-ruling] 改后合计户数 = %d（%d 个单元含楼层表）" % (total, _n_floor_tables))
+else:
+    # 覆盖范围产物无「楼层表」（户数在 assembly 产物里）——不得把「无此字段」印成「0 户」
+    print("[apply-ruling] 本产物无「楼层表」字段（覆盖范围 JSON），不统计户数"
+          "（本类型只改裁定状态位，不涉户数）")
 
 # ---------- 写保护 + 写出 ----------
 out = args.out
@@ -243,9 +422,5 @@ if args.dry_run:
     print("[apply-ruling] --dry-run：未写文件")
     sys.exit(0)
 
-d = os.path.dirname(os.path.abspath(out))
-if d and not os.path.isdir(d):
-    os.makedirs(d, exist_ok=True)
-with open(out, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+write_json(out, data)
 print("[apply-ruling] 已写出: %s" % out)

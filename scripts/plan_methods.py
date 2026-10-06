@@ -5,7 +5,7 @@ FTTH 图纸画像（drawing_profile）生成器 —— Step 1a 探查的选法�
 
 职责：**只判定与选法，不测量任何业务字段**（户数、安装楼层、覆盖范围一律不碰）。
 
-  1. 依据 methods/signals.json 的 12 个信号定义，逐项判定本图状态
+  1. 依据 methods/signals.json 的 13 个信号定义，逐项判定本图状态
      （present / absent / variant / unknown）并写 evidence；
   2. 按「子任务 → 候选方法」生成 candidates[]（role / method / requires / script / params）；
   3. 与本技能已沉淀的图纸档案（methods/*/manifest.json）逐份比对，给出最接近的一份
@@ -35,6 +35,7 @@ FTTH 图纸画像（drawing_profile）生成器 —— Step 1a 探查的选法�
 """
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
@@ -46,10 +47,11 @@ from ftth_common import (load_dxf, collect_texts, parse_bldg_nums_ex,
                           cluster_values_by_gap, measure_column_step,
                           home_box_kw, home_box_hit,
                           extract_geom, suggest_fx_symbol_layers,
-                          filter_titleblock_units,
-                          UNIT_RE_SRC)
+                           filter_titleblock_units,
+                           UNIT_RE_SRC, ensure_console_utf8, write_json,
+                           HU_MULT_RE, hu_mult_of)
 
-sys.stdout.reconfigure(encoding="utf-8")
+ensure_console_utf8()
 
 # ============================================================
 # 常量
@@ -102,11 +104,13 @@ RE_TITLE_HINT = re.compile(r"楼|系统图|示意图|住宅|入户")        # �
 # 图纸类词：判「图纸标题」形态用——纯楼栋号罗列（对照表行 `1#楼，2#楼`）不含此类词，
 # 不是图纸标题，不得作共享图纸证据（2026-09-16 立，实测对照表行误判 present）。
 RE_DRAWING_TITLE = re.compile(r"系统图|示意图|布线图|平面图|竣工图|施工图")
-RE_DEFAULT_FX = r"FX\s*\d+\s*#?"                                 # 分纤箱编号默认形态
+RE_DEFAULT_FX = r"FX\s*\d+\s*#?"                                 # 分纤箱编号默认形态（最宽：尾段即中。另见 inspect哨兵FL-FX / ledger居中 / parse回退FX\d+；pipeline一律下传显式值，默认极少生效）
 
 # 连线图层关键词（通用启发式；实际图层名千变万化，命中清单会原样写进 evidence 供人工复核）
+# 2026-09-26 加「纤芯」：柳辛庄实测电信连线层 03纤芯（80 段皮线+竖干）因只有「光纤」
+# 无「纤芯」而漏检；已核 RE_NON_WIRE_LAYER 无「纤芯」词，不会误排除。
 DEFAULT_WIRE_KEYWORDS = (
-    r"通讯|通信|光纤|光缆|皮线|主干|ftth|弱电|电信|综合布线|"
+    r"通讯|通信|光纤|光缆|纤芯|皮线|主干|ftth|弱电|电信|综合布线|"
     r"wire|cable|fiber|optic|telecom"
 )
 
@@ -544,12 +548,12 @@ def load_suggested_from_probe(paths):
 
 
 def load_texts_from_probe(path):
-    """复用 probe.json 的全量文字样例，避免二次提取。"""
+    """复用 probe.json 的文字样例（text_samples / 全量文字样例），避免二次提取。"""
     try:
         d = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         return None
-    texts = d.get("全量文字样例")
+    texts = d.get("text_samples") or d.get("全量文字样例")
     return texts if isinstance(texts, list) and texts else None
 
 
@@ -577,7 +581,7 @@ def find_titles(texts, title_re=None, log=None):
 
 
 # ============================================================
-# 信号判定（12 项，逐项返回 (status, evidence)）
+# 信号判定（13 项，逐项返回 (status, evidence)）
 # ============================================================
 
 def judge_cluster_layout(texts, titles):
@@ -660,16 +664,86 @@ def judge_shared_drawing(titles):
                          "其余没有——共享与独立并存，须人工裁决")
     txt, nums = covered_all[0]
     return ABSENT, (f"多栋标题『{txt}』→ 楼栋号 {nums}，但这些楼栋在本图均有各自的"
-                    "单栋图纸标题——每楼独立图纸，不构成共享")
+                     "单栋图纸标题——每楼独立图纸，不构成共享")
+
+
+# 逐层户数短标签上限（2026-09-26：参照 _HOME_BOX_TEXT_MAX=12 的先例；逐层户数标签
+# 天然更短，凤鸣朝阳实测 2户/1户 全为 2 字符，取 6 足够覆盖 10户 类写法）。
+_HH_TEXT_MAX = 6
+# 整句说明文字特征（2026-09-26：柳辛庄实测「共覆盖住户467户。」仅 9 字符，纯长度
+# 阈值拦不住，须看整句特征词；命中即判说明文字而非楼层行标签）
+_RE_HH_SENTENCE = re.compile(r"覆盖|住户|共|合计|总计|说明|备注")
+
+# 逐层户数标注的**覆盖率下限**（2026-10-02 会审 P0 新增）：命中 y 去重数 / 楼层带
+# y 去重数。逐层标注天然每层一条 ⇒ 比值接近 1；图签区/列汇总的乘数写法只有个别 y
+# ⇒ 比值趋 0（云峰实测 0.018：2 条 `*16` vs 114 个楼层带）。
+# 取 0.30 而非 0.5：柳辛庄多地块图上部分单元的标注不落在最长刻度列附近（实测 0.88），
+# 留一半余量吸收「同一层多条标注」「部分单元无标注」等正常形态。
+# 判 VARIANT 而非 ABSENT：图上**确有**这些文字，只是不能当逐层直读用；ABSENT 会让
+# 下游把「未接入」误读成「图上没有」，variant 则如实表达「形态不符，换法」。
+_HH_PER_FLOOR_COV_MIN = 0.30
 
 
 def judge_household_annotation(texts):
-    """每层标注户数（'X户'）。"""
-    hits = [t for t in texts if RE_HOUSEHOLD.search(t.get("内容", ""))]
+    """每层标注户数：『X户』或乘号式 `*N`/`xN`（**两者同为直读形态**，共用本信号）。"""
+    # 2026-09-26 形态检验：逐层户数标注是贴在楼层行旁的短标签（凤鸣朝阳实测 155 条
+    # 全为 2户/1户 式 2 字符短标签），须排除图签形态与整句说明文字（柳辛庄实测：
+    # 18层/3户 14 条、共覆盖住户467户。 均非逐层标注，误判会导致选法错选直读口径）。
+    # 2026-09-27 用户裁决：**乘号式 `*N`/`xN`（如 `*16`/`x2`）乘号后数字即该处户数** ——
+    #   它是「图上直接可读的户数」，与本信号的『X户』同属直读形态。此前被判为
+    #   "乘数标注、须报人裁决"（P5 禁区），现已废止：图上只要有它即优先直读。
+    _excl_tb, _excl_sent = 0, 0
+    hits, _n_mult = [], 0
+    for t in texts:
+        s = t.get("内容", "")
+        _is_mult = hu_mult_of(s) is not None
+        if not (_is_mult or RE_HOUSEHOLD.search(s)):
+            continue
+        if RE_LEVEL_HH.search(s):
+            _excl_tb += 1  # N层/M户图签形态归 titleblock_annotation 专管
+            continue
+        # 长句排除只对『X户』形态适用：乘号式标注天然是 `*16` 这样的短标签。
+        if not _is_mult and (len(s) > _HH_TEXT_MAX or _RE_HH_SENTENCE.search(s)):
+            _excl_sent += 1  # 长句/说明文字（纯长度不够：共覆盖住户467户。仅 9 字符）
+            continue
+        if _is_mult:
+            _n_mult += 1
+        hits.append(t)
     if hits:
         s = "｜".join(t.get("内容", "")[:12] for t in hits[:3])
-        return PRESENT, f"命中 {len(hits)} 条『X户』层户数标注，样例：{s}"
-    return ABSENT, "全量文字中无『X户』形式的层户数标注"
+        tail = ("（其中乘号式 `*N`/`xN` %d 条，乘号后数字即该处户数）" % _n_mult) if _n_mult else ""
+        det = f"命中 {len(hits)} 条层户数标注，样例：{s}{tail}"
+        # ---- 形态检验（2026-10-02 会审 P0）：命中条数不足以证明「逐层」 ----
+        # 云峰实测：全图仅 2 条 `*16`（y≈-3592），而楼层刻度列有 114 个去重 y。
+        # 那两条是**图签区/列汇总**的乘数写法，不是逐层户数 —— 但本函数按「有条目命中」
+        # 判 present，导致 plan 选直读法、parse 产出 214 层全 null、count-box 被跳过，
+        # **331 户这个数在默认链路上根本产不出来**（人工知道要跑 count-box 才拿得到）。
+        #
+        # 判据用「命中 y 去重数 / 楼层带 y 去重数」这个**覆盖率**，而不是「命中条数 ≥ N」：
+        # 逐层标注天然每个楼层带一条，比值应接近 1；列汇总/图例的乘数只有个别 y，比值趋 0。
+        # 实测三图：凤鸣朝阳 0.87、柳辛庄 0.88（真逐层）、云峰 0.018（列汇总）。
+        _h_y = {round(float(t.get("y") or 0.0), 1) for t in hits}
+        _f_y = {round(float(t.get("y") or 0.0), 1) for t in texts
+                if RE_FLOOR_LABEL.match(_strip_group_braces(t.get("内容")))}
+        if not _f_y:
+            # 无楼层刻度可比 —— 保持 present（本函数无权在此判降级），
+            # 归层是否成立交由区间法前置 floor_scale 判。
+            return PRESENT, det + "；本图无楼层刻度可比对形态覆盖率，归层是否成立由 floor_scale 判"
+        cov = len(_h_y) / float(len(_f_y))
+        if cov < _HH_PER_FLOOR_COV_MIN:
+            return VARIANT, (
+                det + "；**形态检验不通过**：命中 y 去重 %d 个 / 楼层带 y 去重 %d 个 = %.1f%%"
+                "（< 阈值 %d%%）—— 命中过稀，不足以证明是**逐层**户数标注，"
+                "疑为列汇总或图例区的乘数写法。" % (
+                    len(_h_y), len(_f_y), cov * 100, _HH_PER_FLOOR_COV_MIN * 100))
+        return PRESENT, det + "；形态检验通过（命中 y 覆盖率 %.1f%%，≥ 阈值 %d%%）" % (
+            cov * 100, _HH_PER_FLOOR_COV_MIN * 100)
+    extra = ""
+    if _excl_tb:
+        extra += f"；另有 {_excl_tb} 条图签形态『N层/M户』不计入（titleblock_annotation 专管）"
+    if _excl_sent:
+        extra += f"；另有 {_excl_sent} 条长句说明文字不计入"
+    return ABSENT, "全量文字中无『X户』或乘号式 `*N`/`xN` 层户数标注" + extra
 
 
 def collect_insert_idents(msp):
@@ -1272,7 +1346,7 @@ def judge_intake_table(project_dir):
         return True
     sheets = [f for f in p.rglob("*") if _is_intake_candidate(f)]
     if not sheets:
-        return ABSENT, f"项目目录下未发现表格文件（已扫描 {project_dir}，已排除 run_*/_diag 等产物目录）"
+        return ABSENT, f"项目目录下未发现表格文件（已扫描 {os.path.basename(project_dir)}，已排除 run_*/_diag 等产物目录）"
     # 2026-09-17：改为报**相对路径**（相对 project_dir），不再只报文件名。
     #   实测某项目根目录与 _历史产物_归档\ 各有一份同名 xlsx，只报文件名会打出
     #   两个完全相同的名字——看着像脚本重复枚举（歧义），实为两处各一份。
@@ -1312,12 +1386,13 @@ def build_steps(sig, ctx):
             },
             "户数提取": {
                 "candidates": [
-                    {"role": "primary", "method": "读取标注（直读『X户』）",
+                    # 2026-09-27 用户裁决：**乘号式 `*N`/`xN` 亦属本候选** —— 乘号后数字
+                    #   即该处户数，与『X户』同为直读形态、优先级最高；选定即出数，
+                    #   不再数图标/皮线、不做交叉校验（详见本子任务 cross_check）。
+                    {"role": "primary", "method": "读取标注（直读『X户』或乘号式 `*N`/`xN`）",
                      "requires": ["household_annotation"], "script": "parse_dxf_structured.py",
-                     "params": {"hu_pattern": "由探查采样后确定"}},
-                    {"role": "alternate", "method": "读取标注（图签形态 N层/M户）+ 采集表三来源协议",
-                     "requires": ["titleblock_annotation"], "script": "read_titleblock_households.py",
-                     "params": {"geometric_tolerances": "由该脚本 --probe 量测，不设默认值"}},
+                     "params": {"hu_pattern": "由探查采样后确定（含『X户』与 `*N`/`xN` 两种形态）"}},
+                    # 2026-09-26：L1-C1 户数口径裁决：图标法优先于图签形态（直读X户 → 图标法 → 图签形态 → 皮线计数）。
                     # 2026-09-16：**图标法此前完全不在候选表里**（画像 household_annotation /
                     #   fiber_length_vshape 均 absent 的图上，实际走的就是"贴皮线末端的
                     #   家居配线箱图标计数"，而候选表只指到 count_households.py 皮线计数 ——
@@ -1341,7 +1416,15 @@ def build_steps(sig, ctx):
                                                  "（如 A=家居配线箱 / $TEXT$=HDD），比只按块名更稳",
                                 "floor_layer": "楼层刻度列图层；刻度列配对偏移异常会自动告警",
                                 "region_y": "系统图区 y 范围（默认由楼层刻度列界定）",
-                                "*N": "乘数标注不得自行相乘，须列入待裁决项"}},
+                                 # 2026-09-27：乘号式标注属**直读**形态（乘号后数字即
+                                 #   该处户数），本候选只在直读不可用时才跑，遇残存者仅登记。
+                                 "*N": "乘号式标注属直读形态，本脚本仅登记、不作乘数"}},
+                    # 2026-09-26（Bug A 实测依据：柳辛庄 8 带直读不可用而图签与图标法同时可用时，
+                    #   图签形态胜出导致 count_box 该跑没跑）：图签形态是栋级三来源协议第二来源
+                    #   （C10 交叉核验用），只在直读与图标法都不可用时才作户数提取兜底。
+                    {"role": "alternate", "method": "读取标注（图签形态 N层/M户）+ 采集表三来源协议",
+                     "requires": ["titleblock_annotation"], "script": "read_titleblock_households.py",
+                     "params": {"geometric_tolerances": "由该脚本 --probe 量测，不设默认值"}},
                     # 皮线计数：**仅当图标法不可用时**才可选（用户裁决 2026-09-16）。
                     #   注意「图标法不可用」≠「无图标标识」：图标法的 requires 是**三前置**
                     #   （区间法公共前置 floor_scale + 专用连线层 + 图标标识）。图上只有
@@ -1356,18 +1439,35 @@ def build_steps(sig, ctx):
                                             "dedicated_wire_layer 同时成立 → 数图标，不数皮线）；"
                                             "图标法不可用时允许回落"}},
                 ],
-                "cross_check": ("**本子任务按候选顺序取首个可用者，非并跑**（2026-09-16 用户裁决）："
-                                "①有『X户』标注或图签『N层/M户』→ 直读；②两者皆无 → 区间法，"
-                                "其中图标法（**区间法公共前置 floor_scale** + 专用连线层 + "
-                                "图标标识，三前置齐备）优先于皮线计数，"
-                                "图标法不可用才回落皮线。划定实体口径后仍须与『X户』直读值（若有）"
-                                "对账，不一致不得自动择一，交用户裁定"),
+                "cross_check": ("**本子任务按候选顺序取首个可用者 —— 非并跑、不互校**"
+                                "（2026-09-16 / 2026-09-27 用户裁决）：①有『X户』或乘号式"
+                                " `*N`/`xN` 层户数标注 → **直读**（乘号后数字即该处户数），"
+                                "不再数图标/皮线；②无直读标注 → 有图标则数图标"
+                                "（区间法公共前置 floor_scale + 专用连线层 + 图标标识，三前置齐备）；"
+                                "③无图标才数皮线。**三口径选定即出数，互不校验、不对账**"
+                                "（2026-09-27 用户裁决：交叉校验耽误时间，读数有误由人工修正）"),
             },
             "覆盖判定": {
                 "candidates": [
+                    # 2026-09-27（P0-1，代码核证）：**本候选尚无产出口，故标 implemented=False**。
+                    #   `judge_cover_range_annotation`（本文件）只判**信号**；生产侧
+                    #   `parse_dxf_structured.py` 对「覆盖起止层直写」**零实现**，
+                    #   `ftth.py` 的覆盖脚本映射表（`_COV_SCRIPT_TO_CMD`）也不含它。
+                    #   若仍标 primary，则这份**最直接的覆盖证据**反而被拦死：
+                    #   画像选中 primary → 覆盖阶段映射不到脚本而静默跳过 → inspect C6 硬 FAIL。
+                    #   故显式标未接入 ⇒ `_pick_method` 自动**降级**到 V型/竖线并**登记**
+                    #   （不静默）；仅当它**唯一**可用时才 rc=2 报人（不得当 absent 放行）。
+                    #   接入产出口后删此标记，并同步 ftth.py 能力表。
                     {"role": "primary", "method": "读取标注（图上直写箱体覆盖起止层）",
                      "requires": ["cover_range_annotation"], "script": "parse_dxf_structured.py",
+                     "implemented": False,
+                     "unimplemented_reason": ("本技能未接入产出口：信号可判（judge_cover_range_annotation），"
+                                             "但无脚本读取该标注并写回覆盖楼层"),
                      "params": {"cover_range_pattern": "由探查采样后确定（形如『覆盖 -1F~9F』）"}},
+                    # 2026-09-27（用户裁决）：**有米标即取 V型法** —— 列表顺序即 `_pick_method`
+                    #   的取用顺序，故 `fiber_length_vshape` 成立时选中本项，
+                    #   不再与竖线法并跑互证（两法同时可用时**不比对、不自动择一**，
+                    #   直接采用 V型结论；发现错误由人工修正）。
                     {"role": "alternate", "method": "V型计算（皮线米数谷底→箱安装层）",
                      "requires": ["fiber_length_vshape", "floor_scale"],
                      "script": "analyze_coverage_vshape.py",
@@ -1380,8 +1480,11 @@ def build_steps(sig, ctx):
                      "params": {"wire_layer": wire_suggest or "必须显式传入连线图层名（本图探查未给出候选）",
                                 "floor_scale": "三步走第②③步用区间法测安装楼层与断头端点所在层"}},
                 ],
-                "cross_check": ("两者 requires 同时成立时必须并跑比对：覆盖楼层集合一致才通过；"
-                                "不一致列入待确认。仅一个前置成立时用该法并在输出标注『无第二来源』"),
+                "cross_check": ("**按候选顺序取首个可用者，非并跑**（2026-09-27 用户裁决）："
+                                "有皮线米数标注（`fiber_length_vshape`）→ **优先 V型计算**；"
+                                "米数缺而竖干可追踪 → 竖线法。选定一法即出结论，"
+                                "**不再要求两法并跑互证、不因单来源降级**；"
+                                "结论与实际不符时交人工修正（列待确认项，不得脚本自动改数）"),
                 "notes": ["方法按测量原理命名，禁止用小区名冠名",
                           "竖线法/V型计算只测覆盖楼层；区间法只测户数与安装楼层；不得混用",
                           "总图（fx_overview_map）只提供编号/归属/安装楼层，不含覆盖范围 —— 不能用于校验覆盖"],
@@ -1397,7 +1500,7 @@ def build_steps(sig, ctx):
                      "requires": ["floor_scale"], "script": "analyze_coverage.py",
                      "params": {"fx_symbol_layer": ctx.get("fx_symbol_layer_suggest") or "探查未给出候选图层",
                                 "fx_pattern": "由探查采样后确定",
-                                "bldg_map": "本图无总图时留空，归属改用编号与楼栋/单元标注的坐标关联"}},
+                                 "bldg_map": "本图无总图时留空，归属改用编号与楼栋/单元标注的几何空间归属（x/y 双坐标分区；属合法空间证据，不用于推算安装/覆盖楼层，见 SKILL.md 铁律⑩）"}},
                 ],
                 "cross_check": "两条来源的归属 / 安装楼层不一致时不得自动择一，列入待确认项",
             },
@@ -1407,7 +1510,7 @@ def build_steps(sig, ctx):
                 "两类图纸交叉验证（总图（若有）/ 系统图，户数以系统图为准）",
                 "安装楼层双来源校验（总图直写 vs 区间法，以总图为准并暴露冲突）",
                 "楼层完整性（连续性 / 无混入）",
-                "覆盖范围第二来源核对（两法前置都成立时必须双跑）",
+                "覆盖范围方法选择（有米标取 V型法；单源采信，出错交人工修正）",
                 "户数守恒（源户数 vs 生成行数）",
                 "矛盾检查",
             ]
@@ -1483,7 +1586,7 @@ SIGNAL_RISK_RULES = [
         "id": "no_household_source",
         "when": lambda s: (s.get("household_annotation") == ABSENT
                            and s.get("box_icon_annotation") != PRESENT),
-        "情况": "户数既无『X户』直读、又无可用图标法 → 户数来源不足",
+        "情况": "户数既无直读标注（『X户』/乘号式 `*N`）可用、又无可用图标法 → 户数来源不足",
         "信号依据": "household_annotation = absent 且 box_icon_annotation ≠ present",
         "处置": "户数只能靠皮线法推算；**任何户数结论必须写明取自哪种测量方法**；"
                 "若皮线法前置亦不成立，按门禁 rc=2 报人，不得估算或沿用他图数值",
@@ -1641,8 +1744,14 @@ def summarize_profile_name(sig, archives):
 _METHOD_POOL_RULES = (
     ("V型", "V型计算"), ("竖线", "竖线法"),
     ("区间", "区间法"), ("图标", "区间法"),
-    ("总图对照表", "读取标注（对照表查表）"), ("编号文字", "读取标注 + 坐标关联"),
+    ("总图对照表", "读取标注（对照表查表）"),
     ("读取标注", "读取标注"), ("标题", "读取标注 + 坐标分区"),
+    # 2026-10-06（一百六十）：删 ("编号文字", "读取标注 + 坐标关联") 死条目 ——
+    #   methods/*.json 无含"编号文字"且不含"区间/图标/竖线/V型/总图对照表/读取标注/标题"
+    #   的候选，本条目无真实触发者；且分类目标"读取标注 + 坐标关联"非方法池四类
+    #   之一，被触发会让 install_by 误判为"读取标注（编号旁直写）"。
+    #   "坐标关联"作为楼栋/单元**空间归属**证据合法（见 SKILL.md 铁律⑩），
+    #   但不作为安装/覆盖楼层的测量方法命名。
 )
 
 
@@ -1655,14 +1764,29 @@ def classify_method(method):
 
 
 def _pick_method(steps, sig, sub):
-    """取某子任务的**可用**候选（requires 全部成立），按列表顺序取首个为选定方法。"""
+    """取某子任务的**可用**候选（requires 全部成立），按列表顺序取首个为选定方法。
+
+    2026-09-27（P0-1，实跑修复）：候选分两层 ——
+      · `implemented`（缺省 True）＝ 本技能**有产出口**（脚本 + 执行阶段都接得上）；
+      · `implemented is False` ＝ 信号判得出、但本技能**没有产出口**。
+    前者才可被选为「选定方法」。后者两种情况：
+      ① 还有已接入的候选 → **按候选顺序降级**到它，并把未接入项写进 `未接入候选`
+         （**登记，不静默**：本图确有该证据，只是本技能还没接上，不得当 absent 掩盖）；
+      ② 唯一可用的就是未接入项 → 申报 `unimplemented`（**既不是 absent 也不是 unknown**），
+         由调用方判 rc=2 报人 —— **图上有、技能没有**绝不允许静默放行成「本图不提供」。
+    """
     s = {k: v[0] for k, v in sig.items()}
     cands = ((steps.get("解析") or {}).get(sub) or {}).get("candidates") or []
-    usable = [c for c in cands
+    ok_req = [c for c in cands
               if all(s.get(r, UNKNOWN) == PRESENT for r in c.get("requires", []))]
+    usable = [c for c in ok_req if c.get("implemented", True)]
+    unimpl = [c for c in ok_req if not c.get("implemented", True)]
+    _unimpl_rec = [{"方法": c["method"], "脚本": c.get("script"),
+                    "原因": c.get("unimplemented_reason")
+                            or "本技能未接入该方法的产出口"} for c in unimpl]
     if usable:
         ch = usable[0]
-        return {
+        out = {
             "选定方法": ch["method"],
             "方法池类别": classify_method(ch["method"]),
             "脚本": ch.get("script"),
@@ -1671,6 +1795,22 @@ def _pick_method(steps, sig, sub):
             "申报": "已选定",
             "待确认": False,
             "阻塞原因": None,
+        }
+        if _unimpl_rec:
+            out["未接入候选"] = _unimpl_rec
+            out["未接入处置"] = ("信号成立但本技能无产出口，**已按候选顺序降级**"
+                                 "到上列选定方法；该未接入项**不得当 absent 处理**"
+                                 "（本图确有该证据），接入产出口前其覆盖结论须照此注明")
+        return out
+    if unimpl:
+        return {
+            "选定方法": None, "方法池类别": None, "脚本": None, "requires": [],
+            "同可用备选": [], "待确认": True,
+            "申报": "unimplemented",
+            "未接入候选": _unimpl_rec,
+            "候选信号实况": {r: s.get(r, UNKNOWN) for c in cands for r in c.get("requires", [])},
+            "阻塞原因": ("信号成立但本技能未接入产出口：" + "；".join(
+                "%s ← %s" % (c["method"], c.get("script")) for c in unimpl)),
         }
     req_state = {}
     for c in cands:
@@ -1737,10 +1877,12 @@ def build_handoff(sig, steps, ov):
         overview["注意"] = ("无总图对照表 → 归属只能走几何/编号-符号配对，"
                             "此时 SKILL.md 硬约束②（禁用标题 x 区间硬切）无对照表可依，"
                             "必须把归属依据逐箱写出交人工复核")
-        overview["降级"] = ("本图无对照表 → 箱的楼栋/单元/安装楼层归属改用"
-                            "**编号与单元/楼栋标注的坐标关联**（逐箱写出依据），"
+        overview["降级"] = ("本图无对照表 → 箱的楼栋/单元归属改用"
+                            "**编号与单元/楼栋标注的几何空间归属**（x/y 双坐标分区、逐箱写出依据），"
                             "并与系统图自身读数交叉；成果表归属列须注明"
-                            "『依系统图坐标关联，无总图可查表』")
+                            "『依系统图几何空间归属，无总图可查表』。"
+                            "注：空间归属合法（SKILL.md 铁律⑩）；安装/覆盖楼层仍只由四法产出，"
+                            "y 最近邻关联不作为来源（2026-09-18 裁决）。")
 
     # ---- ② 系统图选法（**必备项**：三项各用什么方法统计；只申报方法，不出结果）----
     fx_pick = _pick_method(steps, sig, "分纤箱提取")
@@ -1794,6 +1936,14 @@ def build_handoff(sig, steps, ov):
     for k, v in sys_methods.items():
         if v.get("申报") == "unknown":
             unanswered.append(f"② 系统图选法·{k}：状态 unknown（{v.get('阻塞原因')}）")
+        elif v.get("申报") == "unimplemented":
+            # 2026-09-27（P0-1）：**图上有、技能没有** —— 既不是 absent（不得当「本图不提供」
+            #   放行，那会把「最直接的证据」静默丢掉），也不是 unknown（信号是判出来的）。
+            #   计入未作答 ⇒ ok=false ⇒ 入口 rc=2，并点名未接入的方法与脚本。
+            unanswered.append(
+                f"② 系统图选法·{k}：状态 **unimplemented**（信号成立但本技能未接入产出口 —— "
+                f"{v.get('阻塞原因')}）。**不得当 absent 放行**：须接入该方法的产出口，"
+                f"或改用本入口已接入的方法（当前无其它可用候选）")
         elif v.get("申报") == "absent":
             if k in _MANDATORY_SUB:
                 unparsable.append(
@@ -1813,6 +1963,8 @@ def build_handoff(sig, steps, ov):
                      "**②系统图属必备**：必须给出「分纤箱位置」「每层户数」两项的测定方法，"
                      "二者缺任一 ⇒ 不可解析 ⇒ rc=2（「覆盖范围」仍可 absent + 降级放行）。"
                      "只有 unknown（未作答）才 → completeness.ok=false → 第二步入口 rc=2。"
+                     "**unimplemented**（信号成立、本技能无产出口）同样 → ok=false → rc=2："
+                     "「图上有、技能没有」不得当 absent 放行。"
                      "absent 导致某命令在本图不适用时，该命令 rc=3（不适用，非错误）。"),
         "①分纤箱总图": overview,
         "②系统图选法": sys_methods,
@@ -1826,6 +1978,8 @@ def build_handoff(sig, steps, ov):
             "缺失项及降级路径": gaps,
             "说明": ("申报制：present / absent / variant 都是合法作答，absent 只意味着本图不提供"
                      "这一路，**不阻塞**；未作答（unknown）= 判不了，才须补探查。"
+                     "**unimplemented = 图上有、技能没有产出口** —— 不属可放行项："
+                     "计入未作答 ⇒ rc=2 报人（不得当 absent 静默放行）。"
                      "缺失项的降级路径已逐条给出，下游按「以现有图纸为准」执行。"),
         },
     }
@@ -2040,6 +2194,11 @@ def main():
     if str(probe_signals.get("fx_location_annotation") or "").startswith("present"):
         log.info("箱位直读标注信号 present → 建议 extract_fx_locations.py 提取后 "
                  "给 coverage-vshape 传 --fx-locations 做安装层交叉校验")
+    elif str(probe_signals.get("fx_location_annotation") or "").startswith("absent"):
+        # 2026-10-04（P2-E3）：absent 时明确告知「跳过 extract_fx_locations.py」。
+        #   此前 absent 无任何输出 → Agent 只看到 present 的提示，不知 absent 时该跳过。
+        log.info("箱位直读标注信号 absent → 无「N号楼M单元K层」直读标注，**跳过 extract_fx_locations.py**"
+                 "（coverage-vshape 不传 --fx-locations 即可）")
     if probe_signals.get("titleblock_layer_candidates"):
         log.info("图签候选图层：%s"
                  % (probe_signals["titleblock_layer_candidates"].get("候选图层"),))
@@ -2057,10 +2216,13 @@ def main():
         "name": summarize_profile_name(sig, archives),
         "kind": "drawing_profile",
         "version": "2.0",
-        "source_dxf": str(Path(args.dxf).resolve()),
-        "source_probe": str(Path(args.probe).resolve()) if args.probe else None,
+        # 溯源字段一律记 basename：无消费方（`source_dxf`/`source_probe` 全仓零读取），
+        # 而写绝对路径会让 profile.json 的 md5 随 outdir 与调用写法漂移 ——
+        # 与技能内 5 个产出脚本的既有约定一致（parse/coverage/count/… 均写 basename）。
+        "source_dxf": os.path.basename(args.dxf),
+        "source_probe": os.path.basename(args.probe) if args.probe else None,
         "generated_by": "plan_methods.py",
-        "description": ("【本图纸画像，由 Step 1a 探查产出】记录本图 12 个信号的实测状态与"
+        "description": ("【本图纸画像，由 Step 1a 探查产出】记录本图 13 个信号的实测状态与"
                         "选定的候选方法。方法按测量原理命名，不绑定任何项目或小区。"),
         "signals": {
             k: dict({"status": v[0], "evidence": v[1]},
@@ -2104,7 +2266,7 @@ def main():
             "effective": {k: getattr(args, k, None)
                           for k in ("text_layer", "text_type", "title_pattern", "fx_pattern")},
             "filled_from_params_json": sorted(_filled),
-            "params_json_path": _probe_like,
+            "params_json_path": os.path.basename(_probe_like) if _probe_like else None,
         },
         "gate": gate,
         "risk_forecast": risk_fc,
@@ -2114,8 +2276,7 @@ def main():
     }
 
     out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(str(out), profile)
     log.info(f"已写出图纸画像：{out}")
 
     # ---- 6. 控制台结论 ----

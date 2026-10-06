@@ -5,10 +5,17 @@ FTTH 脚本公共模块
 存放各脚本共享的常量、工具函数，避免重复代码。
 """
 import logging
+import hashlib
 import math
 import os
 import re
 import sys
+
+# 命名归一域已外移 ftth_naming（2026-09-26 P1-2）；本行 re-export 保持 30 脚本零改动。
+# 全局开关 EXPAND_BLDG_RANGES 刻意留守本模块（跨模块 global 写会漂移）。
+from ftth_naming import *  # noqa: F401,F403
+from ftth_geom import *  # noqa: F401,F403
+from ftth_cells import *  # noqa: F401,F403
 
 # ---------- 常量 ----------
 INF_COORD = 1e9          # 坐标边界的"无穷大"值（楼栋 x 范围首尾锚点用）
@@ -19,26 +26,11 @@ DEFAULT_Y_TOL = 2.0           # 户数/皮线与楼层 y 坐标匹配容差
 DEFAULT_MATCH_TOL = 30.0      # 皮线归属楼层 y 容差
 DEFAULT_X_CLUSTER = 20.0      # 皮线 x 聚簇阈值
 DEFAULT_X_Y_GAP = 6.0         # 同层两户皮线的y间距参考
-# ---------- 「N单元」数字写法兼容表（全技能唯一权威定义，2026-09-19 立） ----------
-# 为什么必须是共享入口：实测同一张图上**两种写法并存** ——
-#   · `1单元`：图签（TK-图框）、对照表、箱位直读标注 `N号楼M单元K层`；
-#   · `一单元`：系统图单元轴的标注（TEL_TEXT，每个单元轴一条，y 在顶层刻度之上）。
-# 病灶（实测）：各检测点各自写死 `\d+单元`，于是**只认图签那一路**，系统图自带的
-#   单元划分整批落空；下游表现仅是「单元数=1 且单元名=楼栋名」，无任何告警，
-#   直到 C10 把它报成「图签与系统图矛盾」——**把解析漏洞误报成图面矛盾**。
-# 纪律：凡判「是否 N单元」一律引用本常量，禁止再写裸 `\d+单元`。
-UNIT_NUM_CN = "0-9一二三四五六七八九十"
-UNIT_TOKEN = "[%s]+" % UNIT_NUM_CN
-UNIT_RE_SRC = UNIT_TOKEN + r"\s*单元"
-
 DEFAULT_VERT_DX = 3.0         # 垂直线段 x 跨度阈值
 DEFAULT_VERT_DY = 3.0         # 垂直线段 y 跨度阈值
 DEFAULT_FX_WINDOW = 15.0      # 分纤箱 x 附近线段搜索半宽
 DEFAULT_MERGE_TOL = 2.0       # 竖干拼接：端点相接容差
 DEFAULT_CONN_TOL = 3.0        # 皮箱连接判定：端点距竖干/设备x容差
-
-DEFAULT_FLOOR_PATTERN = r"(-?\d+)F"   # 仅作 parse_floor_label 认不出时的兜底正则，不要当"标准楼层正则"使用
-FLOOR_WF_VALUE = 900     # 屋面层（WF）的排序值。WF 只用于排序，不代表可住楼层
 
 
 # ---------- 输出写盘卫生（统一实现） ----------
@@ -116,6 +108,12 @@ def write_json(path, obj, encoding="utf-8", log=None, indent=2, ensure_ascii=Fal
 
     dump 前强制清洗非有限浮点为 `null`（见 `sanitize_nonfinite`）——
     保证产物是**标准 JSON**，任何语言的严格解析器都读得进来。
+
+    L1-C7 调用契约标记（2026-10-02）：经 `ftth_launcher.py` 派生的产物，顶层带
+    `_via_launcher: true`。这让「是否绕过启动器直调」从跨进程事实变成**产物上
+    可读的字段**，由 `scripts/check_launch_path.py` 核对。
+    刻意写**布尔真值**而非时间戳/路径：含变量的标记会让每次运行产物 md5 都变，
+    golden 回归（T14）将永久假红。业务代码若自行设置该键，本函数不覆盖。
     """
     import json
     _hits = []
@@ -123,6 +121,10 @@ def write_json(path, obj, encoding="utf-8", log=None, indent=2, ensure_ascii=Fal
     if _hits and log is not None:
         log.warning("产物含非有限浮点 %d 处，已清洗为 null：%s"
                     % (len(_hits), "、".join(_hits[:8])))
+    if (os.environ.get("FTTH_VIA_LAUNCHER")
+            and isinstance(obj, dict) and "_via_launcher" not in obj):
+        obj = dict(obj)
+        obj["_via_launcher"] = True
     ensure_parent(path, log=log)
     with open(path, "w", encoding=encoding) as f:
         json.dump(obj, f, ensure_ascii=ensure_ascii, indent=indent)
@@ -157,17 +159,23 @@ def protect_out_path(path, force=False, suffix="_patched", log=None, label=None)
     return new, True
 
 
-# ---------- 文字清洗（统一实现，替代各脚本内联的 replace 链） ----------
-def clean_text(s):
-    """统一文字清洗：去全角空格 / 零宽字符 / BOM，再 strip。
+def sha256_file(path):
+    """文件内容 SHA256（十六进制）；文件不存在/不可读返回 None（不抛错）。
 
-    各脚本原先各自内联 `.replace("\\u3000","").replace("\\u200b","").replace("\\ufeff","")`，
-    口径容易漂移，统一到这里。
+    用途（2026-09-29 一百二十七·P0）：inspect 在闭合产物里记录各输入指纹，
+    gen 出表前核对“当前输入 == 被检查过的输入”，堵住“inspect 查 A、gen 用 B”
+    的陈旧验证旁路。唯一入口：指纹一律走本函数，不得各脚本自写 hashlib。
     """
-    return str(s).replace("\u3000", "").replace("\u200b", "").replace("\ufeff", "").strip()
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1048576), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except (IOError, OSError):
+        return None
 
 
-# ---------- 参数校验（统一实现） ----------
 def require_params(pairs, script_name):
     """校验必填参数，缺一即打印清单并退出（exit code 2）。
 
@@ -184,129 +192,6 @@ def require_params(pairs, script_name):
         for n, h in missing:
             print(f"  {n:22s} {h}")
         sys.exit(2)
-
-
-# ---------- 楼层标注统一解析（2026-09-11 修正 P0-4） ----------
-def parse_floor_label(name):
-    """
-    把楼层标注解析为整数值，覆盖图纸上出现的全部形态。
-
-    支持：
-        '3F' / '17F' / '01F'   →  3 / 17 / 1    （类别 normal）
-        '-1F' / '-2F'          → -1 / -2        （类别 normal）
-        'B1' / 'B2' / 'b1'     → -1 / -2        （类别 basement）
-        'WF'                   → FLOOR_WF_VALUE （类别 roof，仅排序用）
-
-    返回 (值, 类别)；无法识别返回 (None, None)。
-    类别 ∈ {'normal', 'basement', 'roof'}
-
-    为什么要有这个函数：旧实现仅用正则 `(-?\\d+)F` 解析楼层，对 `B1`（地下一层）
-    和 `WF`（屋面层）一律返回 None，导致：
-      · 楼层表把 B1 整层丢掉，B1 住户静默消失（实测：地下一层整层住户在输出中凭空消失，
-        且既不报错也不进待确认清单）
-      · 'B1' 无法转换为模板要求的「地下一层」
-    这类丢失不报错、不进待确认清单，属于最危险的一类缺陷。
-    """
-    if name is None:
-        return None, None
-    t = clean_text(name)
-    if not t:
-        return None, None
-    m = re.fullmatch(r"[Bb](\d+)", t)
-    if m:
-        return -int(m.group(1)), "basement"
-    if t.upper() == "WF":
-        return FLOOR_WF_VALUE, "roof"
-    m = re.fullmatch(r"(-?\d+)\s*[Ff]", t)
-    if m:
-        return int(m.group(1)), "normal"
-    return None, None
-
-
-def is_floor_text(s, floor_re=None):
-    """楼层标注判定（统一实现，替代各脚本重复定义的 `_is_floor_text`）。
-
-    先走 parse_floor_label（支持 3F/17F/-1F/B1/B2/WF）；
-    显式传入 floor_re 时，额外兼容该正则的写法。
-    """
-    if parse_floor_label(s)[0] is not None:
-        return True
-    if floor_re is not None:
-        return bool(floor_re.fullmatch(clean_text(s)))
-    return False
-
-
-def floor_mark_conflicts(items, y_tol=0.001, max_report=5):
-    """检查一组「楼层标注」的自洽性，返回冲突描述列表（无冲突返回 []）。
-
-    适用面：凡"把某区域内的楼层标注收成 楼层名→y 表"的环节，都应在**建表时**
-    先跑一遍本检查——防止同形的非楼层文字被静默并入楼层表。
-
-    两条判据都是与项目无关的通用几何事实：
-
-    ① **同名多址**：同一个楼层名出现在两个以上不同标高。同一区域内一个楼层
-       只应有一条楼层线；出现多址即说明这组标注混入了非楼层文字。
-       旧实现写成 `floor_marks[txt] = y`（字典覆盖），多址会被**静默合并成一条**，
-       既不报错也不进待确认清单 —— 属最危险的一类缺陷。故本检查必须喂
-       **未去重**的原始标注列表，喂去重后的字典等于没检查。
-    ② **次序倒挂**：按 y 升序排列后，楼层数值须单调不减。出现倒挂说明混入了
-       不属于本区域楼层序列的标注。
-
-    典型命中场景（与文字写法无关）：路由/端子图上以 `B1`…`B9` 标端口，与
-    `parse_floor_label` 认可的地下层写法 `B<数字>` **同形**，被一并收进楼层表，
-    实测会把分纤箱归到不存在的 `B9` 层。
-
-    参数:
-        items      : [(楼层名, y), ...] —— **未去重**的原始标注
-        y_tol      : 判定"同一个标高"的容差（图纸单位，默认 0.001）
-        max_report : 每类冲突最多报几条（防止噪声淹没日志）
-
-    返回:
-        [描述字符串, ...]
-    """
-    out = []
-    if not items:
-        return out
-
-    # ① 同名多址
-    grouped = {}
-    for name, y in items:
-        grouped.setdefault(clean_text(name), []).append(y)
-    _n_dup = 0
-    for name in sorted(grouped):
-        uniq = []
-        for y in sorted(grouped[name]):
-            if not uniq or abs(y - uniq[-1]) > y_tol:
-                uniq.append(y)
-        if len(uniq) > 1:
-            _n_dup += 1
-            if _n_dup <= max_report:
-                out.append("楼层名「%s」在本区域出现 %d 处不同标高（y=%s）—— 同一区域"
-                           "一个楼层只应有一条楼层线，疑似混入了同形的非楼层文字"
-                           "（如端口标号 B1~B9）"
-                           % (name, len(uniq), "、".join(str(round(v, 1)) for v in uniq)))
-    if _n_dup > max_report:
-        out.append("（同上，另有 %d 个楼层名存在多址，已省略）" % (_n_dup - max_report))
-
-    # ② 次序倒挂
-    seq = []
-    for name, y in sorted(items, key=lambda p: p[1]):
-        v, _cat = parse_floor_label(name)
-        if v is not None:
-            seq.append((y, clean_text(name), v))
-    _n_rev, _prev_v, _prev_n = 0, None, None
-    for y, name, v in seq:
-        if _prev_v is not None and v < _prev_v:
-            _n_rev += 1
-            if _n_rev <= max_report:
-                out.append("楼层序列在 y=%s 处倒挂：「%s」(%d) 排在「%s」(%d) 之后，"
-                           "与楼层递增次序矛盾，疑似混入了非楼层文字"
-                           % (round(y, 1), name, v, _prev_n, _prev_v))
-        _prev_v, _prev_n = v, name
-    if _n_rev > max_report:
-        out.append("（同上，另有 %d 处次序倒挂，已省略）" % (_n_rev - max_report))
-
-    return out
 
 
 def attrib_hit(attribs, tags=None, val_keys=None):
@@ -392,6 +277,22 @@ def home_box_hit(text, kw=None):
     return kw_hit(text, sub, pat)
 
 
+# ---------- 户数直读形态：乘号式标注 ----------
+# `*16` / `x2` / `×3` / `X16` —— **全匹配**（带 `^...$`），故不会误吞皮线米数标注
+# `20m*2`（后者行内还带米数单位，整体不匹配）。
+# 2026-09-27 用户裁决：**乘号后数字即该处户数** —— 与『X户』同属「读取标注（直读）」，
+# 按标注自身坐标落楼层带归属，优先级高于图标计数与皮线计数；**不是**"乘数、须与
+# 图标数相乘"（旧口径已废）。本正则被 plan_methods.py（信号判定）与
+# count_box_icons.py（登记）共用 —— 只此一份，调用方不得另抄（同「镜像铁律」）。
+HU_MULT_RE = re.compile(r"^[*×xX]\s*(\d{1,3})$")
+
+
+def hu_mult_of(text):
+    """乘号式户数标注 → 户数 int；不是该形态返回 None。"""
+    m = HU_MULT_RE.match((text or "").strip())
+    return int(m.group(1)) if m else None
+
+
 # ---------- 日志 ----------
 def setup_logger(name="ftth", verbose=False):
     """配置日志，替代散落的 print。verbose=True 时输出 DEBUG 级别。"""
@@ -408,8 +309,9 @@ def setup_logger(name="ftth", verbose=False):
 def ensure_console_utf8():
     """控制台 UTF-8 兜底（幂等、无害）：中文 Windows 控制台默认 GBK，直接 print
     CJK/特殊符号即 UnicodeEncodeError 崩溃（实测 tests/run_smoke.py T2 行）。
-    新代码统一走本函数；存量 `sys.stdout.reconfigure(encoding="utf-8")` 裸调用
-    保持不动（真实控制台下行为一致，不值得为统一而全量 churn）。
+    新代码统一走本函数；2026-09-26 起存量裸调用已全量收口（此前八十九"保持不动"
+    的决定被 09-25 审计推翻：被替换的流（管道/测试捕获）下裸调用抛 AttributeError，
+    而本函数 getattr 防护；真实控制台下行为逐位一致，已由三图 T14 验证）。
     stdout/stderr 被替换（如管道/测试捕获、无 reconfigure 方法）时静默跳过。
     """
     for _s in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
@@ -421,365 +323,6 @@ def ensure_console_utf8():
             pass
 
 
-# ---------- DXF 加载 ----------
-def _central_cache_path(src_path, suffix):
-    """集中缓存路径：%LOCALAPPDATA%/ftth-address-extractor/cache/<hash>__<basename><suffix>。
-
-    集中存放的理由：pickle 缓存是整个 ezdxf 对象图，实测某大图 .pkl 达 141MB，
-    落在图纸同目录会污染用户图纸目录（且图纸目录多为交付物所在，不应混入运行缓存）。
-    命名含源路径哈希，避免不同目录的同名图纸互相覆盖。
-    """
-    import hashlib
-    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache")
-    d = os.path.join(base, "ftth-address-extractor", "cache")
-    h = hashlib.md5(os.path.abspath(src_path).encode("utf-8")).hexdigest()[:12]
-    return os.path.join(d, "%s__%s%s" % (h, os.path.basename(src_path), suffix))
-
-
-def load_dxf(path, log=None):
-    """
-    加载 DXF 文件，返回 (doc, msp)。带磁盘缓存（实测某大图：全量解析约 2 分钟/次，
-    命中缓存后秒级——同一张图被多次加载时收益显著）。
-    缓存规则：集中目录缓存（`_central_cache_path`，图纸同目录的旧 `<DXF>.pkl` 仍可命中、
-    只读兼容）；以源文件 mtime+size 校验，图纸改动即自动失效；
-    缓存损坏/反序列化失败时静默回退全量解析并重建，不影响主流程。
-    失败时打印错误并 sys.exit(1)。
-    """
-    import pickle
-    cache = _central_cache_path(path, ".pkl")
-    legacy_cache = path + ".pkl"
-    try:
-        st = os.stat(path)
-    except OSError as e:
-        if log:
-            log.error(f"无法读取DXF文件: {path}\n{e}")
-        else:
-            print(f"无法读取DXF文件: {path}\n{e}")
-        sys.exit(1)
-    for cand in (cache, legacy_cache):
-        if not os.path.exists(cand):
-            continue
-        try:
-            with open(cand, "rb") as f:
-                blob = pickle.load(f)
-            if blob.get("mtime") == st.st_mtime and blob.get("size") == st.st_size:
-                doc = blob["doc"]
-                return doc, doc.modelspace()
-        except Exception:
-            pass  # 缓存损坏或 pickle 版本不兼容 → 回退重新解析
-    import ezdxf
-    try:
-        doc = ezdxf.readfile(path)
-        msp = doc.modelspace()
-    except IOError as e:
-        if log:
-            log.error(f"无法读取DXF文件: {path}\n{e}")
-        else:
-            print(f"无法读取DXF文件: {path}\n{e}")
-        sys.exit(1)
-    except Exception as e:
-        if log:
-            log.error(f"解析DXF时出错: {path}\n{e}")
-        else:
-            print(f"解析DXF时出错: {path}\n{e}")
-        sys.exit(1)
-    try:
-        os.makedirs(os.path.dirname(cache), exist_ok=True)
-        with open(cache, "wb") as f:
-            pickle.dump({"mtime": st.st_mtime, "size": st.st_size, "doc": doc},
-                        f, protocol=pickle.HIGHEST_PROTOCOL)
-    except Exception:
-        pass  # 缓存写失败不影响主流程
-    return doc, msp
-
-
-# ---------- 几何快速路径：只读几何，免去反序列化整个 ezdxf 对象图 ----------
-# v2：坐标/旋转角改为**原值不取整**。v1 为压体积做过 round(…,2)，
-#     实测会使由坐标推得的几何容差出现末位扰动（如 8350.1 → 8350.2），
-#     虽未改变任何判定结果，但测量路径不应引入无谓误差。JSON 的 float 往返
-#     在 Python 3 下无损，故去整后缓存与直接解析**逐位一致**；代价约 +30% 体积。
-# v3：新增 polylines（**整组顶点**）+ insert_attrs（INSERT 块属性）。
-#     起因：count_households / analyze_coverage / extract_fx_map 需要"多段线整组顶点"
-#     与"INSERT 属性"这两样几何缓存原本不承载的东西，被迫退回 load_dxf（实测 pkl 命中
-#     仍要约 20s，而 geom.json 载入仅约 0.2s —— 差两个数量级）。
-#     v2 的 segs 是**逐段拆开**的线段（实测某大图 52,934 条），
-#     无法还原"哪几段属于同一条多段线"；inserts 也只有 [layer,x,y,name,rot] 五元组，
-#     不含块属性 —— 所以只加一个"类型字段"是不够的，必须补这两类原始结构。
-# v2：坐标/旋转角改为**原值不取整**。v1 为压体积做过 round(…,2)，
-#     实测会使由坐标推得的几何容差出现末位扰动（如 8350.1 → 8350.2），
-#     虽未改变任何判定结果，但测量路径不应引入无谓误差。JSON 的 float 往返
-#     在 Python 3 下无损，故去整后缓存与直接解析**逐位一致**；代价约 +30% 体积。
-GEOM_VERSION = 3
-
-# INSERT 块属性值的截断长度（属性值可能很长，全量存会把缓存撑大）。
-_ATTR_VAL_MAX = 200
-
-
-def extract_geom(msp):
-    """把 modelspace 抽成**轻量几何 dict**（可被 json 直接序列化/载入）。
-    结构与 scripts/dump_geom.py 产物一致：
-      texts        [layer, x, y, text]                  TEXT/MTEXT
-      inserts      [layer, x, y, name, rot]             INSERT（**保持五元组不变**，
-                                                       以免破坏既有消费方）
-      insert_attrs [{tag: value} | None, ...]           与 inserts **同索引**的块属性
-      segs         [layer, x1, y1, x2, y2, closed]      LINE/LWPOLYLINE/POLYLINE 拆段
-                                                        (closed=1 表示闭合多段线的封口段)
-      polylines    [layer, [x1,y1,x2,y2,...], closed]   **整组顶点**（不拆段）
-      layers       {layer: 实体总数}
-      bbox         {x_min,y_min,x_max,y_max}
-      n_entities   实体总数
-    只读几何、不保留 ezdxf 对象——这是它能被 json 承载、载入快两个数量级的原因。
-    坐标与旋转角**保留原值不取整**：JSON 的 float 往返无损，去掉取整才能保证本缓存
-    与直接解析逐位一致（v1 为压体积做过 round，会让下游由坐标推得的容差出现末位偏差）。
-    """
-    texts, inserts, insert_attrs, segs, polylines = [], [], [], [], []
-    layer_cnt = {}
-    n = 0
-    for e in msp:
-        n += 1
-        try:
-            dt = e.dxftype()
-            lay = e.dxf.layer
-            layer_cnt[lay] = layer_cnt.get(lay, 0) + 1
-            if dt == "TEXT":
-                p = e.dxf.insert
-                texts.append([lay, p.x, p.y, str(e.dxf.text).strip()])
-            elif dt == "MTEXT":
-                p = e.dxf.insert
-                texts.append([lay, p.x, p.y, e.plain_text().strip()])
-            elif dt == "INSERT":
-                p = e.dxf.insert
-                inserts.append([lay, p.x, p.y, e.dxf.name,
-                                getattr(e.dxf, "rotation", 0) or 0])
-                # 块属性（v3 新增）：{tag: value}，无属性记 None。
-                _attrs = {}
-                try:
-                    for _a in e.attribs:
-                        _tag = str(_a.dxf.tag or "").strip()
-                        _val = str(_a.dxf.text or "").strip()
-                        if _tag:
-                            _attrs[_tag] = _val[:_ATTR_VAL_MAX]
-                except Exception:
-                    _attrs = {}
-                insert_attrs.append(_attrs or None)
-            elif dt == "LINE":
-                s, t = e.dxf.start, e.dxf.end
-                segs.append([lay, s.x, s.y, t.x, t.y, 0])
-                polylines.append([lay, [s.x, s.y, t.x, t.y], 0])
-            elif dt == "LWPOLYLINE":
-                pts = [(q[0], q[1]) for q in e.get_points("xy")]
-                for a, b in zip(pts, pts[1:]):
-                    segs.append([lay, a[0], a[1], b[0], b[1], 0])
-                _closed = 1 if getattr(e, "closed", False) else 0
-                if _closed and len(pts) > 2:
-                    segs.append([lay, pts[-1][0], pts[-1][1], pts[0][0], pts[0][1], 1])
-                if pts:
-                    _flat = []
-                    for _x, _y in pts:
-                        _flat.append(_x)
-                        _flat.append(_y)
-                    polylines.append([lay, _flat, _closed])
-            elif dt == "POLYLINE":
-                pts = [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
-                for a, b in zip(pts, pts[1:]):
-                    segs.append([lay, a[0], a[1], b[0], b[1], 0])
-                _closed = 1 if getattr(e, "is_closed",
-                                       getattr(e, "closed", False)) else 0
-                if _closed and len(pts) > 2:
-                    segs.append([lay, pts[-1][0], pts[-1][1], pts[0][0], pts[0][1], 1])
-                if pts:
-                    _flat = []
-                    for _x, _y in pts:
-                        _flat.append(_x)
-                        _flat.append(_y)
-                    polylines.append([lay, _flat, _closed])
-        except Exception:
-            continue
-    xs = [t[1] for t in texts] + [i[1] for i in inserts] + [s[1] for s in segs] + [s[3] for s in segs]
-    ys = [t[2] for t in texts] + [i[2] for i in inserts] + [s[2] for s in segs] + [s[4] for s in segs]
-    bbox = dict(x_min=min(xs), x_max=max(xs), y_min=min(ys), y_max=max(ys)) if xs else None
-    return dict(texts=texts, inserts=inserts, insert_attrs=insert_attrs,
-                segs=segs, polylines=polylines, layers=layer_cnt,
-                bbox=bbox, n_entities=n)
-
-
-def load_geom(path, log=None, rebuild=False, out=None):
-    """**只读几何快速路径**：优先读 <DXF>.geom.json，命中即 json.load 返回。
-
-    为什么需要它：`load_dxf` 命中的是 <DXF>.pkl，仍需反序列化整个 ezdxf 对象图——
-    实测某大图 pkl 命中约 20s、全量解析约 76s，而本缓存 json 载入约 0.2s。
-    凡只需「文字 / INSERT / 线段 / 图层 / 包围盒」这几类几何查询
-    （探查、统计、坐标窗口筛选、找锚点），一律走本函数；
-    只有确实需要 ezdxf 完整 API 时才用 load_dxf。
-
-    缓存规则：集中目录缓存（`out` 显式传入时仍按 `out`，图纸同目录的旧缓存只读兼容）；
-    以源文件 mtime+size+GEOM_VERSION 校验，图纸或结构版本变化即失效；
-    损坏/过期/rebuild=True 时经 load_dxf 重新转储回写。
-    写盘失败不影响返回。返回 dict：texts / inserts / segs / layers / bbox / n_entities。
-    """
-    import json
-    cache = out or _central_cache_path(path, ".geom.json")
-    legacy_cache = path + ".geom.json"
-    try:
-        st = os.stat(path)
-    except OSError as e:
-        msg = f"无法读取DXF文件: {path}\n{e}"
-        if log:
-            log.error(msg)
-        else:
-            print(msg)
-        sys.exit(1)
-    cands = [cache] if out else [cache, legacy_cache]
-    for cand in cands:
-        if rebuild or not os.path.exists(cand):
-            continue
-        try:
-            with open(cand, "r", encoding="utf-8") as f:
-                blob = json.load(f)
-            src = blob.get("_src") or {}
-            if (src.get("mtime") == st.st_mtime and src.get("size") == st.st_size
-                    and src.get("v") == GEOM_VERSION):
-                blob.pop("_src", None)
-                blob.pop("stat", None)
-                return blob
-        except Exception:
-            pass  # 缓存损坏/过期 → 回退重新转储
-    doc, msp = load_dxf(path, log=log)
-    geom = extract_geom(msp)
-    payload = dict(geom)
-    payload["_src"] = dict(mtime=st.st_mtime, size=st.st_size, v=GEOM_VERSION, dxf=path)
-    try:
-        os.makedirs(os.path.dirname(cache), exist_ok=True)
-        with open(cache, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        pass  # 缓存写失败不影响主流程
-    return geom
-
-
-# ---------- 文字收集 ----------
-def collect_texts(msp, layers, types):
-    """
-    从 modelspace 收集指定图层和类型的文字实体。
-    
-    参数:
-        msp: ezdxf modelspace
-        layers: [str, ...] 目标图层名列表；为空/None 时表示"不限图层"（探查阶段用）
-        types: [str, ...] 目标实体类型列表（大写，如 ["MTEXT", "TEXT"]）
-    
-    返回:
-        [{"内容": str, "x": float, "y": float, "层": str, "类型": str, "高": float}, ...]
-
-    注（2026-09-15）：`高` = 文字高度（TEXT 用 dxf.height，MTEXT 用 dxf.char_height）。
-    它是**唯一与图纸坐标尺度无关的长度尺子**——坐标可以放大 500 倍而字高按比例同步放大，
-    所以凡是需要「多少距离算同一列/同一行」的判据，都应锚定到字高，而不是写死坐标值。
-    """
-    types = set(t.upper() for t in (types or [])) or {"TEXT", "MTEXT"}
-    layer_set = set(layers) if layers else None
-    texts = []
-    for e in msp:
-        if e.dxftype() not in types:
-            continue
-        if layer_set is not None and e.dxf.layer not in layer_set:
-            continue
-        txt = e.plain_text().strip() if e.dxftype() == "MTEXT" else str(e.dxf.text).strip()
-        if not txt:
-            continue
-        p = e.dxf.insert
-        try:
-            h = float(e.dxf.height if e.dxftype() == "TEXT" else (e.dxf.char_height or 0))
-        except Exception:
-            h = 0.0
-        texts.append({"内容": txt, "x": round(p.x, 2), "y": round(p.y, 2),
-                      "层": e.dxf.layer, "类型": e.dxftype(), "高": h})
-    return texts
-
-
-def median_text_height(texts, pred=None):
-    """取一组文字的**字高中位数**（尺度锚）。pred 为可选的筛选谓词（入参：内容字符串）。
-
-    为什么要它：所有几何容差若写成绝对坐标值，换一张坐标尺度不同的图就失效。
-    字高随图缩放，`k × 字高` 才是可移植的判据。量不出时返回 None，调用方须回落到显式参数。
-    """
-    hs = []
-    for t in texts:
-        if pred is not None and not pred(t.get("内容", "")):
-            continue
-        h = t.get("高") or 0
-        if h > 0:
-            hs.append(h)
-    if not hs:
-        return None
-    hs.sort()
-    return hs[len(hs) // 2]
-
-
-# ---------- 楼栋锚点提取 ----------
-# 楼栋号书写形态（2026-09-13 统一入口；禁止各脚本再内联写楼号正则）
-#   A 后缀重复式：`1#、2#、3#住宅` / `1#2#3#楼` / `1号楼` / `1#楼`
-#   B 前缀共享式：`3/6号楼` / `3、6号楼` / `3#6#楼`（仅末号带「楼」字）
-# 真实教训：某项目 12 条系统图标题本应展开 10 栋，旧写法只认 `N#、N#`
-#   与 `N#N#`，对 `3/6号楼` 只取到 6 号楼 → 2/3/8/10/12 五栋静默丢失。
-# 注意：这里**不能**加 `(?!\d)` 负向断言。`(\d+)` 已经贪婪吃掉多位数字，
-#   而 `1#2#3#楼` 这种"号紧跟号"的写法恰恰需要逐号命中；
-#   加上 `(?!\d)` 会把 `1#`(后随 2)、`2#`(后随 3) 全部排除，只剩 `3#` → 丢 2 栋。
-_BLDG_NUM_SUFFIX_RE = re.compile(r"(\d+)\s*[#号]")
-_BLDG_NUM_LIST_RE = re.compile(r"((?:\d+\s*[/、,，\-]\s*)+\d+)\s*[#号]?\s*楼")
-
-
-def parse_bldg_nums_ex(text, expand_ranges=False):
-    """解析楼栋号并标记歧义。返回 (nums, ambiguous)。
-
-    nums:      int 列表，**按原文出现位置**排序去重（顺序即图面顺序）
-    ambiguous: True 表示命中 `N-M号楼` 连字符写法——它既可能是「N 号与 M 号」，
-               也可能是区间「N~M」（如 `3-6号楼` = 3 至 6 号共 4 栋）。
-               语义无法由文字本身判定，调用方**必须**据此列入「需人工裁决」，
-               不得静默按其中一种语义处理。
-    expand_ranges: 当 True 且 ambiguous=True 时，将 `N-M` 按**区间**展开为
-               [N, N+1, ..., M]。调用方须在**用户确认**区间语义后才能传 True。
-               默认 False 保持原有行为（仅取字面数字，不展开中间值）。
-
-    规则：
-      · 后缀重复式 `1#` `1#楼` `1号楼` `1#2#3#楼` `1#、2#、3#住宅`
-      · 前缀共享式 `3/6号楼` `3、6号楼` `3#6#楼` `1/2/3号楼`
-      · 区间式 `1-3号楼`（expand_ranges=True → [1,2,3]；False → [1,3] + ambiguous）
-      · 两类结果按位置合并排序，避免"后缀式先抓到末号"导致顺序颠倒
-    """
-    hits = []                     # (位置, 楼号)
-    ambiguous = False
-    for m in _BLDG_NUM_SUFFIX_RE.finditer(text):
-        hits.append((m.start(), int(m.group(1))))
-    for m in _BLDG_NUM_LIST_RE.finditer(text):
-        chunk = m.group(1)
-        if "-" in chunk:
-            ambiguous = True
-        if expand_ranges and ambiguous:
-            # 按 `/、,，` 拆分 chunk，对含 `-` 的子段做区间展开
-            for part in re.split(r'[/、,，]', chunk):
-                part = part.strip()
-                rm = re.match(r'(\d+)\s*-\s*(\d+)', part)
-                if rm:
-                    lo, hi = int(rm.group(1)), int(rm.group(2))
-                    for n in range(lo, hi + 1):
-                        hits.append((m.start(), n))
-                else:
-                    for mm in re.finditer(r"\d+", part):
-                        hits.append((m.start() + mm.start(), int(mm.group())))
-        else:
-            for mm in re.finditer(r"\d+", chunk):
-                hits.append((m.start() + mm.start(), int(mm.group())))
-    seen, out = set(), []
-    for _, n in sorted(hits):
-        if n not in seen:
-            seen.add(n)
-            out.append(n)
-    return out, ambiguous
-
-
-# ---------- 全局开关：楼栋区间标题是否按「区间」语义展开 ----------
-# `N-M号楼` 既可能是「N 号与 M 号并列」，也可能是区间「N~M」，文字本身无法判定。
-# 默认 False（只取字面数字，并 WARNING 待裁决）；由 CLI `--expand-bldg-ranges`
-# 在**用户确认区间语义后**开启。禁止默认开启——那等于替用户静默选定语义。
 EXPAND_BLDG_RANGES = False
 
 
@@ -790,18 +333,31 @@ def set_expand_bldg_ranges(v):
     return EXPAND_BLDG_RANGES
 
 
-def parse_bldg_nums(text, expand_ranges=False):
-    """从标题/标注文字解析全部楼栋号，返回 int 列表（按图面顺序、去重）。
+# ---------- 覆盖判定依据：机器可枚举（L1-C8 / P0-3，2026-09-27 立） ----------
+# 治的病：「怎么得到的」此前只在**自由文本** `判定依据` 里，人可读、**机器不可判** ——
+#   实测同一脚本内并存两种写法（`V型计算` 与 `V形计算`），下游按枚举解释即错得悄无声息。
+# 唯一来源纪律（operations_discipline §十二）：枚举与取首段判据**只在本模块实现一处**；
+#   产出方与校验器（analyze_coverage* / check_contracts / inspect_closure）一律调它，
+#   禁止各抄一份 —— 抄两份必然漂移，本轮缺陷就是这么来的。
+# 与 `result_origin`（measured/derived/unresolved）分工：本枚举答「**用哪个方法**」，
+#   `result_origin` 答「**直读还是推算**」，`result_confirmation` 答「**定案没有**」，三者正交。
+COVERAGE_METHODS = ("读取标注", "竖线法", "V型计算", "人工裁决", "待确认")
 
-    覆盖写法：
-      · 后缀重复式：`1#`、`1#楼`、`1号楼`、`1#、2#、3#住宅`、`1#2#3#楼`
-      · 前缀共享式：`3/6号楼`、`3、6号楼`、`3#6#楼`（/ 、 , ， - 为并列分隔）
-      · 区间式：`1-3号楼`（expand_ranges=True → [1,2,3]；默认 False → [1,3]）
 
-    需要知道 `3-6号楼` 是否语义存疑时，改用 parse_bldg_nums_ex()。
-    需要展开区间时传 expand_ranges=True（须用户确认区间语义后使用）。
+def coverage_method_of(basis):
+    """从 `判定依据`（人可读长文本）取出机器可枚举的方法名；取不出返 None。
+
+    口径：**取首段** —— 长文本必须以枚举词开头（如 `竖线法（断口区间法直读）：…`、
+    `V型计算`、`读取标注（图上直写覆盖起止层）`）。取不出（空 / 非字符串 /
+    首段不在枚举内）返 None，由调用方按「不得采信」处置 —— **不得猜、不得就近匹配**。
     """
-    return parse_bldg_nums_ex(text, expand_ranges=expand_ranges)[0]
+    if not isinstance(basis, str):
+        return None
+    s = basis.strip()
+    for m in COVERAGE_METHODS:
+        if s.startswith(m):
+            return m
+    return None
 
 
 def pending_items_from_rulings(rulings):
@@ -824,7 +380,6 @@ def pending_items_from_rulings(rulings):
 
 # ---------- 裁决项对象串的「分段」与「作用范围」（全技能唯一实现，2026-09-18） ----------
 _UNIT_SEG_RE = re.compile(r'^[0-9一二三四五六七八九十]+单元$')
-_UNIT_TAIL_RE = re.compile(r'([0-9一二三四五六七八九十]+单元)\s*$')
 _BOX_SEG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9#\-_.]*$')
 _BLDG_SEG_RE = re.compile(r'[楼图]')
 
@@ -838,44 +393,6 @@ def _is_bldg_seg(seg):
     """段是否形如楼栋：含 `楼`/`图` 特征字，且不是 `N单元`（`7#楼1单元` 归单元段）。"""
     s = str(seg or '').strip()
     return bool(s) and not _UNIT_SEG_RE.match(s) and bool(_BLDG_SEG_RE.search(s))
-
-
-def _unit_seg_of(name):
-    """从名称里抽出**单元段**：`7#楼1单元`→`1单元`；`1单元`→`1单元`；`4#配套楼`→``。
-
-    竖线法的单元名会把楼号一并带上（`7#楼1单元`），V 型法只有单元段（`1单元`）；
-    两侧都归一到单元段再比，同一对象串才能对上两种命名习惯。
-    """
-    m = _UNIT_TAIL_RE.search(str(name or '').strip())
-    return m.group(1) if m else ''
-
-
-def parse_unit_key(text, expand_ranges=False):
-    """「楼栋[单元]」串 → 归属键 ``(楼栋号, 单元号)``（**全技能唯一实现**，2026-09-18）。
-
-    用途：把不同来源的楼栋/单元写法归一到**同一个可比键**，供跨来源清点使用
-    （探查期「单元 × 箱清单」交叉清点即第一个消费者）。两侧命名习惯实测并存：
-      · 箱位直读标注 ``N号楼M单元K层``（extract_fx_locations，楼号/单元号已分开存字段）；
-      · 对照表 ``N#楼M单元``（extract_fx_map 的 `单元` 字段，楼号与单元号**紧贴无分隔**）；
-      · 图签证据坐标 ``M单元``（只有单元段，楼栋由所在键给出）。
-
-    实现**必须复用**既有解析器，不得另写正则（本技能已因「同一逻辑多份实现」漂移过多次）：
-      · 楼号走 :func:`parse_bldg_nums_ex`（覆盖 `N#楼` / `N号楼` / `N#配套楼` / 共享标题）；
-      · 单元号取串尾 `N单元`（``_UNIT_TAIL_RE``），中文数字走 :func:`cn2num`。
-
-    返回 ``(楼栋号, 单元号)``；**无法判定的一位返回 None，不得用 0 冒充** ——
-    0 会与真实楼号/单元号 0 混淆，把「没解析出来」伪装成「解析成 0 号」。
-
-    注意：多楼号共享标题（``[共享]1-3号楼…``）只取**首个**楼号，其 ``ambiguous``
-    由调用方按 :func:`parse_bldg_nums_ex` 自行登记待裁决 —— 不得静默取首值。
-    """
-    s = str(text or '').strip()
-    if not s:
-        return None, None
-    nums, _amb = parse_bldg_nums_ex(s, expand_ranges=expand_ranges)
-    m = _UNIT_TAIL_RE.search(s)
-    u = cn2num(m.group(1)[:-2]) if m else None      # 去掉尾部「单元」二字
-    return (nums[0] if nums else None), u
 
 
 def split_ruling_object(text):
@@ -936,7 +453,49 @@ def parse_ruling_scope(text):
     return ' '.join(p for p in parts if p), unit, box
 
 
-def judge_pending_scope(objs, unit_name, box_id=None, bldg_key=None):
+def is_shared_title(name):
+    """标题是否为「一窗多栋」共享系统图（如 `[共享]1-3号楼综合布线系统图`）。
+
+    判据走共享入口 :func:`parse_bldg_nums_ex` —— **本技能唯一楼号解析实现**，
+    不另写正则（`N-M号楼` / `N、M号楼` / `N/M号楼` / `[共享]…` 写法各异）。
+    返回 True 表示该标题承载**多于一个**楼号，其楼栋作用域不得按「首个楼号」判定。
+    """
+    try:
+        nums, _amb = parse_bldg_nums_ex(str(name or ""))
+    except Exception:                                            # noqa: BLE001
+        return False
+    return len(nums) > 1
+
+
+def ruling_bldg_matches(scope_bldg, bldg_key, src_window=None):
+    """裁决对象串的**楼栋段**是否作用于 ``bldg_key`` 这一栋（全技能唯一实现）。
+
+    三级判据，任一命中即算命中：
+
+    ① **字符串相同** —— 含 `[共享]…` 窗键本身（窗节点与作用域同名）；
+    ② **同源共享窗** —— 该栋条目的 ``来源共享窗`` 恰为作用域。共享窗标题作作用域时，
+       窗内各成员楼栋的箱**同出一个米数窗/竖干**，证据完全同源，必须一律命中；
+       旧口径按「首个楼号」取 ``bldg_num`` 配对（`[共享]1-3号楼…` → 1），
+       于是同窗 2#/3#楼被判 settled、仅 1#楼 pending —— 同源证据状态分裂，属任意口径。
+    ③ **楼号相同** —— 仅当作用域**不是**共享标题时启用（`N号楼` vs `N#楼` 写法差异的
+       既有约定）。共享标题一律不进本支：其首值是「取首个」的副作用，不是判据。
+
+    推广：凡裁决作用域落到「一窗多栋」标题上，先问「这栋是不是从这个窗展开的」，
+    而不是「这栋的楼号是不是等于标题里的第一个数」。
+    """
+    if not scope_bldg:
+        return True
+    if scope_bldg == bldg_key:
+        return True
+    if src_window and scope_bldg == src_window:
+        return True
+    if is_shared_title(scope_bldg):
+        return False
+    _b1, _b2 = bldg_num(scope_bldg), bldg_num(bldg_key)
+    return bool(_b1) and _b1 == _b2
+
+
+def judge_pending_scope(objs, unit_name, box_id=None, bldg_key=None, src_window=None):
     """裁决项是否作用于「本单元全部箱」（第 1 位）/「本箱」（第 2 位）。
 
     **这是覆盖类脚本判 ``result_confirmation`` 的唯一定义**（2026-09-18 统一）。
@@ -959,21 +518,22 @@ def judge_pending_scope(objs, unit_name, box_id=None, bldg_key=None):
     ``analyze_coverage.judge_object_name``）。不传时退化为「只认对象首段与本单元名
     完全相同」，即**不猜楼栋**（保守，不会误伤别栋）。
 
+    ``src_window`` 是本单元所属楼栋的**来源共享窗键**（coverage 条目的 ``来源共享窗``
+    字段，调用方应传）：共享窗标题作作用域时，靠它把「一窗多栋」的成员楼栋**全部**
+    命中（判据见 :func:`ruling_bldg_matches`），取代旧「取首个楼号」的任意口径。
+
     返回 ``(是否单元级命中, 是否箱级命中)``。
     """
     u = str(unit_name or '').strip()
     uk = str(bldg_key or '').strip()
     u_unit = _unit_seg_of(u)
-    u_bnum = bldg_num(uk or u)
     for _o in objs:
         _b, _un, _bx = parse_ruling_scope(_o)
         if not (_b or _un or _bx):
             continue
-        # ① 楼栋段校验：字符串相同，或楼号相同（后者是既有口径）
+        # ① 楼栋段校验：走共享入口 ruling_bldg_matches（同键 / 同源窗 / 同楼号三级）
         if _b:
-            _same = (_b == uk) if uk else (_b == u)
-            if not _same and u_bnum and bldg_num(_b) == u_bnum:
-                _same = True
+            _same = (ruling_bldg_matches(_b, uk, src_window) if uk else (_b == u))
             if not _same:
                 continue
         # ② 单元段：空 = 楼栋级（作用于本楼栋全部单元）；非空 = 必须命中本单元段
@@ -997,6 +557,22 @@ def first_group(m):
     捕获组只是"自定义写法"的兜底，缺失时应降级而非报错。
     """
     return m.group(1) if (m.re.groups or 0) >= 1 else None
+
+
+def first_nonnull_group(m):
+    """取**第一个非 None 的捕获组**；无匹配或全空返回 None。
+
+    与 `first_group`（固定取组1）的区别：本函数专供**多形态交替**的 pattern。
+    背景（2026-09-27）：户数直读 pattern 需同时覆盖『X户』与乘号式 `*N` 两种写法，
+    写成 `(\\d+)\\s*户|[*×xX]\\s*(\\d+)` 时，命中哪一支决定哪一组有值 ——
+    固定取 group(1) 会静默漏掉另一支（表现为"图上有标注、却一个数都没读到"）。
+    """
+    if not m:
+        return None
+    for g in m.groups():
+        if g is not None:
+            return g
+    return None
 
 
 # 多地块同名楼守卫（2026-09-17 新增，通用化自多地块项目实测）：
@@ -1252,7 +828,18 @@ def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
                               % (_n, " / ".join("%.0f" % _x for _x in sorted(_xs)), len(_xs)))
             _lines.append("锚点池按楼名去重，同名楼会互相覆盖（保留先出现者，其余同名楼整栋静默丢失），"
                           "全图解析的楼栋归属不可信。")
-            _lines.append("处理：这是多地块图纸 —— 用 split-band 子命令按 y 带切出各地块子 DXF，"
+            # 2026-10-05（一百五十九）：原文案只给了「手工 split-band」一条路，而
+            #   pipeline 自本日已内置自动分带（`_pipe_fanout_bands`，默认开启）——
+            #   加了能力却没更新这道守卫的处置提示，用户撞到 rc=2 时仍会被导向
+            #   手工路线（文档层滞后于规则层）。两条路都要给，并说明本条错误出现的
+            #   前提（即分带被跳过/未生效）。
+            _lines.append("处理：这是多地块图纸 —— 须**按地块分带**后再跑下游，不要全图解析。两条路：")
+            _lines.append("  · 【推荐】走 pipeline，它已内置自动分带："
+                          "`ftth.py pipeline --dxf <全图> --project-dir <项目目录>`"
+                          "（多地块图会自动切带并对每带递归跑完整链路，产物在 "
+                          "`<outdir>/bands/<带名>/`）。若你是加了 `--no-auto-split-band` "
+                          "才撞到本错误，去掉该开关即可；")
+            _lines.append("  · 直调 parse/手工跑：先用 split-band 子命令按 y 带切出各地块子 DXF，"
                           "再对每个子图分别跑 parse / coverage 等下游子命令。")
             _lines.append("  · 图上有「N块地」类标注（已实测）时："
                           "`ftth.py split-band --auto --config <config.json> --dxf <全图> "
@@ -1522,182 +1109,6 @@ def derive_plot_bands(msp, texts=None, cut_empty_tol=2000.0):
 
 
 # ---------- 楼名/楼层工具 ----------
-def extract_bldg_name(text):
-    """从标题文字中提取楼名原文（如 '2#楼'、'2号楼'、'4#配套楼'），失败回退 None。
-
-    2026-09-12 修正（P1-18）：旧正则要求「数字+# + 楼」连续出现，
-      但 `N#配套光纤入户系统图` 中 `#` 和 `楼` 之间插了「配套」→匹配失败→回退为 `N#楼`，
-      丢失「配套楼」标识，导致下游按楼名 join 时与平面图的 `N#楼` 同名不同物串行。
-      新正则允许 `#` 和 `楼` 之间出现「配套」「商业」「附属」等修饰词。
-    2026-09-12 复核补丁（P1-18 缺口修复）：某些标题 `N#配套光纤入户系统图` 中
-      修饰词后**无「楼」字**，原正则仍匹配失败。
-      补充规则：`N#+修饰词`（无「楼」）也识别为配套楼名，如 `N#配套` → `N#配套楼`。
-    """
-    bm = re.search(r"([\d一二三四五六七八九十]+[#号](?:配套|商业|附属)?楼)", text)
-    if bm:
-        return bm.group(1)
-    # 修饰词后无「楼」字：补「楼」构成完整楼名（如 '4#配套' → '4#配套楼'）
-    bm = re.search(r"([\d一二三四五六七八九十]+[#号](?:配套|商业|附属))(?![\d一二三四五六七八九十])", text)
-    if bm:
-        return bm.group(1) + "楼"
-    # 回退：不含修饰词的普通楼名
-    bm = re.search(r"([\d一二三四五六七八九十]+[#号]?楼)", text)
-    return bm.group(1) if bm else None
-
-
-# 楼名修饰词（决定楼名归一后的形态，如 `4#配套楼`）。
-# **只收「影响归属的楼栋类别」**（配套/商业/附属 —— 与 extract_bldg_name 保持一致）；
-# 不收「住宅/综合」等用途词：它们在标题里出现但 `extract_bldg_name` 根本不捕获，
-# 收进来会给同一栋楼造出第二种形态，反而制造新的重名。
-RE_BLDG_MODIFIER = re.compile(r"(配套|商业|附属)")
-
-
-def normalize_bldg_name(name, num):
-    """楼名归一化：统一为 `N#楼`（保留「配套/商业/附属」等修饰词）。
-
-    为什么必须归一（2026-09-15 柳辛庄实测，P1）：
-      · 单楼号标题走 `extract_bldg_name` 原文 → 得到「4号楼」
-      · 多楼号共享标题展开时构造 → 得到「4#楼」
-      两者作为 dict key 不同，**同一栋楼会在锚点池里出现两次**、x 位置各异，
-      楼栋边界被 x 中分切成两半，户数/箱体分到错误锚点。
-      实测柳辛庄未归一时 14 个锚点（含 1#楼/1号楼…5 组重名），归一后 9 个。
-    修饰词（配套楼/商业楼）是**真实的楼栋类别**，必须保留，不得一并抹平。
-    """
-    n = str(num)
-    m = RE_BLDG_MODIFIER.search(name or "")
-    return "%s#%s楼" % (n, m.group(1)) if m else "%s#楼" % n
-
-
-def bldg_num_or_none(bldg_name):
-    """从楼名提取数字（'1#楼'→1）；**失败返回 None**（不冒充 0）。
-
-    与 :func:`bldg_num`（失败返 0 的既有语义）是同一解析的两态出口；
-    需要区分「解析失败」与「真的是 0 号」时用本函数（2026-09-19 审查后统一：
-    此前 inspect_closure 有一份同名但失败返 None 的本地实现，属同名异义漂移）。
-    """
-    m = re.search(r"(\d+)", bldg_name)
-    return int(m.group(1)) if m else None
-
-
-def bldg_num(bldg_name):
-    """从楼名提取数字（如 '1#楼'→1, '2号楼'→2），失败返回 0。
-
-    注意：**失败返回 0 是本函数的既有语义**（调用点众多、依赖该行为），故保留不变；
-    需要区分「解析失败」时改用 :func:`bldg_num_or_none`。
-    """
-    n = bldg_num_or_none(bldg_name)
-    return n if n is not None else 0
-
-
-# ---------- 中文数字（2026-09-18 上提自 verify_coverage_truth.py，全技能唯一实现） ----------
-# 上提理由：`cn2num` 原先只存在于 verify_coverage_truth.py 一个文件里，任何新脚本要用
-#   就只能再抄一份 —— 「同一逻辑多份实现必然漂移，且漂移后没有任何东西会报错」是本技能
-#   反复踩过的坑（判范围 / 楼号解析均已因此收口为共享实现，见 parse_unit_key）。
-CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
-            "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12,
-            "十三": 13, "十四": 14, "十五": 15, "十六": 16, "十七": 17,
-            "十八": 18, "十九": 19, "二十": 20, "二十一": 21, "二十二": 22}
-
-
-def unit_num(text):
-    """从「N单元」写法里取单元号（int），取不到返回 None —— **全技能唯一实现**。
-
-    接受 `1单元` / `一单元` / `十一单元` / `1#楼2单元` / `7#楼一单元`；
-    也接受**整串就是一个号码**的来源（`1` / `一`）—— 实测箱位直读证据
-    （`fx_locations.json`）与对照表的「单元」字段就是 int，图上写法则带「单元」二字，
-    两种都必须能取号，否则箱按单元号归位时会整批落到楼栋级容器（实测踩中）。
-
-    纪律：**不得用 0 冒充失败值** —— 单元号 0 与「没解析出来」语义不同，失败一律 None。
-    """
-    s = str(text or "").strip()
-    if not s:
-        return None
-    m = _UNIT_TAIL_RE.search(s)
-    if m:
-        return cn2num(m.group(1)[:-2])      # 去掉尾部「单元」二字
-    return cn2num(s)                        # 纯号码来源；混合串（`1号楼`）由 cn2num 返 None
-
-
-def is_bldg_level_container(key, bldg_name):
-    """容器键是否为「**楼栋级兜底容器**」—— 全技能唯一实现。
-
-    背景（2026-09-23 实测柳辛庄 band4）：parse 侧把箱按**单元号**注入图上已有的单元
-      容器；当某箱的单元号在图上的单元轴里找不到对应容器时，会**单开一个楼栋级容器**
-      承载它并登记「需人工裁决」（见 parse_dxf_structured.py 的 `_to_bldg` 分支，
-      该容器与楼层表不同键是**刻意**的）。这类容器的键就是**楼栋名**（如 `3#楼`）。
-
-    判据（客观、可复核，属测量非推理）：**取不出单元号**（unit_num → None）且
-      **与楼栋同号**（bldg_num_or_none 相等）。两条同时成立才是兜底容器。
-
-    为什么要判它：兜底容器不是图上画出的单元。把它计入「单元数」会**虚增栋级单元数**，
-      实测后果是把解析缺陷**报成图面矛盾** —— band4 的 3#楼 图签与系统图都说 1 个单元
-      （图签只有一格 `1单元`，格内写着 FX09+FX10），但系统图侧因这个兜底容器被数成 2，
-      与图签虚增后的 2「一致」⇒ C10 看不出问题，缺陷被藏住（人工按矛盾去查图必然查不到）。
-    """
-    if unit_num(key) is not None:
-        return False
-    _kn, _bn = bldg_num_or_none(key), bldg_num_or_none(bldg_name)
-    return _kn is not None and _kn == _bn
-
-
-def cn2num(s):
-    """中文数字 → 整数（支持 一 / 十 / 十一 / 二十 / 二十一 …）；无法识别返回 None。
-
-    **不得用 0 冒充失败值** —— 楼号 / 单元号 / 层号里 0 与「解析失败」语义完全不同；
-    失败一律 None，由调用方决定是否登记「未识别」。
-    """
-    s = str(s or "").strip()
-    if not s:
-        return None
-    if s in CN_DIGIT:
-        return CN_DIGIT[s]
-    m = re.fullmatch(r"([一二三四五六七八九])?十([一二三四五六七八九])?", s)
-    if m:
-        return (CN_DIGIT[m.group(1)] if m.group(1) else 1) * 10 + \
-               (CN_DIGIT[m.group(2)] if m.group(2) else 0)
-    if re.fullmatch(r"\d+", s):
-        return int(s)
-    return None
-
-
-def floor_num(fl_name, floor_pattern=None, use_fullmatch=False):
-    """
-    从楼层名提取数字（如 '3F'→3, '-1F'→-1, 'B1'→-1, 'WF'→900），失败返回 None。
-
-    参数:
-        fl_name: 楼层标注名
-        floor_pattern: 楼层正则。**建议保持 None**（2026-09-11 起为默认推荐）：
-                       为 None 时走统一解析 parse_floor_label，支持 B1/B2/WF；
-                       显式传入时按该正则解析（向后兼容旧调用）。
-        use_fullmatch: True 时用 fullmatch（严格匹配），False 时用 search（宽松匹配）
-
-    2026-09-11 修正（P0-4）：默认路径改为 parse_floor_label，修复 B1/WF 被丢弃的问题。
-    """
-    if floor_pattern is None:
-        v, _ = parse_floor_label(fl_name)
-        if v is not None:
-            return v
-        if use_fullmatch:
-            return None      # 严格模式：认不出就是认不出，不做模糊 search 兜底
-        floor_pattern = DEFAULT_FLOOR_PATTERN
-    cleaned = str(fl_name).replace("\u3000", "").replace("\u200b", "").replace("\ufeff", "").strip()
-    if use_fullmatch:
-        m = re.fullmatch(floor_pattern, cleaned)
-    else:
-        m = re.search(floor_pattern, cleaned)
-    return int(m.group(1)) if m else None
-
-
-def floor_num_or_zero(fl_name, floor_pattern=None, use_fullmatch=False):
-    """
-    floor_num 的零回退包装：提取楼层数字，失败返回 0（用于排序等场景）。
-    等价于各脚本中重复定义的 楼层数字() / fl_num() / floor_num_local()。
-    """
-    v = floor_num(fl_name, floor_pattern, use_fullmatch=use_fullmatch)
-    return v if v is not None else 0
-
-
-# ---------- fx 聚类通用函数 ----------
 def cluster_chain_mean(vals, tol):
     """一维数值聚类（链式锚定 + 取均值中心），返回各簇中心列表。
 
@@ -2320,416 +1731,6 @@ class ToleranceEstimateError(ValueError):
     pass
 
 
-def point_rect_dist(px, py, rect):
-    """点到轴对齐矩形 (x0,x1,y0,y1) 的最短距离；点在矩形内返回 0。"""
-    x0, x1, y0, y1 = rect
-    dx = 0.0 if x0 <= px <= x1 else (x0 - px if px < x0 else px - x1)
-    dy = 0.0 if y0 <= py <= y1 else (y0 - py if py < y0 else py - y1)
-    return (dx * dx + dy * dy) ** 0.5
-
-
-MULTI_BLDG_LABEL_SEP = "[，,、;；]|[~～]|\\d\\s*-\\s*\\d"
-
-
-def collect_multi_bldg_labels(texts, bldg_re_src):
-    """图签层里「一格写了多栋」的楼名（`1#楼，2#楼` / `4、6-7号楼` / `6#楼,7#楼,`）。
-
-    **只登记、绝不解析成多个楼号**：多栋合并写法里「格内单元 ↔ 各栋」的对应关系取决于
-    格内单元的画序，图上并未逐栋标注 ⇒ 属**待人工裁决**。自行拆分会把单元挂到错的楼栋。
-    实测（凤鸣朝阳小区）：图签 4 行楼名全是合并写法（`1#楼，2#楼` / `3#楼，5#楼` /
-    `6#楼,7#楼,` / `8#楼`），`bldg_re.fullmatch` 一条都不认 ⇒ 图签 12 个单元格零锚点 ——
-    这就是格组判据在该图被误用到**系统图**单元格上的直接原因。登记出来即可让人一眼看见
-    根因，不必等下游闸门报「11 条不落盘」这种离症状很远的信号。
-
-    参数：texts=[(x, y, 文本), …]（该图签层的全部文字）；bldg_re_src=楼名正则**源码串**
-    （与调用方 `--bldg-re` 必须同一份，避免两处各写一份漂移）。
-    返回 [(x, y, 文本), …]，按 (y 降序, x 升序)。
-    """
-    if not texts:
-        return []
-    _re = re.compile(bldg_re_src)
-    _sep = re.compile(MULTI_BLDG_LABEL_SEP)
-    out = []
-    for x, y, s in texts:
-        if _re.fullmatch(s):
-            continue
-        if _re.search(s) and _sep.search(s):
-            out.append((x, y, s))
-    return sorted(out, key=lambda r: (-r[1], r[0]))
-
-
-def collect_titleblock_unit_cells(lvu, polylines, size_rel_tol=0.02, adj_rel=0.02):
-    """按图签明细表**画出来的格**，把 `N单元` 标注分组成「格组」（同栋的单元集）。
-
-    为什么需要（2026-09-23，柳辛庄 band3 实测）：图签里的 `N单元` 是与**格子**绑定的 ——
-    每个 `(楼栋, 单元)` 占一格，格内同时写着该单元的箱编号；格的归属由它在表格里的位置
-    决定。而「单元到最近层户」的邻近判据无法表达这件事：同栋「单元列」相对「层户列」的
-    x 偏置逐栋不同（实测 0.6k~101k），偏置一旦大于容差窗，真主就被排除、隔壁楼反而入选 ——
-    实测某图 7# 的 `1单元` 被判给 4#、8# 的 `1单元` 因超窗直接落空，单元数虚低。
-    格是**图上画出来的客观边界**，用它分组属**测量**，不引入任何图面含义推断。
-
-    做法（全部由图纸自身量出，不预设坐标）：
-      ① 每个标注取「最小包含它的轴对齐矩形」＝ 它所在的格；
-      ② 出现的格尺寸里取**唯一主尺寸**（占比 ≥ 一半且格数 ≥2）＝「单元格尺寸」，
-         其余尺寸的格不参与（多尺寸族的图不启用本判据）；
-      ③ 两格**共享竖直边**（边界差 ≤ adj_rel×格宽）且 y 区间相交 ⇒ 同一格组；
-      ④ 组内出现**重复单元号**或格数 > 该图单元号最大值 ⇒ 视为串标风险，该组不启用
-         （把标注交回旧判据，并登记原因）。
-
-    返回 (groups, info)：
-      groups: [{'rect': (x0,x1,y0,y1), 'members': [(x,y,文本), ...]}, ...]
-      info:   诊断字典（是否启用、格尺寸、落格/未落格数、弃用组与原因）。
-              **「落格」= 落在单元格（主尺寸族）里**；只落在图框等非格矩形里的标注
-              计 `未落格`，原始计数另存 `落入任意矩形标注数` —— 两者不得混为一谈，
-              否则「没核」会被读成「已核」（实测某图 20 条里 8 条只落在图框内）。
-    调用方只应把 groups 当作**归属证据**使用，并把 info 一并落进产物/日志。
-    """
-    import collections
-    info = {"启用": False, "格尺寸": None, "落格标注数": 0, "未落格标注数": 0,
-            "落入任意矩形标注数": 0, "弃用组": [], "原因": ""}
-    if not lvu:
-        info["原因"] = "无单元标注"
-        return [], info
-    rects = []
-    for item in (polylines or []):
-        try:
-            pts = item[1]
-        except (TypeError, IndexError):
-            continue
-        n = len(pts) // 2
-        if n not in (4, 5):          # 四边形（5 点＝首尾闭合重复一点）
-            continue
-        xs, ys = pts[0::2], pts[1::2]
-        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-        if x1 - x0 <= 0 or y1 - y0 <= 0:
-            continue
-        # 轴对齐校验：每个顶点都必须落在包围盒的某一个角上（斜放的四边形不认）
-        corners = {(round(x0, 3), round(y0, 3)), (round(x1, 3), round(y0, 3)),
-                   (round(x1, 3), round(y1, 3)), (round(x0, 3), round(y1, 3))}
-        if not {(round(xs[i], 3), round(ys[i], 3)) for i in range(n)} <= corners:
-            continue
-        rects.append((x0, x1, y0, y1))
-    if not rects:
-        info["原因"] = "几何缓存无轴对齐矩形（本判据不适用）"
-        return [], info
-
-    cell_of = {}
-    for u in lvu:
-        hit = [r for r in rects if r[0] <= u[0] <= r[1] and r[2] <= u[1] <= r[3]]
-        if not hit:
-            continue
-        hit.sort(key=lambda r: (r[1] - r[0]) * (r[3] - r[2]))
-        cell_of[id(u)] = hit[0]
-    # 「落格」只能指**落在单元格（主尺寸族）里**，不得拿「落在任意矩形里」充数：
-    #   实测某图 20 条标注里 8 条只落在 585000×430500 的**图框**内（该处根本没有单元格），
-    #   旧口径报成「落格 20 / 未落格 0」，等于把「没核」呈现成「已核」。
-    #   故：另存原始计数 `落入任意矩形标注数` 供诊断，「落格/未落格」在量出主尺寸族后重算。
-    info["落入任意矩形标注数"] = len(cell_of)
-    info["落格标注数"] = 0
-    info["未落格标注数"] = len(lvu)
-    if len(cell_of) < 2:
-        info["原因"] = "落入矩形的标注不足 2 条，无法成组"
-        return [], info
-
-    sizes = collections.Counter((round(c[1] - c[0], 1), round(c[3] - c[2], 1))
-                                for c in cell_of.values())
-    (cw, ch), cn = sizes.most_common(1)[0]
-    if cn < 2 or cn < 0.5 * len(cell_of):
-        info["原因"] = ("格尺寸无唯一主尺寸（%s），不启用" % dict(sizes))
-        return [], info
-    info["格尺寸"] = [cw, ch]
-    _tol_w = max(1.0, adj_rel * cw)
-    _fam = {i: c for i, c in cell_of.items()
-            if abs((c[1] - c[0]) - cw) <= max(1.0, size_rel_tol * cw)
-            and abs((c[3] - c[2]) - ch) <= max(1.0, size_rel_tol * ch)}
-    info["落格标注数"] = len(_fam)
-    info["未落格标注数"] = len(lvu) - len(_fam)
-    if len(_fam) < 2:
-        info["原因"] = "主尺寸格不足 2 个"
-        return [], info
-
-    # 并查集：共享竖直边 + y 区间相交 ⇒ 同组
-    par = {i: i for i in _fam}
-
-    def _find(a):
-        while par[a] != a:
-            par[a] = par[par[a]]
-            a = par[a]
-        return a
-
-    _ids = sorted(_fam)
-    for _i in range(len(_ids)):
-        for _j in range(_i + 1, len(_ids)):
-            a, b = _ids[_i], _ids[_j]
-            ra, rb = _fam[a], _fam[b]
-            _share_v = (abs(ra[1] - rb[0]) <= _tol_w) or (abs(rb[1] - ra[0]) <= _tol_w)
-            _ov = min(ra[3], rb[3]) - max(ra[2], rb[2])
-            if _share_v and _ov > 0.5 * min(ra[3] - ra[2], rb[3] - rb[2]):
-                par[_find(a)] = _find(b)
-
-    by_root = collections.defaultdict(list)
-    for i in _fam:
-        by_root[_find(i)].append(i)
-    by_id = {id(u): u for u in lvu}
-    groups = []
-    for root, ids in sorted(by_root.items(), key=lambda kv: min(_fam[i][0] for i in kv[1])):
-        members = [by_id[i] for i in ids]
-        nums = [unit_num(m[2]) for m in members]
-        if any(n is None for n in nums):
-            info["弃用组"].append({"格": _fam[ids[0]], "原因": "组内有单元号解析不出的标注"})
-            continue
-        if len(set(nums)) != len(nums):
-            info["弃用组"].append({"格": _fam[ids[0]],
-                                   "原因": "组内单元号重复（串标风险）：%s" % nums})
-            continue
-        xs0 = min(_fam[i][0] for i in ids)
-        xs1 = max(_fam[i][1] for i in ids)
-        ys0 = min(_fam[i][2] for i in ids)
-        ys1 = max(_fam[i][3] for i in ids)
-        groups.append({"rect": (xs0, xs1, ys0, ys1), "members": members,
-                       "单元号": nums})
-    info["启用"] = bool(groups)
-    if not groups:
-        info["原因"] = info["原因"] or "所有格组均被弃用"
-    return groups, info
-
-
-def assign_cells_to_buildings(groups, anchors, cell_h=None, dominance=0.5,
-                              applicability_min=0.5):
-    """格组 → 楼栋归属（**楼名主导认领 + 互斥**）—— 全技能唯一实现。
-
-    参数
-      groups : `collect_titleblock_unit_cells` 的输出（每项需含 'rect' / 'members' / '单元号'）
-      anchors: [(x, y, 文字, 归属键)]；归属键由调用方给出（如 `('默认', 7)`）——
-               楼号解析与地块归属留在调用方，本函数不做任何文字解析。
-      cell_h : 格高（尺度闸用）；None 时取各组自身高的最大值。
-    返回 dict：
-      'verdicts' : 逐格组裁决记录（'采信' / '不采信原因' / '最近锚点' …），供留痕与人工复核
-      'owner'    : {id(标注) -> 归属键}，仅含**采信**的格组
-      'blocked'  : 不采信格组的标注 id 集合 —— 调用方**不得**再把这些标注回落到
-                   逐标注判据落盘（回落出来的值已被实测证伪，见下）
-      'unclaimed': 楼名侧未做认领的原因清单，交人核对
-      'offset_claims': **采信但无横向覆盖结构证据**的认领登记（实测偏置 + 优势倍数）。
-                   调用方须与 'unclaimed' **分开呈现** —— 一个是「没认领」，一个是
-                   「认领了但依据较弱，登记供复核」，混在一起会读成同一件事。
-      '适用'     : False 表示**判据前提不成立**（认领率低于 `applicability_min`）——
-                   此时 'owner' 为空、'blocked' 为空，调用方必须把**全部**标注交回
-                   逐标注判据，并且**不得**逐组打印「不采信 / 不落盘」（那是误判范围）。
-      '不适用原因': 上面那条的说明文字。
-
-    判据（2026-09-23，柳辛庄 band1~band4 四地块实测后定稿；两步全部是图上已画边界的**测量**）：
-      A. **楼名主导认领**：楼名是「行」的标签，由楼名去认领它所属的那一行 ——
-         ① 优先取「**横向投影覆盖它**（x 落在格的 x 跨度内）的格组中、离它最近的一个」；
-         ② 没有任何格组横向覆盖它时**不直接弃权**，改为取全体最近的格组，但加一道
-            **优势闸**（`d1 ≤ dominance × 次近格`）—— 过闸才认领，并登记进 'offset_claims'。
-         为什么①按 x 覆盖筛：楼名是**行头**，横向上落在本行的 x 跨度内 —— 该结构证据
-         **与图形朝向无关**（不假设「楼名在上方」），比按 dy 正负判方向稳。
-         为什么②不能把①当**硬**闸（柳辛庄 band2 实测）：图签里楼名会画在本行格组的
-         **左边界之外一点** —— 实测 `4#楼` x 偏置 3813.2 = 格宽 118040.9 的 **3.2%**，
-         两个拼版份一致（x 平移后偏置仍是 3813.5）。零容差硬闸把这一整行判死：4 条
-         `N单元` 标注全部不落盘 ⇒ 图签侧该栋**单元数丢成 None**，C10 退化成「单侧不可读」
-         （真实答案是 2 单元，与该栋系统图一致）。而该锚点到本行 11167.5、到次近格
-         26201.1（**优势 2.35 倍**）—— 证据本身充足，是该采的。
-         优势闸**只用在②这一支**：实测「楼名→本行上沿」偏移（8.6k~17.7k）会大于相邻行
-         间距的一半 —— 行距 41067 时本行 17705.8、**上一行底边**只有 23361.2，永远落在
-         2 倍以内（行距 86108 时同理：17706 vs 68403 的一半）。若对有覆盖的支路也施加
-         优势闸，该行会被**永久**判「优势不足」（band4 的 `2#楼` 正是此值）。
-         尺度闸（两支持平）：认领距离不得超过**一个格高**（超过则标签已落进别的行）。
-      B. **格组定锚**：格组在**认领它的**楼名里取距离最近者。多栋争抢时要求胜者有明确
-         优势（≤ `dominance` × 次近的不同栋认领者），否则**不判**、交人。
-         `横向覆盖=False` 的胜者**不因此被拒**（band2 实测的 `4#楼` 就靠这一条落盘），
-         只把该事实留在裁决记录里供复核。
-
-    判据适用性闸门（同日新增，凤鸣朝阳小区实测）：
-      本判据的**前提**是「每个格组所在的那一行有它的楼名锚点」。前提不成立时逐组判
-      「不采信」＝把一批标注**因一个用错范围的判据丢出成品** —— 实测该小区：图签的
-      楼名写成**多栋合并**（`1#楼，2#楼` / `3#楼，5#楼` / `6#楼,7#楼,` / `8#楼`），
-      `bldg_re.fullmatch` 全不认 ⇒ 图签 12 个单元格**零锚点**；判据抓到的 8 个锚点实为
-      **系统图内的单栋标签**（离格组 362~425、方向纯横向），全被尺度闸拦下 ⇒
-      采信 1/12，其余 11 组被判「不落盘」。而该图 C10（图签 vs 系统图逐栋）实测 **PASS**，
-      说明这些标注的信息另有来源、此处纯属**判据用错范围**。
-      故：**认领率 < `applicability_min`（默认 0.5）⇒ 整体判不适用**（owner/blocked 置空、
-      全部标注交回逐标注判据），而不是逐组弃解。实测认领率：柳辛庄 6/6、14/14、18/18、
-      5/6（最低 83%）；凤鸣朝阳 1/12（8%）—— 阈值 50% 落在两者之间且远离边界。
-
-    为什么去掉「同排共享」（同日更早一版，band3 实测后删除）：
-      曾按「y 区间重叠 > 50%」把格组并入同一行，理由是拼版图各份的同一行 y 区间相同。
-      但**本类图纸的图签有多列并排版式**（实测 band3：同一 y 带内并列 3 列，x≈8.15M /
-      8.33M / 8.50M），同 y 带内是**不同楼栋**的行 —— 共享把 6#/7#/4# 三个楼名都并到
-      同一格组，18 组里 14 组变成「多栋争抢且优势不足」（7841.8 vs 7920.4，几乎等距），
-      判据整体失效（回归实测：采信 18→4）。
-      而「一行画出多个格」这件事**已由 `collect_titleblock_unit_cells` 的相邻并组解决**
-      （同一行的 1单元格与 2单元格共享竖边，必被并成一组），不需要额外的同排共享。
-
-    为什么这样判（取代首版「每格各取最近楼名 + 0.5 优势闸」）：
-      首版把优势闸放在「最近栋 vs **次近的不同栋**（不论它是否认领本格）」上，实测
-      **判据方向反了**：拼版图里相邻行的行距（实测 86108）只有楼名偏移（17706）的
-      4.9 倍，导致某一行的**邻行楼名**永远落在 2 倍以内 ⇒ 该行永被判「优势不足」。
-      后果（柳辛庄 band4 实测）：① 允许**一对多** —— 缺楼名那一行的格组抢用相邻行的
-      楼名，3#楼被 3 个格组同时认领、收到 `1单元×4`（编号去重后单元数仍是 2，症状被
-      掩盖）；② 真正属于 2#楼的那一行反被判不采信 ⇒ 2#楼单元数丢成 None。
-      改判据后 band4 逐格与「图签格内直写箱编号 → 系统图箱自证」完全一致：
-      1#=2单元 / 2#=2单元 / 3#=1单元（3# 只有一格 `1单元`，格内写着 FX09+FX10），
-      且 15×2×2 + 15×2×2 + 15×3×1 = 165 户，与图纸「共覆盖住户165户」吻合。
-
-    为什么 'blocked' 必须**排除**而不是回落逐标注判据：
-      band4 的 2#楼那一行（第一份拼版里漏写楼名）在首版判据下被逐标注判据判给了 3#楼，
-      而格内箱编号（FX05–FX08）自证属 2#楼 —— **回落出来的值已被实测证伪**。
-      把它排除后：该行内容由第二份拼版里同号的那一行给出（同样是 1单元+2单元），
-      结果不变；被排除的标注逐条登记交人。取安全侧（少解可见）而非回落（错解被当已核）。
-    """
-    verdicts, owner, blocked, unclaimed, offset_claims = [], {}, set(), [], []
-    if not groups or not anchors:
-        return {"verdicts": verdicts, "owner": owner, "blocked": blocked,
-                "unclaimed": unclaimed, "offset_claims": offset_claims}
-    _ch = cell_h
-    if not _ch:
-        _ch = max((g["rect"][3] - g["rect"][2]) for g in groups)
-
-    # A 步：楼名 → 认领的格组（优先横向投影覆盖它的最近格组；无覆盖则最近格 + 优势闸）
-    claims = []
-    for _x, _y, _t, _key in anchors:
-        covering = [g for g in groups if g["rect"][0] <= _x <= g["rect"][1]]
-        pool = covering or groups
-        sc = sorted(((point_rect_dist(_x, _y, g["rect"]), g) for g in pool),
-                    key=lambda z: z[0])
-        d1, g1 = sc[0]
-        if d1 > _ch:
-            unclaimed.append(
-                "%s「%s」@[%.1f,%.1f]：最近格组 x[%.1f,%.1f] y[%.1f,%.1f] 超出尺度闸"
-                "（%.1f > 一个格高 %.1f）—— 不做认领"
-                % (_key[0], _t, _x, _y, g1["rect"][0], g1["rect"][1],
-                   g1["rect"][2], g1["rect"][3], d1, _ch))
-            continue
-        if not covering:
-            # 无横向覆盖＝缺结构证据 ⇒ 要求距离上明显最近，否则交人（不猜）。
-            _d2 = min((point_rect_dist(_x, _y, g["rect"])
-                       for g in groups if g is not g1), default=None)
-            if _d2 is not None and d1 > dominance * _d2:
-                unclaimed.append(
-                    "%s「%s」@[%.1f,%.1f]：无格组的横向跨度覆盖它，且最近格优势不足"
-                    "（%.1f 未 ≤ %.2f×次近格 %.1f）—— 不做认领，交人核对"
-                    % (_key[0], _t, _x, _y, d1, dominance, _d2))
-                continue
-            _gw = g1["rect"][1] - g1["rect"][0]
-            _off = (g1["rect"][0] - _x) if _x < g1["rect"][0] else (_x - g1["rect"][1])
-            offset_claims.append(
-                "%s「%s」@[%.1f,%.1f]：楼名画在本行格组横向跨度之外（最近格 "
-                "x[%.1f,%.1f] y[%.1f,%.1f]，x 偏置 %.1f = 格宽的 %.1f%%），按"
-                "「最近格 + 优势闸（%.1f ≤ %.2f×%.1f）」认领 —— 已采信，登记供复核"
-                % (_key[0], _t, _x, _y, g1["rect"][0], g1["rect"][1],
-                   g1["rect"][2], g1["rect"][3], _off,
-                   (100.0 * _off / _gw) if _gw else 0.0,
-                   d1, dominance, (_d2 if _d2 is not None else d1)))
-        claims.append({"x": _x, "y": _y, "文字": _t, "归属键": _key, "距离": d1,
-                       "格组": g1, "横向覆盖": bool(covering)})
-
-    # B 步：每个格组在认领它的楼名里取胜者
-    for g in groups:
-        cand = sorted([(c["距离"], c) for c in claims if c["格组"] is g],
-                      key=lambda z: z[0])
-        rec = {"格组矩形": [round(v, 1) for v in g["rect"]],
-               "单元号": sorted(g.get("单元号") or []),
-               "标注": [[round(m[0], 1), round(m[1], 1), m[2]] for m in g["members"]]}
-        if not cand:
-            rec.update({"最近锚点": None, "次近不同栋": None, "采信": False,
-                        "不采信原因": "无楼名认领本行（图上该行未写楼名，或该楼名被"
-                                  "尺度/优势闸拦下 —— 原因见调用方打印的"
-                                  "「[格组·锚点]」逐条登记）—— 该行标注**不落盘**，"
-                                  "交人核对"})
-            verdicts.append(rec)
-            blocked.update(id(m) for m in g["members"])
-            continue
-        d1, c1 = cand[0]
-        d2 = c2 = None
-        for _d, c in cand[1:]:
-            if c["归属键"] != c1["归属键"]:
-                d2, c2 = _d, c
-                break
-        rec["最近锚点"] = {"类型": "楼名", "文字": c1["文字"], "距离": round(d1, 1),
-                       "归属": "%s %d号楼" % c1["归属键"]}
-        rec["次近不同栋"] = (None if c2 is None else
-                        {"文字": c2["文字"], "距离": round(d2, 1),
-                         "归属": "%s %d号楼" % c2["归属键"]})
-        rec["同格组竞争者"] = ["%s「%s」距离 %.1f" % (c["归属键"][0], c["文字"], d)
-                         for d, c in cand[1:6]]
-        rec["胜者横向覆盖"] = bool(c1["横向覆盖"])
-        why = []
-        if d2 is not None and d1 > dominance * d2:
-            why.append("同格组内多栋争抢且优势不足（%.1f 未 ≤ %.2f×%.1f）"
-                       % (d1, dominance, d2))
-        rec["采信"] = not why
-        if why:
-            rec["不采信原因"] = "；".join(why) + " —— 该行标注**不落盘**，交人核对"
-            verdicts.append(rec)
-            blocked.update(id(m) for m in g["members"])
-            continue
-        verdicts.append(rec)
-        for m in g["members"]:
-            owner[id(m)] = c1["归属键"]
-    # 判据适用性闸门（前提是「每行有它的楼名锚点」；认领率过低即前提不成立）——
-    #   此时**不得逐组判「不采信」把标注丢出成品**，而要整体退出、交回逐标注判据。
-    #   实测认领率：柳辛庄 6/6、14/14、18/18、5/6（最低 83%）；凤鸣朝阳小区 1/12（8%）。
-    _adopted = sum(1 for _r in verdicts if _r["采信"])
-    if verdicts and (_adopted / float(len(verdicts))) < applicability_min:
-        _why = ("格组 %d 个中仅 %d 个能被楼名认领（%.0f%% < %.0f%%）—— 锚点与格组之间"
-                "不存在结构关系，判据前提不成立 ⇒ **本图整体不适用**，全部单元标注交回"
-                "逐标注判据（不在此处丢解）"
-                % (len(verdicts), _adopted, 100.0 * _adopted / len(verdicts),
-                   100.0 * applicability_min))
-        return {"verdicts": verdicts, "owner": {}, "blocked": set(),
-                "unclaimed": unclaimed, "offset_claims": offset_claims,
-                "适用": False, "不适用原因": _why}
-    return {"verdicts": verdicts, "owner": owner, "blocked": blocked,
-            "unclaimed": unclaimed, "offset_claims": offset_claims,
-            "适用": True, "不适用原因": ""}
-
-
-def filter_titleblock_units(lvu, bl, lvf, gap_ratio=3.0, protected=None):
-    """把「图签块内的单元标注」从全图同名标注里分出来（2026-09-18，P0）。
-
-    为什么需要：`N单元` 这个写法在图签里有，在**系统图里也有**（每栋系统图楼层列
-    顶部的单元列头），两者同图层、同写法。若不区分，单元标注会被配到错误楼栋 ——
-    实测某图图签 12 个 + 系统图 11 个混在一起配对，7 栋里 5 栋单元数错，
-    其中一栋收到 `1单元×6 / 2单元×5` 的重复标签，而脚本只打 ⚠、退出码仍为 0
-    （下游按成功消费即得错的单元数）。
-
-    判据（属**测量**：对图上已有距离做量化切分，不是对图纸含义的推断）：
-    单元到「最近的楼名或层户」的 2D 距离 `|dx| + |dy|` 在图上常呈**明显两簇** ——
-    图签块内的单元紧邻其楼名行（实测 10~30），系统图里的单元离任何楼名都有半个
-    图幅远（实测 440+）。取排序后相邻距离的最大比值处切开，比值 < gap_ratio 视为
-    无断层、原样返回（不切、不猜）。
-
-    返回 (保留项, 剔除项)。**调用方必须把剔除量写进证据**，不得静默丢弃。
-
-    protected（2026-09-23 增，柳辛庄 band3 实测）：`保护名单` = 已确认落在**图签明细表
-    绘制格**内的标注 id 集合。为什么要有它：本判据只看「离楼名/层户多远」，
-    而实测存在**真图签格离最近楼名 14.8 万**（同栋单元列相对层户列的 x 偏置可达 10 万），
-    于是真数据被当「系统图列头」剔除 —— 表现为该栋单元数凭空少 1，下游 C10 报成
-    图面矛盾。格是图上画出来的边界：**落格即属图签数据**，距离不足以推翻。
-    故 protected 内的标注一律保留（不参与剔除），并请在调用方留痕。
-    """
-    anchors = list(bl) + list(lvf)
-    if not anchors or not lvu:
-        return list(lvu), []
-    _prot = set(protected or ())
-    dists = [min(abs(a[0] - u[0]) + abs(a[1] - u[1]) for a in anchors) for u in lvu]
-    order = sorted(range(len(lvu)), key=lambda i: dists[i])
-    best_i, best_ratio = None, 0.0
-    for k in range(len(order) - 1):
-        a, b = dists[order[k]], dists[order[k + 1]]
-        if a <= 0:
-            continue
-        if b / a > best_ratio:
-            best_ratio, best_i = b / a, k
-    if best_i is None or best_ratio < gap_ratio:
-        return list(lvu), []
-    keep_i = set(order[:best_i + 1])
-    keep = [u for i, u in enumerate(lvu) if i in keep_i or id(u) in _prot]
-    drop = [u for i, u in enumerate(lvu) if i not in keep_i and id(u) not in _prot]
-    return keep, drop
-
-
 def estimate_titleblock_tolerances(texts, bldg_re, lev_re, unit_re, safety=1.25):
     """按图纸自身的图签行结构，推定 6 个几何容差（读取标注·图签形态专用）。
 
@@ -2906,35 +1907,8 @@ def estimate_titleblock_tolerances(texts, bldg_re, lev_re, unit_re, safety=1.25)
 #   文字坐标 → 竖干配对率 0% → 覆盖全空，而脚本仍返回退出码 0）。
 #   本函数把「找符号层」变成可复算的打分；输入只需几何缓存（extract_geom / load_geom
 #   的产物），不需要重新解析 DXF。
-RE_DRAWING_WORD = re.compile(r"系统图|布线图|示意图")
-RE_BLDG_NO = re.compile(r"\d+\s*#|\d+\s*号楼")
-
-
-def is_bldg_title_text(t):
-    """判断一段文字是否为**楼栋图纸标题**（系统图 / 布线图 / 示意图）。
-
-    通用判据 = 「图纸类词」+「楼栋号写法」；由图纸类词负责排除
-    「防护分区抗爆单元示意图」这类无编号标题。
-    **楼栋号后不要求紧跟『楼』** —— 实测某图整类标题写作
-    「N#住宅光纤入户系统图」「N#配套光纤入户系统图」，数字后接『住宅 / 配套』；
-    旧判据（要求 `数字+#+楼`）整类失配，会使「标题正则建议」与「标题图层并入
-    text_layer」两道防线**同时静默失效**。放宽为「数字+#」或「数字+号楼」后两处
-    同时恢复；对旧写法仍是**严格超集**，不会让原本能匹配的图纸失配。
-    """
-    if not t:
-        return False
-    return bool(RE_DRAWING_WORD.search(t) and RE_BLDG_NO.search(t))
-
-
-def _txt_fields(t):
-    """文字记录归一：兼容几何缓存的 [层, x, y, 内容] 与 collect_texts 的 dict。"""
-    if isinstance(t, dict):
-        return (t.get("层") or t.get("layer") or "", t.get("x"), t.get("y"),
-                t.get("内容") or t.get("text") or "")
-    try:
-        return t[0], t[1], t[2], t[3]
-    except Exception:
-        return "", None, None, ""
+# 注：RE_DRAWING_WORD / RE_BLDG_NO 已随 is_bldg_title_text 外移 ftth_naming
+#  （楼名正则属命名域），此处经 re-export 引用，勿重复定义。
 
 
 def suggest_fx_symbol_layers(polylines, texts, fx_count=None, top=3):
@@ -3033,7 +2007,9 @@ def suggest_fx_symbol_layers(polylines, texts, fx_count=None, top=3):
 import math as _math
 
 # 箱位描述的完整拆分：楼栋号 / 单元号 / 安装层。写法容错：`号楼` 与 `#楼` 都收，
-#   单元号可缺省（单单元楼栋）。
+#   单元号可缺省（单单元楼栋）。三处同名正则中**最宽**的一份（收配套/商业/附属）；
+#   另见 extract_fx_map.DESC_POS_RE（窄：对照表描述列专用）与
+#   extract_fx_locations.loc_re（严：单元必填+认F/安装介词）。差异有意，不得合并。
 DESC_POS_RE = re.compile(r"(\d+)\s*(?:号楼|#?\s*(?:配套|商业|附属)?\s*楼)\s*(?:(\d+)\s*单元)?\s*(\d+)\s*层")
 # 仅到单元级的楼栋标注（`N#楼1单元` / `N号楼`），无安装层 —— 信息弱于上者，仅作二级证据。
 UNIT_POS_RE = re.compile(r"(\d+)\s*(?:号楼|#?\s*(?:配套|商业|附属)?\s*楼)\s*(?:(\d+)\s*单元)?")

@@ -65,17 +65,30 @@ import re
 import sys
 
 import ftth_common
+from coverage_engine import vshape_floor_evidence  # V3 对称：V 谷底统一证据唯一入口（纯构造）
 from ftth_common import (
     clean_text, collect_texts, cluster_chain_mean, cluster_values_by_gap,
-    ensure_console_utf8, floor_num, floor_step_from_texts, first_group,
+    ensure_console_utf8, floor_num, floor_num_or_zero, unit_num,
+    floor_step_from_texts, first_group,
     judge_pending_scope, load_dxf, median_text_height, parse_bldg_nums,
     parse_bldg_nums_ex, parse_floor_label, pending_items_from_rulings,
-    require_params, setup_logger,
+    require_params, setup_logger, write_json,
+    bldg_range_evidence, EXPAND_BLDG_RANGES,
 )
 
 ensure_console_utf8()
 
 log = setup_logger("analyze_coverage_vshape")
+
+# 箱位锚「明确非本窗」的折合字高门限（2026-10-04，R2 缺陷 D2 立）。
+#   背景：箱编号常画在平面图区/箱表区，与系统图区在 x 上同处一个窗口却无几何关联，
+#   故 --box-anchor-x-factor 超阈者**剔除归属**。但「剔除」不等于「阻塞」——
+#   旧实现凡超阈即阻塞，在一窗多栋图上会把窗内全部成员楼栋一并拦下。
+#   实测分离带（本文件 P0-9 注释 + r02 实测）：真锚距米数列 4.9~5.8×字高；
+#   邻楼锚 34×；箱表区编号 40~59×（r02 band1 实测被剔除两锚 40.73× / 47.14×）。
+#   故取 30×字高作「明确外来」门限：距真锚实测上限 5.2 倍外，且落在邻楼/箱表带同侧。
+#   语义：折合字高 ≥ 本值 ⇒ 判非本窗锚，**登记但不阻塞**；低于本值 ⇒ 灰区，维持阻塞。
+ANCHOR_FOREIGN_FACTOR = 30.0
 
 
 class CableParseError(ValueError):
@@ -156,13 +169,13 @@ def norm(s):
 
 
 def fl_num(name):
-    """楼层名 → 排序值（支持 3F / -1F / B1 / B2 / WF；认不出返回 -9999）。
+    """楼层名 → 排序值（支持 3F / -1F / B1 / B2 / WF；认不出返回 0）。
 
-    2026-09-12：改走 ftth_common.floor_num（parse_floor_label 统一解析），
-    旧实现只认 `(-?\\d+)F`，把 `B1` 判为 -9999，与主链口径不一致。
+    2026-09-12：改走 ftth_common.floor_num（parse_floor_label 统一解析）。
+    2026-09-27二轮：失败值 -9999→0（与 floor_num_or_zero 同口径；旧 -9999 会把
+    未知楼层误判成地下层并入覆盖下界，见 extra 分支）。
     """
-    v = floor_num(name, use_fullmatch=True)
-    return v if v is not None else -9999
+    return floor_num_or_zero(name, use_fullmatch=True)
 
 
 def unit_no_from_key(key):
@@ -171,6 +184,9 @@ def unit_no_from_key(key):
     兼容 `1单元` 与 `1#楼1单元`（楼名+单元并写）两种实测写法；`全部` 表示该楼
     未拆分单元，按 1 单元对位。
     """
+    n = unit_num(str(key or ''))  # canonical：覆盖ASCII+中文数字（2026-09-27二轮收敛）
+    if n is not None:
+        return n
     s = str(key or '')
     m = re.search(r'([0-9]+)单元', s)
     if m:
@@ -239,6 +255,288 @@ def cluster_column_x(vals, tol):
     return out
 
 
+# ============================================================
+# 2026-09-26（第5轮迭代·箱号锚缺席形态的覆盖归属）
+# 形态依据：柳辛庄项目「箱编号在布线图区、与系统图米数列分离，属图纸固有分离」。
+# V 型法只在米数列邻域找箱号锚，锚缺席时 V 段算得出、箱归属配不上 → coverage
+# 箱级记录 0。实测（band9-1）：V 谷底恰在 5F/14F，解析侧安装层（口径A′箱位直读）
+# 同样是 5F/14F —— 两独立来源一致，配对即得覆盖归属。
+# 以下两个函数均为纯函数（不读 DXF），便于合成自验；主流程仅负责组池与落盘。
+# ============================================================
+_PARSE_PAIR_BASIS = ('V型计算（皮线米数谷底；箱号锚缺席，经解析侧安装层'
+                     '（口径A′箱位直读）与谷底配对归属）')
+_PARSE_PAIR_SRC = 'E-DXF-TEXT:米数列V谷底+E-DXF-TEXT:箱位直读标注（两来源一致）'
+
+
+def load_parse_boxes(parse_path):
+    """读 parsed.json → 扁平箱清单，供锚缺席配对组池。
+
+    返回 (清单, 原因)。清单项 = {'编号','安装楼层'(原文),
+    '安装层num'(floor_num 数值),'单元号','楼栋号集','楼栋名'(parse原名),
+    '单元名'(parse原名)}。
+    文件不存在 / 读失败 / 无可用分纤箱数据时返回 (None, 原因)，调用方行为与
+    旧版完全一致（不启用新路径、不登记、不改判）。
+    """
+    if not parse_path or not os.path.isfile(parse_path):
+        return None, '未提供或文件不存在'
+    try:
+        with open(parse_path, 'r', encoding='utf-8') as _fp:
+            _p = json.load(_fp)
+    except Exception as _ex:                                        # noqa: BLE001
+        log.warning('锚缺席配对：--parse %s 读取失败（%s），新路径未启用，行为与旧版一致',
+                    parse_path, _ex)
+        return None, '读取失败：%s' % _ex
+    out = []
+    for _bname, _bv in (((_p or {}).get('楼栋')) or {}).items():
+        try:
+            _bnos, _amb = parse_bldg_nums_ex(
+                str(_bname), expand_ranges=ftth_common.EXPAND_BLDG_RANGES)
+        except Exception:                                           # noqa: BLE001
+            _bnos = []
+        if not _bnos:
+            continue
+        for _uname, _uv in (((_bv or {}).get('单元')) or {}).items():
+            _uno = unit_no_from_key(_uname)
+            if _uno is None:
+                continue
+            for _bx in (((_uv or {}).get('分纤箱')) or []):
+                _raw = (_bx or {}).get('安装楼层')
+                if not _raw:
+                    continue
+                _num = floor_num(str(_raw), use_fullmatch=True)
+                if _num is None:
+                    continue
+                _no = str((_bx or {}).get('编号') or '').strip()
+                if not _no:
+                    continue
+                out.append({'编号': _no, '安装楼层': str(_raw), '安装层num': _num,
+                            '单元号': _uno, '楼栋号集': set(_bnos),
+                            '楼栋名': str(_bname), '单元名': str(_uname)})
+    if not out:
+        return None, '无可用分纤箱数据（安装楼层均为空或键形态不可识别）'
+    return out, ''
+
+
+def select_parse_pool(parse_boxes, shared_members, bldg_num, unit_no):
+    """按窗口归属从解析侧箱清单组候选池（纯函数）。
+
+    共享组（shared_members 非空）取全部成员楼栋的箱；非共享窗口取本楼栋
+    本单元的箱。调用方仅在「本单元无可用箱号锚」时调用。
+    """
+    if shared_members:
+        _members = set(shared_members)
+        return [_pb for _pb in (parse_boxes or [])
+                if _pb['单元号'] == unit_no and (_pb['楼栋号集'] & _members)]
+    return [_pb for _pb in (parse_boxes or [])
+            if _pb['单元号'] == unit_no and bldg_num in _pb['楼栋号集']]
+
+
+def pair_parse_boxes_to_valleys(pool, seg_meta, rows, obj):
+    """解析侧箱 × V 段谷底配对（纯函数）。
+
+    参数:
+        pool: 本单元候选箱（load_parse_boxes 清单的子集）
+        seg_meta: 本单元 V 段元数据（含 v底楼层/覆盖楼层/行区间）
+        rows: 本单元米数行（含 米数，供证据段内序列）
+        obj: 待裁决「对象」串（如 `[共享]… 1单元`）
+    返回:
+        (boxes, rulings)：boxes 与既有输出同字段结构（另带 楼栋/单元 原名与
+        `_parse配对` 标记，供末尾 L1-C8 状态块与共享展开消费；该标记键以下划线
+        开头，C9 递归扫描只认 result_origin/result_confirmation，不会误收）；
+        rulings 为需人工裁决条目。配不上只登记、不硬凑、不静默丢弃。
+    """
+    boxes, rulings = [], []
+    _vnum = []
+    for _sm in seg_meta:
+        _vf = _sm.get('v底楼层')
+        _vnum.append(floor_num(str(_vf), use_fullmatch=True) if _vf else None)
+    _claimed = set()
+    for _pb in pool:
+        _hit = [_si for _si, _vn in enumerate(_vnum)
+                if _vn is not None and _vn == _pb['安装层num']]
+        if _hit:
+            _si = _hit[0]
+            _sm = seg_meta[_si]
+            _claimed.add(_si)
+            boxes.append({
+                '编号': _pb['编号'],
+                '安装楼层': _pb['安装楼层'],
+                '安装楼层口径': '口径A′:图上箱位直写标注（解析侧安装层，与V谷底配对）',
+                '覆盖范围线索': {
+                    '覆盖楼层': list(_sm['覆盖楼层']),
+                    '性质': '线索（V形法：皮线米数谷底；箱号锚缺席，经解析侧安装层配对归属）',
+                },
+                '判定依据': _PARSE_PAIR_BASIS,
+                '依据来源': _PARSE_PAIR_SRC,
+                '证据': {
+                    'v谷底行索引': _sm['谷底行'],
+                    'v谷底米数': _sm['v底米数'],
+                    'v谷底y': _sm['v底y'],
+                    '箱符号x': None,
+                    '箱符号y': None,
+                    'v底与箱符号偏差': None,
+                    '箱符号说明': '箱号锚缺席（箱编号在布线图区，属图纸固有分离），无箱符号可比对',
+                    'V段行区间': list(_sm['行区间']),
+                    '段内米数序列': [rows[k]['米数']
+                                     for k in range(_sm['行区间'][0], _sm['行区间'][1] + 1)],
+                    '解析侧安装层': _pb['安装楼层'],
+                    '配对方式': '解析侧安装层数值(%d) == V谷底楼层数值(%d)'
+                                % (_pb['安装层num'], _vnum[_si]),
+                },
+                '楼栋': _pb['楼栋名'],
+                '单元': _pb['单元名'],
+                'result_origin': 'derived',
+                'result_confirmation': 'settled',
+                '_parse配对': '已配对',
+            })
+        else:
+            boxes.append({
+                '编号': _pb['编号'],
+                '安装楼层': _pb['安装楼层'],
+                '安装楼层口径': '口径A′:图上箱位直写标注（解析侧安装层，无对应谷底）',
+                '覆盖范围线索': {
+                    '覆盖楼层': [],
+                    '性质': '线索（V形法：皮线米数谷底；箱号锚缺席，安装层无对应谷底，待确认）',
+                },
+                '判定依据': _PARSE_PAIR_BASIS,
+                '依据来源': 'E-DXF-TEXT:米数列V谷底+E-DXF-TEXT:箱位直读标注（两来源不一致，待裁决）',
+                '证据': {
+                    '解析侧安装层': _pb['安装楼层'],
+                    '本单元V谷底楼层': [_sm.get('v底楼层') for _sm in seg_meta],
+                    '配对方式': '无对应谷底，未归属',
+                },
+                '楼栋': _pb['楼栋名'],
+                '单元': _pb['单元名'],
+                'result_origin': 'derived',
+                'result_confirmation': 'pending',
+                '_parse配对': '未配对',
+            })
+            rulings.append({
+                '对象': obj,
+                '事项': '安装层无对应谷底（解析侧配对未命中）',
+                '说明': '箱 %s 解析侧安装层 %s；本单元 V 谷底楼层 %s —— '
+                        '未自行择一，该箱覆盖保持待确认'
+                        % (_pb['编号'], _pb['安装楼层'],
+                           '/'.join(str(_sm.get('v底楼层')) for _sm in seg_meta))})
+    for _si, _sm in enumerate(seg_meta):
+        if _si in _claimed:
+            continue
+        rulings.append({
+            '对象': obj,
+            '事项': '谷底无箱认领（解析侧无对应安装层）',
+            '说明': 'V 段谷底 %s（行 %s，米数 %s）；候选箱 %s —— 不硬凑'
+                    % (_sm.get('v底楼层'), _sm.get('谷底行'), _sm.get('v底米数'),
+                       '/'.join('%s=%s' % (_pb['编号'], _pb['安装楼层'])
+                                 for _pb in pool) or '无')})
+    return boxes, rulings
+
+
+def build_scale_anchors(args, texts, log, is_floor, cbre):
+    """尺度锚：把一切绝对坐标阈值换成随图缩放的字高/层高锚。
+
+    2026-09-15 立。本脚本原先多处使用绝对坐标阈值（列容差 30、带容差下限 5000、
+    带跨度 500000、窗口 y 用整带高度…），这些值都是在某一版图纸的坐标尺度上标定的。
+    换一张图（实测另一项目坐标尺度差 ~10^3 倍）整图崩坏：一条米数列被切成几十段、
+    窗口吞进相邻地块的数据。现改为**双锚**：
+
+      · 字高锚（本图米数文字高度中位数）→ 一切「x 方向多近算同列」的判据
+      · 层高锚（本图楼层标注量出的竖向栅格）→ 一切「y 方向多远算同一块」的判据
+
+    两者都随图纸缩放，判据因此与坐标尺度无关。
+
+    **2026-10-02（会审整改 P2-2）从 main() 抽出**：本函数原为 main() 内联块，
+    而 main() 达 1,275 行、无任何单元测试边界 —— 改其中任一段都要冒烟三分钟才敢
+    确认。抽出后本块可被直接调用验证，且 fmcy 的 coverage.json md5 在 golden
+    回归（T14）锁定，抽前抽后须逐字节一致，否则本抽取即视为改变行为。
+
+    `cbre` = 皮线米数正则（main() 内由 --cable-pattern 编译）。**必须显式传入**：
+    它是 main() 的局部量，模块级取不到 —— 首次抽取时漏传，真机跑出
+    `NameError: CBRE`，fmcy coverage 阶段 rc=1，由 T14 golden 红灯当场抓住。
+    这也说明为什么这类抽取必须锁在真图回归之下做。
+
+    返回 (字高中位, 建列容差, 任意字高中位, 层高步长, 层高来源说明,
+          楼层列容差, 箱列容差, 人读摘要)
+    """
+    hmed = median_text_height(
+        [{'内容': s, '高': h} for _, _, s, h in texts],
+        pred=lambda s: bool(cbre.search(s)))
+    col_tol = (args.col_x_tol_factor * hmed) if hmed else args.x_tol
+    hmed_any = median_text_height([{'内容': s, '高': h} for _, _, s, h in texts])
+    fl_step, fl_why = floor_step_from_texts(
+        [{'内容': s, 'x': x, 'y': y} for x, y, s, _ in texts], is_floor)
+    if fl_step is None and hmed_any:
+        # 兜底：无楼层刻度时用字高推一个保守的竖向步长（实测层高 ≈ 5×字高）
+        # 退役条件：floor_scale 信号 absent 时改申报制跳过（rc=3）而非猜步长
+        # （需画像侧配合；当前为过渡态，分支预算纪律 §十一）。
+        fl_step, fl_why = 5.0 * hmed_any, '楼层刻度量不出，按 5×字高 兜底'
+    # 楼层列建列容差同样锚定字高（原先写死 3000）——取两者较大者，
+    # 保证「1F 与 15F 同列却因右对齐差 1.4×字高」不被切裂。
+    fl_col_tol = max(args.floor_x_tol, col_tol) if hmed else args.floor_x_tol
+    box_tol = max(args.box_x_tol, col_tol) if hmed else args.box_x_tol
+    note = ('字高中位=%s → 建列容差=%.4g；层高锚=%s（%s）'
+            % ('%.4g' % hmed if hmed else '量不出',
+               col_tol if hmed else args.x_tol,
+               '%.4g' % fl_step if fl_step else '量不出', fl_why))
+    log.info('尺度锚：%s', note)
+    return hmed, col_tol, hmed_any, fl_step, fl_why, fl_col_tol, box_tol, note
+
+
+def merge_pending_items(result):
+    """待裁决后处理：去重 + 同形态合并（就地改 result['需人工裁决']）。
+
+    2026-10-02（P2-2 第二组）从 main() 抽出。本块只碰 result['需人工裁决']，
+    依赖仅 json + print，无 main() 局部量、无提前退出 ——
+    抽取无 NameError/语义漂移风险类问题（第一组 CBRE 教训见 build_scale_anchors）。
+    行为不变：去重按内容 key 保序；合并仅「V段数与箱数不一致」+
+    「窗口内无箱号锚」且 >= 2 条时成组，单条不成组；console 文案逐字保留。
+    """
+    # ---- 待裁决清单去重（2026-09-18 实跑修复，P1）----
+    #   同一 (对象, 事项) 会在多个判据分支下被重复 append：实测某图 18 项里有 8 项
+    #   是同一句话的复制（「V 段数多于箱数」与「V段数与箱数不一致」各出现两遍）。
+    #   重复项不改变数值，但把「待裁决 N 项」虚高、稀释人工注意力，也让人误以为
+    #   有更多独立疑点。按内容 key 保序去重（不排序 —— 保持判据产出顺序可追溯）。
+    _raw_pend = result.get('需人工裁决') or []
+    _seen_pend = set()
+    _dedup = []
+    for _x in _raw_pend:
+        _k = json.dumps(_x, ensure_ascii=False, sort_keys=True)
+        if _k in _seen_pend:
+            continue
+        _seen_pend.add(_k)
+        _dedup.append(_x)
+    result['需人工裁决'] = _dedup
+    if len(_dedup) != len(_raw_pend):
+        print('  · 待裁决清单去重：%d → %d 项（重复项已合并）' % (len(_raw_pend), len(_dedup)))
+
+    # ---- 同形态告警合并（2026-09-26，一百零二·评估项 7，成立才修 → 成立）----
+    #   「窗口内无箱号锚」形态：箱编号在布线图区、V 窗口内恒无箱号锚 —— 图纸固有分离，
+    #   同一根因（覆盖零产出，已由 inspect C6 FAIL 拦下）在 N 个单元逐条透传同文案
+    #   （8 带合计 50+ 条），信息增量为零且淹没真告警（如箱位锚超邻域剔除）。
+    #   合并为图级汇总 1 条 + 单元明细（信息不丢）：「对象」用**列表**承载全部单元对象串 ——
+    #   pending_items_from_rulings / judge_pending_scope 原生支持列表对象（逐个匹配），
+    #   故下方各单元 result_confirmation=pending 判定逐字不变；inspect C7 透传只计 1 项。
+    #   只合本形态（事项 == 'V段数与箱数不一致' 且说明含 '窗口内无箱号锚'），其余待裁决逐字保留；
+    #   仅 1 条时不成组、不合并（行为与旧版一致）。
+    _anchor_items = [x for x in result['需人工裁决']
+                     if isinstance(x, dict) and x.get('事项') == 'V段数与箱数不一致'
+                     and '窗口内无箱号锚' in str(x.get('说明') or '')]
+    if len(_anchor_items) >= 2:
+        _anchor_ids = {id(x) for x in _anchor_items}
+        _rest = [x for x in result['需人工裁决'] if id(x) not in _anchor_ids]
+        _merged = {
+            '对象': [x.get('对象') for x in _anchor_items],
+            '事项': 'V段数与箱数不一致',
+            '说明': ('%d 个单元命中同形态：窗口内无箱号锚（箱编号在布线图区，属图纸固有分离；'
+                     'V段仅输出覆盖线索，箱配对见parse侧）—— 同形态根因（覆盖零产出）已由 C6 拦下；'
+                     '各单元 V 段/谷底明细见「单元明细」。' % len(_anchor_items)),
+            '单元明细': [{'对象': x.get('对象'), '说明': x.get('说明')}
+                         for x in _anchor_items],
+        }
+        result['需人工裁决'] = _rest + [_merged]
+        print('  · 同形态告警合并：%d 条「窗口内无箱号锚」→ 图级汇总 1 条（单元明细 %d 个）'
+              % (len(_anchor_items), len(_anchor_items)))
+
+
 def main():
     ap = argparse.ArgumentParser(description='皮线 V 形覆盖判定（V型计算）')
     ap.add_argument('dxf', help='输入 DXF 文件路径')
@@ -302,6 +600,12 @@ def main():
                          '提供后逐箱比对「V型谷底安装层 vs 直读标注安装层」：'
                          '一致计入自检，不一致并列证据登记需人工裁决——'
                          '不自动改判、不以标注为准（原则二：不自行择一）')
+    ap.add_argument('--parse', default=None,
+                    help='结构化解析产物 parsed.json（parse_dxf_structured.py 产出，可选）。'
+                         '2026-09-26（第5轮迭代）：箱号锚缺席形态（箱编号在布线图区、'
+                         '与系统图米数列分离，柳辛庄实测）下，按解析侧安装层'
+                         '（口径A′箱位直读）与 V 谷底配对归属。有箱号锚的窗口不启用；'
+                         '文件不存在或无可用分纤箱数据时行为与旧版完全一致。')
     ap.add_argument('--margin', type=float, default=400, help='首末标题外侧窗口宽度的兜底值（默认 400；有相邻标题时改用间距中位数自适应，本值仅在无法量距时生效）')
     ap.add_argument('--include-basement', action='store_true',
                     help='把全局最低段下方的地下层并入覆盖下界。默认关闭：'
@@ -333,43 +637,59 @@ def main():
 
     texts = read_texts(args.dxf, layers, ttypes)
 
-    # ---------- 尺度锚（2026-09-15 立）----------
-    # 本脚本原先多处使用绝对坐标阈值（列容差 30、带容差下限 5000、带跨度 500000、
-    #   窗口 y 用整带高度…），这些值都是在某一版图纸的坐标尺度上标定的。换一张图
-    #   （实测另一项目坐标尺度差 ~10^3 倍）整图崩坏：一条米数列被切成几十段、
-    #   窗口吞进相邻地块的数据。
-    # 现改为**双锚**：
-    #   · 字高锚（本图米数文字高度中位数）→ 一切「x 方向多近算同列」的判据
-    #   · 层高锚（本图楼层标注量出的竖向栅格）→ 一切「y 方向多远算同一块」的判据
-    # 两者都随图纸缩放，判据因此与坐标尺度无关。
-    _hmed = median_text_height(
-        [{'内容': s, '高': h} for _, _, s, h in texts], pred=lambda s: bool(CBRE.match(s)))
-    _col_tol = (args.col_x_tol_factor * _hmed) if _hmed else args.x_tol
-    _hmed_any = median_text_height([{'内容': s, '高': h} for _, _, s, h in texts])
-    _fl_step, _fl_why = floor_step_from_texts(
-        [{'内容': s, 'x': x, 'y': y} for x, y, s, _ in texts], is_floor)
-    if _fl_step is None and _hmed_any:
-        # 兜底：无楼层刻度时用字高推一个保守的竖向步长（实测层高 ≈ 5×字高）
-        _fl_step, _fl_why = 5.0 * _hmed_any, '楼层刻度量不出，按 5×字高 兜底'
-    # 楼层列建列容差同样锚定字高（原先写死 3000）——取两者较大者，
-    #   保证「1F 与 15F 同列却因右对齐差 1.4×字高」不被切裂。
-    _fl_col_tol = max(args.floor_x_tol, _col_tol) if _hmed else args.floor_x_tol
-    _box_tol = max(args.box_x_tol, _col_tol) if _hmed else args.box_x_tol
-    _anchor_note = ('字高中位=%s → 建列容差=%.4g；层高锚=%s（%s）'
-                    % ('%.4g' % _hmed if _hmed else '量不出',
-                       _col_tol if _hmed else args.x_tol,
-                       '%.4g' % _fl_step if _fl_step else '量不出', _fl_why))
-    log.info('尺度锚：%s', _anchor_note)
+    (_hmed, _col_tol, _hmed_any, _fl_step, _fl_why, _fl_col_tol, _box_tol,
+     _anchor_note) = build_scale_anchors(args, texts, log, is_floor, CBRE)
 
     # 2026-09-13（P0-1）：楼号统一走 parse_bldg_nums。旧写法
     #   `int(TITLE.search(s).group(1))` 有两个硬伤：
     #   ① 图上为 `N号楼` 而 title-pattern 写 `(\d+)#` 时匹配不到 → 脚本空转；
     #   ② 共享标题（`3/6号楼…`）只取首号 → 其余楼栋整栋丢失。
+    # 2026-09-27（十五轮迭代，缺陷 D4）：楼号展开必须与 parse 侧**同一判据**。
+    #   parse 走 find_bldg_anchors（区间写法 `N-M号楼` 按「图上有独立实体证据」补入中间
+    #   楼号），本脚本原用 parse_bldg_nums（只取字面）⇒ 同一张图上 parse 有 2#楼、
+    #   本脚本没有 ⇒ 该栋的箱在 coverage 里**整栋静默消失**（无记录、无告警），
+    #   inspect 只能报「C3 箱 coverage 无记录」而看不出根因。
+    #   属「同一判据两份实现必然漂移」的又一次命中 —— 现按同一判据展开；
+    #   仍无证据者维持字面取号并登记待裁决（不静默补号、不静默择一）。
+    _dict_texts = [{"内容": s, "x": x, "y": y} for x, y, s, _h in texts]
+    RANGE_PENDING = []
+
+    def _nums_with_evidence(s):
+        _n, _amb = parse_bldg_nums_ex(s, expand_ranges=bool(EXPAND_BLDG_RANGES))
+        if not _amb:
+            return _n
+        _cm = re.search(r"(\d+)\s*-\s*(\d+)\s*[#号]?\s*楼", s)
+        _lo2 = _hi2 = None
+        if _cm:
+            try:
+                _lo2, _hi2 = int(_cm.group(1)), int(_cm.group(2))
+            except (TypeError, ValueError):
+                _lo2 = _hi2 = None
+        _ev = bldg_range_evidence(_dict_texts, _lo2, _hi2, None)
+        if _ev:
+            for _k, _ss, _ex, _ey in _ev:
+                if _k not in _n:
+                    _n.append(_k)
+            _n.sort()
+            log.info("  [楼栋区间按证据展开] %r：区间 %s-%s 的中间编号 %s 在图上有独立实体"
+                     "证据 → 按区间语义补入（与 parse 侧同判据）"
+                     % (s[:40], _lo2, _hi2, [e[0] for e in _ev]))
+        else:
+            RANGE_PENDING.append({
+                "对象": s[:40],
+                "事项": "标题命中连字符写法「%s-%s号楼」，语义存疑（并列 vs 区间）；"
+                        "图上未找到中间编号的独立实体证据，本次按**字面**取号 %s"
+                        % (_lo2, _hi2, _n),
+                "说明": "若实为区间语义，将静默少解中间楼栋 —— 请人工确认后加 "
+                        "--expand-bldg-ranges 重跑（parse 侧同口径已登记）",
+            })
+        return _n
+
     titles = []
     for x, y, s, _h in texts:
         if not TITLE.search(s):
             continue
-        nums = parse_bldg_nums(s)
+        nums = _nums_with_evidence(s)
         if not nums:
             # first_group 保证 TITLE 写成 `\d+号楼`（无捕获组）时也不崩
             g = first_group(TITLE.search(s))
@@ -466,7 +786,7 @@ def main():
     #   范围 ± N×层高（内容块 = 本图数据区的真实纵向范围，与坐标尺度无关）。
     #   多块时不介入，完全沿用原 y 聚类（保证既有图纸零回归）。
     _cblks = _content_blocks_1d(
-        [t[1] for t in texts if CBRE.match(t[2])], _fl_step)
+        [t[1] for t in texts if CBRE.search(t[2])], _fl_step)
     _force_single = (len(_cblks) == 1 and len(_bands) > 1)
     _single_ylo = None
     _single_yhi = None
@@ -522,8 +842,20 @@ def main():
                                 'band': _bi,
                                 'shared': list(nums) if len(nums) > 1 else None})
 
+    # 2026-09-26（第5轮迭代）：解析侧箱清单预载（锚缺席配对用）。
+    # 加载失败 / 无可用数据 → _PARSE_BOXES 为 None，新路径全程不启用。
+    # 2026-09-30（一百三十二）：nofloor 去决策 parse（安装楼层全空）在此判无可用，
+    #   属正常回落（锚缺席配对走兼容路径），不是错误。但 result 骨架必须照常产出——
+    #   原实现把它建在 if 内，无可用时下游 UnboundLocalError（rc=1），现提到 if 外。
+    _PARSE_BOXES, _parse_why = load_parse_boxes(args.parse)
+    if _PARSE_BOXES:
+        log.info('解析侧配对已启用：--parse %s，可用箱 %d 个',
+                 args.parse, len(_PARSE_BOXES))
+    else:
+        log.info('解析侧配对未启用：%s（锚缺席配对走兼容路径，不影响 V 谷底主计算）',
+                 _parse_why or '无可用箱数据')
     result = {
-        'DXF文件': args.dxf,
+        'DXF文件': os.path.basename(args.dxf),
         '方法': 'V型计算（皮线米数 V 形规律）：米数谷底→箱安装层；相邻谷底间米数最大行→覆盖分界',
         '说明': '本结果由文字标注几何推得。已用箱号文字 y 做独立交叉验证（自检_v底vs箱符号）',
         '参数': {
@@ -555,6 +887,9 @@ def main():
         '自检_v形单调性': [],
         '需人工裁决': [],
     }
+    # 缺陷 D4 配套：区间写法无证据补入者在此**显式登记**（与 parse 侧同口径），
+    #   不得只 WARNING 不留产物 —— 只有进了「需人工裁决」才会经 C7 透传到人工清单。
+    result['需人工裁决'].extend(RANGE_PENDING)
 
     # 2026-09-16（12坑复核·坑7）：**同一图幅带内**同名楼标题的防覆盖。
     #   bkey 的 [图幅N] 后缀只按「带」区分；同一带内若有两个同名楼标题
@@ -616,7 +951,7 @@ def main():
         #   把 y 相差 21 万的**相邻地块**整块米数列吞了进来 → 凭空多出几十个"单元"。
         # 现改为：以标题 y 为块底，向上并入「相邻行距 ≤ 3×层高」的米数行
         #   ——即本栋系统图数据块的真实 y 跨度；上下再外扩 N×层高，纳入列头与箱位标注。
-        _my = sorted({round(t[1], 1) for t in win_x if CBRE.match(t[2])})
+        _my = sorted({round(t[1], 1) for t in win_x if CBRE.search(t[2])})
         _above = [y for y in _my if y > ty]
         _blk = []
         if _above and _fl_step:
@@ -637,9 +972,9 @@ def main():
             #   下界维持原逻辑不动 —— 本类图纸内容全在标题上方，向下放宽必然吞邻带。
             _ys_up = [t[1] for t in win_x
                       if t[1] > _blk[-1]
-                      and (CBRE.match(t[2]) or is_floor(t[2])
-                           or FXRE.match(t[2])
-                           or (BOXRE is not None and BOXRE.match(t[2])))]
+                      and (CBRE.search(t[2]) or is_floor(t[2])
+                           or FXRE.search(t[2])
+                           or (BOXRE is not None and BOXRE.search(t[2])))]
             _ytop = max([_blk[-1]] + _ys_up)
             wy_lo = max(w['ylo'], _blk[0] - _mg)
             # 2026-09-16（P0-12/凤鸣朝阳）：上界由「yhi_max（带标题+20×层高估算）」
@@ -660,7 +995,7 @@ def main():
         win = [t for t in win_x if wy_lo <= t[1] <= wy_hi]
 
         floors = [(x, y, s) for x, y, s, _h in win if is_floor(s)]
-        _raw_cables = [(x, y, s) for x, y, s, _h in win if CBRE.match(s)]
+        _raw_cables = [(x, y, s) for x, y, s, _h in win if CBRE.search(s)]
         # 2026-09-13（P0-2）：先做格式体检——匹配到标注但一条都解析不出时，
         #   立刻以退出码 2 终止并打印样本，避免整轮空转后仍报"成功"。
         cables = []
@@ -671,12 +1006,15 @@ def main():
             except CableParseError as _ce:
                 _fmt_bad.append((_c[2], str(_ce)))
         _fmt_ok += len(cables)
-        hus = [(x, y, s) for x, y, s, _h in win if HURE and HURE.match(s)]
+        # 2026-10-04（P0-A5）：与 parse 主路径一致，整条文字恰好构成户数标注才算数。
+        #   原 search 会把皮线规格 `2Px2芯x28m` 里的 x28 当成 28 户混入 V 型谷底窗口。
+        hus = [(x, y, s) for x, y, s, _h in win
+               if HURE and HURE.fullmatch(str(s).strip())]
         # 箱位锚：除 --fx-pattern（编号）外，还可认 --box-mark-pattern（系统图上直写的
         #   「分纤箱／配线箱」字样）。后者是 V 谷底定层的**独立第二来源**——实测有的图
         #   系统图上只写「配线箱」、编号全在平面图区，只认 FX 编号会让自检整段为空。
         boxes = sorted([(x, y, s) for x, y, s, _h in win
-                        if FXRE.match(s) or (BOXRE is not None and BOXRE.match(s))],
+                        if FXRE.search(s) or (BOXRE is not None and BOXRE.search(s))],
                        key=lambda b: (b[0], -b[1]))
 
         fcols = cluster_chain_mean([f[0] for f in floors], _fl_col_tol)
@@ -776,13 +1114,42 @@ def main():
                     '距最近米数列': round(dx, 1),
                     '折合字高': round(dx / _hmed, 2) if _hmed else None} for b, dx in _box_far]
             binfo['超邻域箱锚'] = _bf
-            result['需人工裁决'].append({
-                '对象': bkey,
-                '事项': '存在 %d 个超出米数列邻域（>%.4g×字高）的箱位锚，已剔除、不参与箱编号归属'
-                        % (len(_box_far), args.box_anchor_x_factor),
-                '说明': '箱位锚 %s。箱编号常画在平面图区/箱表区，与系统图区无几何关联；'
-                        '若这些确是本单元箱位，请核对图纸或上调 --box-anchor-x-factor 后复核。'
-                        % [(_b[2], '距%.0f' % _dx) for _b, _dx in _box_far]})
+            # 2026-10-04（R2 缺陷 D2）：超阈锚按「折合字高」**再分两档** —— 不让一道
+            #   零容差硬闸把整窗判死（对应 operations_discipline：结构判据须留降级通道）。
+            #   >--box-anchor-x-factor 者一律**剔除归属**（口径不变）；「是否**阻塞**」分级：
+            #     · 灰区（未达 ANCHOR_FOREIGN_FACTOR×）—— 可能是本窗锚被画远，维持**阻塞**；
+            #     · 明确外来（≥ ANCHOR_FOREIGN_FACTOR×）—— 已落在邻楼/箱表带量级，
+            #       **登记但不阻塞**（显式 `阻塞: False`，同「已排除」语义）。
+            #   根因：窗内自身锚全部配对成功、被剔除的是**别家的**远锚；一律阻塞时，
+            #   一窗多栋图上邻楼的远锚会把窗内全部成员楼栋一并拦下（r02 实测：
+            #   柳辛庄 band1 12 箱 / band9-1 16 箱 pending 全部源于同一条该事项）。
+            _fh = (lambda _dx: (_dx / _hmed) if _hmed else None)
+            _gray = [(b, dx) for b, dx in _box_far
+                     if not _hmed or _fh(dx) < ANCHOR_FOREIGN_FACTOR]
+            _foreign = [(b, dx) for b, dx in _box_far
+                        if _hmed and _fh(dx) >= ANCHOR_FOREIGN_FACTOR]
+            if _gray:
+                result['需人工裁决'].append({
+                    '对象': bkey,
+                    '事项': '存在 %d 个超出米数列邻域（>%.4g×字高）的箱位锚，已剔除、不参与箱编号归属'
+                            % (len(_gray), args.box_anchor_x_factor),
+                    '说明': '箱位锚 %s。箱编号常画在平面图区/箱表区，与系统图区无几何关联；'
+                            '若这些确是本单元箱位，请核对图纸或上调 --box-anchor-x-factor 后复核。'
+                            % [(_b[2], '距%.0f' % _dx) for _b, _dx in _gray]})
+            if _foreign:
+                result['需人工裁决'].append({
+                    '阻塞': False,
+                    '对象': bkey,
+                    '事项': '存在 %d 个远距箱位锚（≥%.4g×字高），已剔除、不参与箱编号归属'
+                            '（登记不阻塞）' % (len(_foreign), ANCHOR_FOREIGN_FACTOR),
+                    '说明': '箱位锚 %s（折合字高 %s）。已达「邻楼锚/箱表区」量级'
+                            '（真锚实测 4.9~5.8×字高），判为**非本窗锚**，故登记不阻塞 —— '
+                            '窗内自身锚的归属与覆盖不受影响；若确为本窗锚，请核对图纸后重跑。'
+                            % ([(_b[2], '距%.0f' % _dx) for _b, _dx in _foreign],
+                               [round(_fh(_dx), 2) for _b, _dx in _foreign])})
+
+        # 2026-09-26（第5轮迭代）：本窗口共享展开收集器（仅共享窗配对成功时消费）。
+        _win_expand = {}
 
         # 2026-09-14（P0-4）：遍历**所有米数列**，不再取 min(fcols, ccols)。
         #   每个米数列代表一个单元；楼层列可被多单元共享，
@@ -959,11 +1326,18 @@ def main():
                     '编号': bx[2],
                     '安装楼层': sm['v底楼层'],
                     '安装楼层口径': '皮线V形谷底（区间法测谷底行所在层带）',
+                    # V3 对称（2026-09-30 一百三十六）：V 谷底统一证据随行；
+                    # 判据/口径/rc 均不动，老产物无该字段时 C3 走 legacy 原路。
+                    '安装楼层统一': vshape_floor_evidence(
+                        bx[2], sm['v底楼层'], 'x%.1f' % ccx),
                     '覆盖范围线索': {
                         '覆盖楼层': sm['覆盖楼层'],
                         '性质': '线索（V形法：皮线米数谷底，已与箱符号y交叉验证）',
                     },
-                    '判定依据': 'V形计算',
+                    # 2026-09-27（P0-3）：枚举值统一为 **V型计算**（契约/SKILL/文档 70 处皆此写法）；
+                    #   此前本处写「V形计算」（形），与契约枚举「V型计算」（型）不一致 ——
+                    #   同一事实两种写法 = 机器不可判，正是 L1-C8 要治的漂移。
+                    '判定依据': 'V型计算',
                     '依据来源': '文字图层 %s，米数列 x≈%.1f，窗口 x∈[%.1f, %.1f]'
                                 % ('/'.join(sorted(layers)), ccx, lo, hi),
                     '证据': {
@@ -996,7 +1370,31 @@ def main():
                                 '事项': '覆盖范围超出米数列数据范围',
                                 '说明': '楼层 %s 在米数列无对应标注行，本方法结果中不得出现（见 coverage_rules.md「V型计算」）' % fl})
 
-            if len(seg_meta) != len(uboxes):
+            # 2026-09-26（第5轮迭代·锚缺席配对归属）：本单元无可用箱号锚
+            # （箱号文字缺席，或全部被邻域门禁剔除致 uboxes 为空）且 --parse 可用时，
+            # 按解析侧安装层（口径A′箱位直读）与 V 谷底配对归属。
+            # 有箱号锚的单元（uboxes 非空）不进本路径 —— 其行为与旧版逐字节一致。
+            # 共享组取全部成员楼栋的箱；非共享窗口取本楼栋本单元的箱。
+            _parse_pool = []
+            if not uboxes and _PARSE_BOXES and seg_meta:
+                _parse_pool = select_parse_pool(
+                    _PARSE_BOXES, w['shared'], n, ui + 1)
+            _parse_ran = False
+            if _parse_pool:
+                _parse_ran = True
+                _pboxes, _prulings = pair_parse_boxes_to_valleys(
+                    _parse_pool, seg_meta, rows, '%s %d单元' % (bkey, ui + 1))
+                unit['分纤箱'].extend(_pboxes)
+                result['需人工裁决'].extend(_prulings)
+                if w['shared']:
+                    for _pbx in _pboxes:
+                        _ek = (_pbx['楼栋'], _pbx['单元'])
+                        _ed = _win_expand.setdefault(_ek, {'箱': [], '来源V单元': set()})
+                        if _pbx['编号'] not in [_e['编号'] for _e in _ed['箱']]:
+                            _ed['箱'].append(_pbx)
+                        _ed['来源V单元'].add('%d单元' % (ui + 1))
+
+            if len(seg_meta) != len(uboxes) and not _parse_ran:
                 _vbx_note = ('V段 %d 个（谷底 %s）/ 箱 %d 个（%s）'
                              % (len(seg_meta), [s['v底楼层'] for s in seg_meta],
                                 len(uboxes), [b[2] for b in uboxes]))
@@ -1015,6 +1413,30 @@ def main():
             binfo['单元']['%d单元' % (ui + 1)] = unit
 
         result['楼栋'][bkey] = binfo
+
+        # 2026-09-26（第5轮迭代·共享组逐楼栋展开）：共享窗配对成功时追加逐楼栋条目
+        # （键名用 parse 侧楼栋/单元原名，下游 assemble/inspect 按楼栋键消费）。
+        # 共享条目本身保留（米数表/V段/谷底证据不动），其各单元分纤箱数组已填全部
+        # 归属箱（每箱带 楼栋/单元 字段）。已存在同名键时合并单元，不覆盖。
+        if w['shared'] and _win_expand:
+            _exp_names = []
+            for (_eb, _eu), _ed in sorted(_win_expand.items(),
+                                          key=lambda _kv: (_kv[0][0], _kv[0][1])):
+                _exp_names.append(_eb)
+                if _eb not in result['楼栋']:
+                    result['楼栋'][_eb] = {
+                        '图幅带': w['band'], '标题': _eb,
+                        '共享组展开来源': bkey,
+                        '说明': '共享组归属展开：各成员楼栋已另建条目（来源共享窗 %s）' % bkey,
+                        '单元': {}}
+                _eu_entry = result['楼栋'][_eb]['单元'].setdefault(
+                    _eu, {'分纤箱': [], '来源共享窗': bkey,
+                          '来源V单元': sorted(_ed['来源V单元'])})
+                for _bx in _ed['箱']:
+                    if _bx['编号'] not in [_e['编号'] for _e in _eu_entry['分纤箱']]:
+                        _eu_entry['分纤箱'].append(dict(_bx))
+            binfo['共享组归属展开'] = ('共享组归属展开：各成员楼栋已另建条目（%s）'
+                                      % '、'.join(sorted(set(_exp_names))))
 
     # ---------- 米数格式门禁（2026-09-13，P0-2）----------
     # 「匹配到标注但一条都解析不出」= 正则与图面字段序不合，必须硬失败，
@@ -1041,7 +1463,7 @@ def main():
     if not _ok_blds:
         log.error('本次运行未产出任何楼栋的覆盖结果（楼栋 %d 个，全部无可用米数列）—— '
                   '**已按失败退出（码 2）**。最常见原因：--cable-pattern 与图上米数写法不符，'
-                  '或 --text-layer 未覆盖米数标注所在图层。', len(result['楼栋']))
+                  '或 --text-layer 未覆盖米数标注所在图层。本次 --out=%r', len(result['楼栋']), args.out)
         sys.exit(2)
 
     # ---- 自检：覆盖完整性门禁（2026-09-16，P0-12/凤鸣朝阳）----
@@ -1049,7 +1471,7 @@ def main():
     # 根因：凤鸣朝阳 8#楼曾因窗口截断漏 17F/18F（FL08-FX02 只覆盖到 16F），
     #   而既有自检只查 V 形单调性 + V底vs箱符号偏差（均 0 告警），漏层静默通过；
     #   门禁用**独立来源**（户数标注 X户）交叉校验覆盖结果，缺层必报。
-    _cov_missing = []      # (楼栋, 单元, 缺失楼层列表, 覆盖并集)
+    _cov_missing = []      # (楼栋, 单元, 缺失楼层列表, 覆盖并集, 户数标注楼层)
     for _bk, _bv in result['楼栋'].items():
         for _un, _uv in _bv['单元'].items():
             _covered = set()
@@ -1060,26 +1482,34 @@ def main():
                 continue    # 本单元无户数标注（无法建期望），跳过
             _miss = sorted(_hu_expected - _covered, key=fl_num)
             if _miss:
+                # 户数期望须随条目携带：后文循环只能见到元组内字段，
+                # 直接引用 _hu_expected 会取到外层循环最后单元的值（陈旧变量）。
                 _cov_missing.append((_bk, _un, _miss,
-                                     sorted(_covered, key=fl_num)))
+                                     sorted(_covered, key=fl_num),
+                                     sorted(_hu_expected, key=fl_num)))
+
+    def _fmt_floors(_fls, _lim):
+        if not _fls:
+            return '无'
+        if len(_fls) <= _lim:
+            return '/'.join(_fls)
+        return '%s...%s(%d层)' % (_fls[0], _fls[-1], len(_fls))
 
     if _cov_missing:
         print('\n自检 · 覆盖完整性: 发现 %d 个单元覆盖缺层！' % len(_cov_missing))
-        for _bk, _un, _miss, _covered in _cov_missing:
+        for _bk, _un, _miss, _covered, _hu in _cov_missing:
             print('   ! %s %s 缺失楼层 %s（覆盖并集 %s）'
                   % (_bk, _un,
                      '/'.join(_miss),
-                     '/'.join(_covered) if len(_covered) <= 12
-                     else '%s...%s(%d层)' % (_covered[0], _covered[-1], len(_covered))))
+                     _fmt_floors(_covered, 12)))
             result['需人工裁决'].append({
                 '对象': '%s %s' % (_bk, _un),
                 '事项': '覆盖范围缺失楼层 %s（V形法结果与户数标注不符）'
                         % '/'.join(_miss),
                 '说明': '覆盖并集 %s；户数标注楼层 %s。'
                         '请检查窗口边界/米数列是否被截断（参考凤鸣朝阳 8#楼 P0-12 修复）。'
-                        % ('/'.join(_covered) if len(_covered) <= 8
-                           else '%s...%s(%d层)' % (_covered[0], _covered[-1], len(_covered)),
-                           '/'.join(sorted(_hu_expected, key=fl_num)))})
+                        % (_fmt_floors(_covered, 8),
+                           _fmt_floors(_hu, 40))})
 
     # ---- 自检：偏差可信门禁（2026-09-16，12坑复核·坑7）----
     #   阈值 = --dev-gate-factor × 层高（尺度无关，禁用绝对坐标值）。
@@ -1114,7 +1544,10 @@ def main():
         _loc_idx = {}
         for _e in _fxl.get('唯一箱位') or []:
             _loc_idx.setdefault((_e['楼栋'], _e['单元']), set()).add(_e['安装层'])
-        _xchk = {'来源': args.fx_locations, '比对总数': 0, '一致': 0, '不一致': 0,
+        # 「来源」只记 basename：本字段是**溯源标注**，无消费方；写调用方路径原文
+        # 会让产物 md5 随 outdir 漂移（同图换目录跑 → 指纹不同），
+        # 违反「产物不得含随运行变化的路径」设计原则（见 check_launch_path.py 开篇）。
+        _xchk = {'来源': os.path.basename(args.fx_locations), '比对总数': 0, '一致': 0, '不一致': 0,
                  '无标注可校验': 0, '共享组跳过': 0,
                  '标注侧唯一箱位数': len(_fxl.get('唯一箱位') or []),
                  '键未识别未比对': [], '楼栋键区间歧义': []}
@@ -1149,9 +1582,9 @@ def main():
                 for _bno in _bnos:
                     _ann |= _loc_idx.get((_bno, _uno), set())
                 for _bx in (_u.get('分纤箱') or []):
-                    _vf = fl_num(_bx.get('安装楼层') or '')
+                    _vf = floor_num(_bx.get('安装楼层') or '', use_fullmatch=True)
                     if _vf is None:
-                        continue
+                        continue  # 安装层不可解析：判据缺失，不计入比对（≠不一致）
                     _xchk['比对总数'] += 1
                     _bx.setdefault('证据', {})['直读标注安装层'] = sorted(_ann) if _ann else None
                     if not _ann:
@@ -1190,51 +1623,7 @@ def main():
     #   confirmation：本单元在「需人工裁决」中有条目、或偏差门禁判「不可信」⇒ pending
     #           （待裁决，禁止进成品，由 C9 拦下）；否则 settled。
     #           口径与 parse 侧一致：有客观依据（自检通过、几何归属成立）即可定案。
-    # ---- 待裁决清单去重（2026-09-18 实跑修复，P1）----
-    #   同一 (对象, 事项) 会在多个判据分支下被重复 append：实测某图 18 项里有 8 项
-    #   是同一句话的复制（「V 段数多于箱数」与「V段数与箱数不一致」各出现两遍）。
-    #   重复项不改变数值，但把「待裁决 N 项」虚高、稀释人工注意力，也让人误以为
-    #   有更多独立疑点。按内容 key 保序去重（不排序 —— 保持判据产出顺序可追溯）。
-    _raw_pend = result.get('需人工裁决') or []
-    _seen_pend = set()
-    _dedup = []
-    for _x in _raw_pend:
-        _k = json.dumps(_x, ensure_ascii=False, sort_keys=True)
-        if _k in _seen_pend:
-            continue
-        _seen_pend.add(_k)
-        _dedup.append(_x)
-    result['需人工裁决'] = _dedup
-    if len(_dedup) != len(_raw_pend):
-        print('  · 待裁决清单去重：%d → %d 项（重复项已合并）' % (len(_raw_pend), len(_dedup)))
-
-    # ---- 同形态告警合并（2026-09-26，一百零二·评估项 7，成立才修 → 成立）----
-    #   「窗口内无箱号锚」形态：箱编号在布线图区、V 窗口内恒无箱号锚 —— 图纸固有分离，
-    #   同一根因（覆盖零产出，已由 inspect C6 FAIL 拦下）在 N 个单元逐条透传同文案
-    #   （8 带合计 50+ 条），信息增量为零且淹没真告警（如箱位锚超邻域剔除）。
-    #   合并为图级汇总 1 条 + 单元明细（信息不丢）：「对象」用**列表**承载全部单元对象串 ——
-    #   pending_items_from_rulings / judge_pending_scope 原生支持列表对象（逐个匹配），
-    #   故下方各单元 result_confirmation=pending 判定逐字不变；inspect C7 透传只计 1 项。
-    #   只合本形态（事项 == 'V段数与箱数不一致' 且说明含 '窗口内无箱号锚'），其余待裁决逐字保留；
-    #   仅 1 条时不成组、不合并（行为与旧版一致）。
-    _anchor_items = [x for x in result['需人工裁决']
-                     if isinstance(x, dict) and x.get('事项') == 'V段数与箱数不一致'
-                     and '窗口内无箱号锚' in str(x.get('说明') or '')]
-    if len(_anchor_items) >= 2:
-        _anchor_ids = {id(x) for x in _anchor_items}
-        _rest = [x for x in result['需人工裁决'] if id(x) not in _anchor_ids]
-        _merged = {
-            '对象': [x.get('对象') for x in _anchor_items],
-            '事项': 'V段数与箱数不一致',
-            '说明': ('%d 个单元命中同形态：窗口内无箱号锚（箱编号在布线图区，属图纸固有分离；'
-                     'V段仅输出覆盖线索，箱配对见parse侧）—— 同形态根因（覆盖零产出）已由 C6 拦下；'
-                     '各单元 V 段/谷底明细见「单元明细」。' % len(_anchor_items)),
-            '单元明细': [{'对象': x.get('对象'), '说明': x.get('说明')}
-                         for x in _anchor_items],
-        }
-        result['需人工裁决'] = _rest + [_merged]
-        print('  · 同形态告警合并：%d 条「窗口内无箱号锚」→ 图级汇总 1 条（单元明细 %d 个）'
-              % (len(_anchor_items), len(_anchor_items)))
+    merge_pending_items(result)
 
     _dg_concl = (result.get('自检_偏差门禁') or {}).get('结论')
     _dg_ok = (_dg_concl == '可信')
@@ -1247,15 +1636,64 @@ def main():
     #   （如『疑似跨图带连续体（已排除）』），不构成「结论待裁决」。
     _pend_items = pending_items_from_rulings(result.get('需人工裁决'))
     _st_settled = _st_pending = 0
+    # 2026-10-04（R1 缺陷 D1）：共享窗**证据副本**不计入结果状态。
+    #   窗内无箱号锚时走 parse 配对，其箱随后被上方「共享组逐楼栋展开」复制到各成员楼栋
+    #   另立条目（该单元带 `来源共享窗` = 窗键）。窗节点里那一份是**副本**：与成员楼栋
+    #   条目同带 result_origin/result_confirmation 时，同一箱被计两次，且两处状态互相矛盾
+    #   —— 成员楼栋按本栋作用域判 settled、窗节点按整窗作用域判 pending ⇒ C9 以「幽灵
+    #   pending」把整条链拦在出表之前（实测：柳辛庄 5 张分带图 74 条副本 / 34 个编号
+    #   状态互斥，全部 C9 rc=2 不得出表，而成员楼栋侧本已 settled）。
+    #   处置：**只**降级「确已展开到成员楼栋」的那几份副本（去掉两个结果状态字段、
+    #   留 `副本归属` 指针承接证据）；**未展开**的窗节点照旧带字段 —— 此时它是唯一载体，
+    #   降级即丢解。降级数落进「结果状态说明」，不静默。
+    _expanded_copies = set()
+    for _nk, _nv in (result.get('楼栋') or {}).items():
+        if not isinstance(_nv, dict):
+            continue
+        for _nuk, _nuv in ((_nv.get('单元') or {}) or {}).items():
+            _sw = (_nuv or {}).get('来源共享窗')
+            if not _sw:
+                continue
+            for _nbx in ((_nuv or {}).get('分纤箱') or []):
+                _expanded_copies.add((str(_sw), str(_nuk), str(_nbx.get('编号'))))
+    _st_copy = 0
+
     for _bk, _bv in (result.get('楼栋') or {}).items():
         for _uk, _uv in (_bv.get('单元') or {}).items():
+            _src_win = _uv.get('来源共享窗')
             _unit_pend = (not _dg_ok) or any(
-                judge_pending_scope(_objs, _uk, None, _bk)[0]
+                judge_pending_scope(_objs, _uk, None, _bk, _src_win)[0]
                 for _objs, _blk in _pend_items if _blk)
             for _bx in (_uv.get('分纤箱') or []):
+                if (str(_bk), str(_uk), str(_bx.get('编号'))) in _expanded_copies:
+                    _bx.pop('result_origin', None)
+                    _bx.pop('result_confirmation', None)
+                    _bx['副本归属'] = ('共享窗证据副本：归属见成员楼栋条目'
+                                    '（来源共享窗=%s）' % _bk)
+                    _st_copy += 1
+                    continue
                 _cov = (_bx.get('覆盖范围线索') or {}).get('覆盖楼层') or []
+                if '_parse配对' in _bx:
+                    # 2026-09-26（第5轮迭代）：锚缺席配对箱 —— origin 已定 derived
+                    # （V 谷底 + 解析侧安装层两来源算出），此处不重算 origin；
+                    # confirmation 仅在「本单元/本箱无待裁决关联且有覆盖」时 settled，
+                    # 配不上（无覆盖）恒 pending。判定口径与既有块一致，走同一
+                    # judge_pending_scope / _pend_items。
+                    _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk,
+                                                        _src_win)[1]
+                                    for _objs, _blk in _pend_items if _blk)
+                    _bx['result_origin'] = 'derived'
+                    _bx['result_confirmation'] = ('pending'
+                                                  if (_unit_pend or _box_pend or not _cov)
+                                                  else 'settled')
+                    if _bx['result_confirmation'] == 'settled':
+                        _st_settled += 1
+                    else:
+                        _st_pending += 1
+                    continue
                 _bx['result_origin'] = 'derived' if (_cov and _bx.get('安装楼层')) else 'unresolved'
-                _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk)[1]
+                _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk,
+                                                    _src_win)[1]
                                 for _objs, _blk in _pend_items if _blk)
                 _bx['result_confirmation'] = ('pending'
                                               if (_unit_pend or _box_pend
@@ -1275,13 +1713,85 @@ def main():
         'origin 取值含义': 'measured=图上直读/几何测量；derived=按规则算出（V型谷底+区间法对位）；unresolved=无解',
         'confirmation 取值含义': 'settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）',
         '统计': {'settled': _st_settled, 'pending': _st_pending},
+        '共享窗证据副本（不计入统计）': _st_copy,
         '判 pending 的条件': '本单元出现在「需人工裁决」中（**不含带 `阻塞: false` 的'
                           '已排除项**），或自检_偏差门禁结论非「可信」',
     }
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-    with open(args.out, 'w', encoding='utf-8') as fp:
-        json.dump(result, fp, ensure_ascii=False, indent=1)
+    # 2026-09-27（十五轮迭代，缺陷 D5 · 跨阶段对账）：parse 侧收录的箱，若本轮
+    #   **一条覆盖记录都没产出**，必须在此登记并写明成因方向 —— 否则 inspect 只能报
+    #   「C3 箱 coverage 无记录」而给不出成因，人工得回图上重查。
+    #   对应 operations_discipline §十二.6：上游有而下游无的，要么补齐、要么登记。
+    #   注：**不能直接拿 _PARSE_BOXES 当上游全集** —— 它按 `unit_no_from_key` 过滤，
+    #   会把「楼栋级兜底容器」（键为楼栋名、取不出单元号）里的箱**整批跳过**
+    #   （实测某带 10 个箱只进池 9 个，漏掉的正是兜底容器里那个）。对账要的是
+    #   「parse 收录了哪些箱」，故直接按 `分纤箱` 子树全量取号，不按单元过滤。
+    _parse_all_nos = set()
+    if args.parse and os.path.isfile(args.parse):
+        try:
+            with open(args.parse, 'r', encoding='utf-8') as _pf:
+                _pj = json.load(_pf)
+
+            def _walk_fx_nos(node, under_fx=False):
+                if isinstance(node, dict):
+                    for _k, _v in node.items():
+                        if _k == '分纤箱':
+                            _walk_fx_nos(_v, True)
+                        elif under_fx and _k == '编号' and isinstance(_v, str) \
+                                and _v.strip():
+                            _parse_all_nos.add(_v.strip())
+                        else:
+                            _walk_fx_nos(_v, under_fx)
+                elif isinstance(node, list):
+                    for _v in node:
+                        _walk_fx_nos(_v, under_fx)
+
+            _walk_fx_nos(((_pj or {}).get('楼栋')) or {})
+        except Exception as _ex:                                    # noqa: BLE001
+            log.warning('跨阶段对账：parsed.json 读取失败（%s），本次对账跳过', _ex)
+    if _parse_all_nos:
+        _cov_nos = set()
+
+        def _collect_nos(node):
+            if isinstance(node, dict):
+                for _k, _v in node.items():
+                    if _k == '编号' and isinstance(_v, str) and _v.strip():
+                        _cov_nos.add(_v.strip())
+                    else:
+                        _collect_nos(_v)
+            elif isinstance(node, list):
+                for _v in node:
+                    _collect_nos(_v)
+
+        _collect_nos(result.get('楼栋') or {})
+        _miss = sorted(_parse_all_nos - _cov_nos)
+        if _miss:
+            result['需人工裁决'].append({
+                # 2026-10-04（R2 缺陷 D4）：显式 `阻塞: False` —— 本条是**跨阶段损失登记**，
+                #   不是「结论待裁决」。根因：其 `对象` 是「（整图跨阶段对账）」这类图级标签，
+                #   经 parse_ruling_scope 拿不到楼栋/单元/箱段 ⇒ judge_pending_scope 恒不命中
+                #   ⇒ 它**机械上拦不住任何对象**；而缺失的箱在 coverage 里根本没有条目，
+                #   也就没有可标 pending 的载体。若照旧让它隐含「阻塞」，读起来是闸门、
+                #   实际作用为零（「登记了疑点却拦不住」的典型）。
+                #   真正的拦截**由 inspect C3「安装楼层双源交叉」执行**：parse 侧每个箱
+                #   在 coverage 无记录即 FAIL（实测 band4：`C3 FL04FX10 coverage 无记录`，
+                #   rc=2）。故此处只作可见性登记并写明执法者，避免双闸矛盾与误读。
+                '阻塞': False,
+                '对象': '（整图跨阶段对账）',
+                '事项': 'parse 侧收录 %d 个箱，其中 %d 个在本轮 V 型法里**未产出任何覆盖记录**'
+                        '（登记；拦截见 inspect C3 覆盖闭合）'
+                        % (len(_parse_all_nos), len(_miss)),
+                '说明': '未产出编号：%s。常见成因：该箱所在单元缺米数列或谷底数不足、'
+                        '箱位锚超出米数列邻域被剔除、该栋为共享标题成员但本轮未配对。'
+                        '请人工核对图纸后决定是否调参补跑（--box-anchor-x-factor / '
+                        '--min-col-rows）或按图面直读定层。'
+                        '**拦截不靠本条**：inspect C3 对「parse 有、coverage 无记录」的箱逐条判 FAIL。'
+                        % '、'.join(_miss[:20]),
+            })
+            log.warning('跨阶段对账：parse 侧 %d 个箱中有 %d 个本轮未产出覆盖记录：%s',
+                        len(_parse_all_nos), len(_miss), '、'.join(_miss[:20]))
+
+    write_json(args.out, result, indent=1)
 
     # ---- 控制台摘要 ----
     print('✓ V形法完成：楼栋 %d 个' % len(windows))
@@ -1291,9 +1801,13 @@ def main():
             for bx in u['分纤箱']:
                 cov = bx['覆盖范围线索']['覆盖楼层']
                 covs = '/'.join(cov) if len(cov) <= 8 else '%s ... %s (%d层)' % (cov[0], cov[-1], len(cov))
-                print('%-8s %-8s %-14s %-8s %-30s %.1f' %
+                # 2026-09-26（第5轮迭代）：锚缺席配对箱无箱符号，偏差为 None ——
+                # 按 %s 打印（有符号箱的偏差恒经 round(…,1)，%s 与 %.1f 输出逐字一致，
+                # 有箱号锚窗口的控制台输出不变）。
+                _dev = bx['证据'].get('v底与箱符号偏差')
+                print('%-8s %-8s %-14s %-8s %-30s %s' %
                       (bkey, un, bx['编号'], bx['安装楼层'], covs,
-                       bx['证据']['v底与箱符号偏差']))
+                       _dev if _dev is not None else '无箱符号（锚缺席配对）'))
     _dg = result.get('自检_偏差门禁') or {}
     if _dg:
         print('自检 · 偏差可信门禁: %s' % (_dg.get('结论'),))

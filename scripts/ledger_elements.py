@@ -53,7 +53,7 @@ WIRE_LAYER_KW_DEFAULT = ("纤芯", "皮线", "光缆", "蝶形", "CABLE", "RX-",
 # 否则竖线法会顺着配电干线跑，覆盖结论整片跑偏。
 WIRE_LAYER_EXCLUDE = ("照明", "动力", "接地", "消防", "安防", "暖通", "插座", "应急", "母线", "消防")
 FLOORLINE_LAYER_KW_DEFAULT = ("楼层线",)
-FX_TEXT_RE_DEFAULT = r"[A-Z]{2}\d{1,2}[-－]?FX\d{1,3}|FX\d{1,3}"
+FX_TEXT_RE_DEFAULT = r"[A-Z]{2}\d{1,2}[-－]?FX\d{1,3}|FX\d{1,3}"  # 居中默认（另见 plan最宽 / parse回退FX\d+ / inspect哨兵；显式传参优先）
 HU_RE_DEFAULT = r"[（({\[]?\s*(\d+)\s*户(?:\s*/\s*层)?\s*[）)}\]]?"
 CABLE_RE_DEFAULT = r"(\d+)\s*m\s*[*×]\s*(\d+)"
 CORE_RE_DEFAULT = r"(\d+)\s*芯"
@@ -408,9 +408,15 @@ def main():
         if not txt:
             continue
         kind = None
-        if HU_RE and HU_RE.search(txt):
+        # 2026-10-04（P0-A5，形态一致性修复）：HU_RE / CABLE_RE 改 fullmatch，
+        #   与 parse 主路径（parse_dxf_structured.py 业务特征判定）写法对齐。
+        #   原用 search 的后果：皮线规格标注 `2Px2芯x28m` 会被 HU_RE 命中，把**米数 28
+        #   当成 28 户**计入元素台账（实测某图此类误命中 445 条），污染户数计数；
+        #   同理 CABLE_RE 用 search 会把纯户数文字误认成米数。两者互为镜像，必须同改。
+        _t = C.clean_text(txt)
+        if HU_RE and HU_RE.fullmatch(_t):
             kind = "户数"
-        elif CABLE_RE and CABLE_RE.search(txt):
+        elif CABLE_RE and CABLE_RE.fullmatch(_t):
             kind = "皮线米数"
         elif CORE_RE.search(txt):
             kind = "芯数"

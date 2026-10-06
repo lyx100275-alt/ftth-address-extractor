@@ -35,9 +35,9 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ftth_common import protect_out_path, UNIT_RE_SRC, unit_num
+from ftth_common import protect_out_path, UNIT_RE_SRC, unit_num, ensure_console_utf8, write_json, sha256_file
 
-sys.stdout.reconfigure(encoding="utf-8")
+ensure_console_utf8()
 
 ap = argparse.ArgumentParser(description="出表输入 JSON 组装（count 逐层户数 + 显式列归属映射 + coverage 分纤箱）")
 ap.add_argument("--count", required=True, help="count_box_icons.py 输出的 count.json（含「列」数组）")
@@ -62,7 +62,7 @@ except (IOError, json.JSONDecodeError) as e:
 
 cols = count.get("列")
 if not isinstance(cols, list) or not cols:
-    print("[assemble] 错误：count JSON 中没有「列」数组（确认输入是 count_box_icons.py 的输出）")
+    print(f"[assemble] 错误：count JSON {args.count} 中没有「列」数组（确认输入是 count_box_icons.py 的输出）")
     sys.exit(2)
 
 
@@ -246,6 +246,7 @@ if args.coverage:
 # 规则：仅当 coverage 有覆盖楼层、且已组装楼栋中有覆盖楼层集合完全一致的
 #   模板单元时，才复制模板楼层表补入（result_origin=derived，非直读）。
 #   无模板 / 无覆盖楼层信息时不编造，保持告警不补入。无 coverage 时不展开。
+# 退役条件：count_box 覆盖无图标列形态（画像申报 + 自动列发现）后删除本段（分支预算纪律 §十一）。
 if args.coverage and cov_warn_unmatched:
     def _cov_floor_set(fx_list):
         s = set()
@@ -315,7 +316,10 @@ if args.coverage and cov_warn_unmatched:
         _new_floors = {}
         for _fl, _fv in _tpl_floors.items():
             _hu = int((_fv or {}).get("户数") or 0)
-            _new_floors[_fl] = {"户数": _hu, "result_origin": "derived"}
+            # 2026-09-27二轮：同配置展开属按规则算出且待人工核对，两字段正交缺一不可
+            # （旧实现只写origin，confirmation缺失即机器不可判）。
+            _new_floors[_fl] = {"户数": _hu, "result_origin": "derived",
+                                "result_confirmation": "pending"}
         _tgt = out_data["楼栋"].setdefault(_eb, {"单元": {}})["单元"].setdefault(
             _eu, {"楼层表": {}, "分纤箱": []})
         _tgt["楼层表"] = _new_floors
@@ -332,8 +336,15 @@ if args.coverage and cov_warn_unmatched:
             _hu_txt = f"{_n} 层共 {_tot} 户（每层户数：{_per_detail}）"
         print(f"[assemble] ⚠ 同配置展开：{_eb}/{_eu} 无图标列，按 {_tb}/{_tu} 同配置展开 {_hu_txt}"
               f"（覆盖楼层一致：{sorted(_cov_floors)}；模板每层户数：{_per_detail}；"
-              f"result_origin=derived，非直读，请核对）")
+              f"result_origin=derived/result_confirmation=pending，非直读，请核对）")
         _expanded.append(_entry)
+        # 2026-09-27二轮：展开项入产物级待核对清单（C9不扫assemble，此清单是唯一机读出口）。
+        out_data.setdefault("同配置展开待核对", []).append({
+            "对象": f"{_eb}/{_eu}", "模板": f"{_tb}/{_tu}",
+            "覆盖楼层": sorted(_cov_floors), "户数": _per_detail,
+            "result_origin": "derived", "result_confirmation": "pending",
+            "说明": "无图标列，按同覆盖配置模板复制户数；须人工核对后才可进成品",
+        })
     for _e in _expanded:
         if _e in cov_warn_unmatched:
             cov_warn_unmatched.remove(_e)
@@ -370,12 +381,16 @@ if cov_warn_unmatched:
 # ---------- 写出 ----------
 # 产物写保护（2026-09-18）：同名已存在时默认改道 *_patched，
 # 覆盖原始产物须显式 --force（原始输出一旦被自算值覆盖即不可复现）
+# 来源指纹（2026-09-29 一百二十七·P0）：记录组装输入的 SHA256，gen 出表前核对
+# “当前 coverage == 被 inspect 检查过的 coverage”，堵住陈旧验证旁路。
+# apply-ruling 只改值不碰本段（整 dict 回写保留），故裁决后指纹依然有效。
+out_data["provenance"] = {
+    "count_sha256": sha256_file(args.count),
+    "coverage_sha256": sha256_file(args.coverage) if args.coverage else None,
+    "produced_by": "assemble_households.py",
+}
 real_out, diverted = protect_out_path(args.out, force=args.force, label="组装产物")
-d = os.path.dirname(os.path.abspath(real_out))
-if d and not os.path.isdir(d):
-    os.makedirs(d, exist_ok=True)
-with open(real_out, "w", encoding="utf-8") as f:
-    json.dump(out_data, f, ensure_ascii=False, indent=2)
+write_json(real_out, out_data)
 print(f"[assemble] 已写出: {real_out}")
 if diverted:
     print(f"[assemble] （原 --out {args.out} 未被改动）")

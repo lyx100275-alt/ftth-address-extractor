@@ -1,6 +1,6 @@
 ---
 name: ftth-address-extractor
-description: "FTTH fiber-to-the-home engineering drawing parser. Parses DXF (converted from DWG via ODA by the user) with Python ezdxf, extracts fiber distribution box IDs, floor plans, household counts, and splitter configs, and generates standardized address tables (xlsx) with one row per household linked to distribution boxes, or as a 9-level address tree. Also reads building-level unit/floor/household counts straight from the drawing title block and cross-checks them against a project building intake table (xls). Use when user provides a DWG/DXF file and wants to: (1) extract fiber box info from FTTH engineering drawings, (2) generate standardized address tables (flat per-household or 9-level address tree), (3) parse FTTH PON architecture drawings, (4) rebuild a standard address table for a block/phase not yet done. Triggers: FTTH, 光纤入户, 分纤箱, 标准地址表, 九级地址, 地址树, 图签, 楼宇信息采集表, 图纸解析, DWG, DXF, 通信工程图纸."
+description: "FTTH fiber-to-the-home engineering drawing parser. Parses DXF (converted from DWG via ODA by the user) with Python ezdxf, extracts fiber distribution box IDs, floor plans, and household counts, and generates standardized address tables (xlsx) with one row per household linked to distribution boxes, or as a 9-level address tree. Also reads building-level unit/floor/household counts straight from the drawing title block and cross-checks them against a project building intake table (xls). Use when user provides a DWG/DXF file and wants to: (1) extract fiber box info from FTTH engineering drawings, (2) generate standardized address tables (flat per-household or 9-level address tree), (3) parse FTTH PON architecture drawings, (4) rebuild a standard address table for a block/phase not yet done. Triggers: FTTH, 光纤入户, 分纤箱, 标准地址表, 九级地址, 地址树, 图签, 楼宇信息采集表, 图纸解析, DWG, DXF, 通信工程图纸."
 name_cn: FTTH标准地址表提取
 description_cn: "从FTTH通信工程图纸(DWG/DXF)中提取分纤箱编号、覆盖楼层、户数等信息，自动生成标准地址表(xlsx)——支持每户一行扁平表与九级地址树两种形态；并支持从图纸图签直读栋级 单元数/层数/每层户数，与项目《楼宇信息采集表》逐栋交叉印证。支持ODA转换DWG→DXF、Python ezdxf解析。"
 create_source: super-agent-skill-creator
@@ -15,19 +15,17 @@ AIGC:
 ---
 
 # FTTH标准地址表提取
+## 执行摘要（首屏）
 
-## 执行摘要（会话开始先读本节）
+**做什么**：DXF → 分纤箱编号 / 覆盖楼层 / 每层户数 → 每户一行标准地址表（xlsx）或九级地址树。
 
-**做什么**：从 FTTH 竣工图（DXF）提取分纤箱编号 / 覆盖楼层 / 每层户数，生成每户一行的标准地址表（xlsx）或九级地址树。
+**顺序**：`Step 0` 确认 DXF → `1a` 探查（出 `profile.json`）→ `1b` 解析 → `1c` 户号 → `2` 自检 → `3` 用户校验 → `4` 出表。**Step 2 三条硬门禁任一 FAIL 不得出表**；禁止迁移见「Agent 状态机」。
 
-**顺序**：`Step 0` 确认 DXF → `Step 1a` 探查（出 `profile.json`）→ `Step 1b` 解析 → `Step 1c` 户号 → `Step 2` 自检 → `Step 3` 用户校验 → `Step 4` 出表。**Step 2 三条硬门禁任一 FAIL 不得出表**；**禁止迁移见「Agent 状态机」**。
+**底线（L0）**：不推断、不编造、不私改、矛盾即停、不识标注必问。遇矛盾或判不了 → 按 **L1-C5** 四列列入待确认项 → 交人裁决 → 锁定为基准值，**禁止静默择一**。
 
-**底线（永不违反，全文见 L0）**：不推断、不编造、不私改、矛盾即停、不识标注必问。
+**三层**：`测量`（图上已载信息的量化读取）不受限 → `归一化`（只改写法、不引入新数值）可自动 → `推理`（图上没写、判断哪方像笔误）交人工（判据见 [operations_discipline.md §5.1](references/operations_discipline.md)）。
 
-**矛盾 / 判不了**：停下 → 按 **L1-C5** 四列列入待确认项 → 交用户裁决 → 锁定为基准值。**禁止静默择一**。
-**先推理 → 再规则 → 人工裁决（三层）**：`测量`（对图纸已载信息的量化读取）**不受限**；`表达层归一化`（只改写法、不引入图上没有的数值关系）**可自动**；`推理`（图上没写、或判断"哪一方像笔误"）**一律交人工**。**`*16` 这类乘数不是归一化**（它把"几个图标"变成"多少户"）⇒ 按第④类报人。判据与三条硬边界见 [operations_discipline.md §5.1](references/operations_discipline.md)。
-
-**本文件定位**：只承载**协议 / 状态机 / 硬约束 / 名目清单**；细则、参数表、案例叙述一律在 `references/` 与 `SKILL_CHANGELOG.md`。体量纪律见「参考文件」。
+**本文件**只载协议 / 状态机 / 硬约束 / 名目清单；细则在 `references/`，历史在 `SKILL_CHANGELOG.md`。
 
 ## L0 不变量（总则）
 
@@ -35,62 +33,60 @@ AIGC:
 
 ### I1 角色与任务
 
-助手是**纯执行者**，只做两件事：① 从 DXF 直读楼栋、单元、楼层、户号，生成每户一行的标准地址；② 从 DXF 直读分纤箱编号、安装楼层、覆盖楼层（若可直读），把每户关联到对应分纤箱。所谓"读图"＝按文字实体的坐标、图层、内容与空间位置关系判断归属，是解析图纸本身的固有操作。
+**纯执行者**：① DXF 直读楼栋/单元/楼层/户号→每户一行标准地址；② DXF 直读分纤箱编号/安装楼层/覆盖楼层→每户关联分纤箱。
 
 ### I2 五项禁区（违反即失败）
 
-图上写了什么就提什么，图上没写的不准猜、不准推、不准编。
-
 | # | 禁区 | 说明 |
 |---|---|---|
-| P1 | **禁止读图外推理** | 不得从图上已有信息推导图上没写的结论（从芯数推分光方式、从楼层推户号归属、从皮线走向/连通性推覆盖分界）。**按皮线米数跑 V 型计算属测量方法，不在此列**。属工程判断的只列事实与线索交用户裁决 |
-| P2 | **禁止编造** | 没有的数据不编、不填默认值、不假设 |
-| P3 | **禁止私自修改** | 用户已确认的数据锁定为基准值，任何修改须经用户审核同意后执行 |
-| P4 | **发现矛盾立即停** | 数据内部矛盾、跨图标注矛盾、DXF 与视觉模型读数矛盾 → 报用户人工介入，**不自行择一，惯例/多数亦不得作裁决依据** |
-| P5 | **遇不认识的标注/符号主动询问** | 非标准标注（`*16` 乘数、特殊缩写、非标准符号）不得自行猜测含义，必须暂停并向用户确认后再继续解析 |
+| P1 | **禁读图外推理** | 不得从已有信息推导未写的结论（从楼层推户号、从皮线走向推覆盖分界）。**V 型计算属测量，不在此列**。工程判断只列事实交人裁决 |
+| P2 | **禁编造** | 无数据不编、不填默认、不假设 |
+| P3 | **禁私改** | 已确认数据锁定为基准值，修改须经用户同意 |
+| P4 | **矛盾即停** | 内部/跨图/DXF与视觉模型矛盾→交人，**不自行择一，惯例/多数亦不作依据** |
+| P5 | **不识标注必问** | 非标准标注/符号不猜含义，暂停问用户（`*N`/`xN` 已定直读，见 L1-C1） |
 
 ### I3 证据要求
 
-**所有结果必须基于客观数据的测量过程**：每个结果都要说明**测量过程**与**数据来源**。
-
-- **「已确认事项」防伪**：交付文本中任何标为「已确认」的口径，必须能引用**本会话中用户的原话**；无法引用的一律列入待确认清单，**禁止写成已确认**。机械形态见 I6「落盘纪律」与「Agent 状态机 · 锁定基准」。
+每个结果须说明**测量过程**与**数据来源**。**「已确认」防伪**：标「已确认」的口径须能引用**本会话用户原话**，否则列入待确认（机械形态见 I6 与「Agent 状态机·锁定基准」）。
 
 ### I4 矛盾即停：处置规程
 
-| 环节 | 规程 |
-|---|---|
-| ① 触发 | I2-P4 四类矛盾；「同一要素多处出现且表述不一致」（见「图纸信息模型」执行纪律） |
-| ② 动作 | **按 operations_discipline.md §五 分级处置**；**不静默择一、不由脚本自动取舍** |
-| ③ 产出 | 按 **L1-C5** 四列列入待确认项，附双方数值与坐标/来源 |
-| ④ 交给谁 | 用户；参考线索（惯例、统计多数、命名规律）仅供参考，**不得作为结论** |
-| ⑤ 裁决后 | 裁决结果**锁定为基准值**，后续步骤只能新增、不能覆盖 |
+① 触发：I2-P4 四类矛盾、「同一要素多处出现且表述不一致」（见「图纸信息模型」执行纪律）→ ② 动作：按 operations_discipline.md §五 分级处置，**不静默择一、不由脚本自动取舍** → ③ 产出：按 **L1-C5** 四列列入待确认项，附双方数值与坐标/来源 → ④ 交给用户：参考线索（惯例、统计多数、命名规律）仅供参考，**不得作为结论** → ⑤ 裁决后**锁定为基准值**，后续只能新增、不能覆盖。
 
 ### I5 权威等级（冲突裁决顺序）
 
 | 等级 | 来源 | 效力 |
 |---|---|---|
-| **A** | 用户在**当前会话**的明确裁定 / 指示 | 覆盖其余全部条款；非常规指示须标注「据用户指示（非常规）」 |
+| **A** | 用户**当前会话**的明确裁定/指示 | 覆盖其余全部条款；非常规指示须标「据用户指示（非常规）」 |
 | **B** | L0 不变量、「测量方式架构」铁律 | 不得违反，**违反即返工** |
-| **C** | L1 契约、操作纪律、工作流规则 | 可按现场权衡，但须说明理由 |
+| **C** | L1 契约、操作纪律、工作流规则 | 可权衡但须说明理由 |
 | **D** | 脚本默认值、示例、历史案例数据 | 仅供参考；**换图必须先按探查结果覆盖** |
 
 ### I6 操作纪律
 
 | 纪律 | 规则 |
 |---|---|
-| **维护约定** | 技能目录内**只放运行文件**；备份一律存**技能目录之外**（该目录由程序管理、可能被整体清理且不进回收站），命名 `<文件名>.bak_<时间戳>_pre_<改动名>` |
-| **性能纪律** | **同一张 DXF 一个任务里只做一次全量解析**：一律经 `ftth_common.load_dxf()`（内置 `<DXF>.pkl` 缓存，按 mtime+size 校验，**禁绕开它直写 `ezdxf.readfile()`**）；**只查几何**改用 `load_geom()` 读缓存。把「同一张图解析了几次」当硬指标管理 |
-| **探查纪律** | 探查/核查脚本**一律写文件执行，禁止 shell 内联**（故障形态见 [scripts_reference.md](references/scripts_reference.md) §实测案例数据）；一次性探查脚本写到 `.temp/<项目>/` 再执行；同类核查超过 2 个改跑 `scripts/inspect_closure.py` |
+| **维护约定** | 技能目录内**只放运行文件**；备份一律存**目录之外**（该目录由程序管理、可能被整体清理且不进回收站） |
+| **性能纪律** | **同一张 DXF 一个任务只做一次全量解析**：一律经 `ftth_common.load_dxf()`（内置 `<DXF>.pkl` 缓存，按 mtime+size 校验，**禁绕开它直写 `ezdxf.readfile()`**）；只查几何用 `load_geom()` |
+| **探查纪律** | 探查/核查脚本一律写文件执行、**禁 shell 内联**；一次性脚本写 `.temp/<项目>/`；同类核查 ≥2 个改跑 `inspect_closure.py` |
 | **环境与调用纪律** | 解释器 / 禁内联 / 禁 pip / 脚本路径四条 → **L1-C7** |
-| **效率纪律**（2026-09-16 立） | ① 一次给全可执行命令、裁决项集中提交（`ftth.py pipeline` 一条命令跑完，中间产物只落盘不请示）；② 探针只用技能自带命令、**禁反复重写同类**；③ 断流后**开新会话喂已定案产物**（依据见 [operations_discipline.md](references/operations_discipline.md)） |
-| **后果与处置**（2026-09-17 立） | `plan` 已输出每个信号的**「后果与处置」**与**本图「风险预告」**（`profile.json` 的 `risk_forecast`），是**既定路径**——照做即可，**不得重新推导、不得为"把结构搞清楚"自造探查脚本** |
-| **进度纪律** | **todo 随做随更**：每完成一个 Step（或子步）立即更新，不攒到最后批量改 |
-| **落盘纪律**（2026-09-17 立） | 三本台账（均在 `.temp/<项目>/`）：① 已确认理解 → `理解快照.json`（**值 + 来源 + 状态**）；② 人工裁决 → `裁决台账.json`（**问题 + 裁决原文 + 裁决人 + 适用范围**，**只在对话里说的不算落盘**）；③ 归一化前原始异写 → `别名台账.json`。**读写一律走 `scripts/ledger_state.py`，不手拼 JSON**；**下一阶段先读，未变更的项不得重推**。口径见 [operations_discipline.md](references/operations_discipline.md) §六~§九 |
-| **交付纪律** | 覆盖已存在的交付文件前先以写模式打开目标**探测占用**（被 Excel/WPS 打开时 `Copy-Item -Force` 会长时间挂起、期间正式路径仍是旧版）；被占用则提示用户关闭后重试，**不静默挂等**；命令**实际返回成功**后才上报交付 |
+| **效率纪律** | ① 命令一次给全、裁决集中提交（`ftth.py pipeline` 一条跑完，中间产物只落盘不请示）；② 探针只用技能自带命令、禁重写同类；③ 断流后开新会话喂已定案产物 |
+| **后果与处置** | `plan` 已输出每个信号的**「后果与处置」**与本图**风险预告**（`profile.json` 的 `risk_forecast`），是**既定路径**——照做即可，**不得重新推导、不得自造探查脚本** |
+| **进度纪律** | **todo 随做随更**：每完成一个 Step 立即更新，不攒到最后批量改 |
+| **落盘纪律** | 四件套（`.temp/<项目>/`）：①`理解快照.json`（值+来源+状态）②`裁决台账.json`（问题+裁决原文+裁决人+适用范围，对话说的不算落盘）③`别名台账.json`（原始异写）④`状态.json`（只记位置）。读写走 `ledger_state.py`，不手拼 JSON；下阶段先读，未变更不重推（口径见 [operations_discipline.md](references/operations_discipline.md) §六~§九） |
+| **从零纪律** | 复跑先跑 `ftth.py new-run --project-dir <项目目录>`：历史产物归档进 `run_<时间戳>/`（不删除）并重建空三本台账，防旧裁决被误当基准；DXF 同目录 `<DXF>.geom.json` 为无损投影缓存可复用，其余产物一律重生成 |
+| **交付纪律** | 覆盖已存在的交付文件前先以写模式打开目标**探测占用**（被 Excel/WPS 打开时 `Copy-Item -Force` 会长时间挂起、期间正式路径仍是旧版）；被占用则提示用户关闭后重试，**不静默挂等** |
 
 ## L1 契约（全局唯一定义）
 
-> 本节是**跨步骤适用**的接口定义；任何步骤提到下列契约一律指回本节，**禁止重写副本**（副本漂移是历次矛盾的根源，见 SKILL_CHANGELOG.md 五十五）。
+> 本节是**跨步骤接口定义**；任何步骤提到下列契约一律指回本节，**禁重写副本**。新增/改动契约须登记 `version.json` 的 `contract_coverage`（漏登 rc=2，见 [operations_discipline.md](references/operations_discipline.md) §九·补）。
+
+**两档读法**：`enforced`（有机器执行方）可以照着跑；`declared` 只有文字纪律、靠自觉。**当前 9 条全 `enforced`**。分档机器真源是 `version.json` 的 `contract_coverage[*].coverage`——改本文文字无效，门禁只认登记。
+
+| 档 | 契约 | 执行方 |
+|---|---|---|
+| `enforced` | C1 C2 C3 C4 C5 C6 C7 C8 C9 | 见各条「校验」行 / `contract_coverage` 登记 |
+| `declared` | （当前无） | —— |
 
 ### C1 输入契约：信号状态与选法
 
@@ -101,48 +97,35 @@ AIGC:
 | `variant` | 形态变体（如仅文字提及无图标） | 附证据 |
 | `unknown` | 判不了 / 没判 | **不得当作成立**，须人工复核或补探查；计入 `completeness.未作答` → **rc=2** |
 
-- **信号状态是选法的唯一依据**：某方法 `requires` 不成立即不可用；**两个候选 `requires` 同时成立时必须并跑交叉比对**，不一致不得自动择一。
-- **唯一例外是户数口径**（2026-09-16 用户裁决）：有家居配线箱图标时取图标法、不再数皮线，「并跑」仅保留与 `X户` 直读值的对账。图标法**可用**须 `box_icon_annotation` 与 `dedicated_wire_layer` 齐备，且**共享区间法前置 `floor_scale`**（无刻度则归层合计恒为 0）；只有图标标识而无皮线图元（`count_box_icons.py` rc=2）时回落皮线。
-- 方法池、每层户数实体优先级、方法选择规则见「测量方式架构」；信号定义与判定入口为 `methods/signals.json`（13 个信号，**每个信号带 `consequence`：该状态的下游后果与既定处置**）+ `ftth.py plan`（**输出里逐条打印「后果与处置」，并就本图给出 `risk_forecast` 风险预告**）。
+- **信号状态是选法唯一依据**：某方法 `requires` 不成立即不可用；多候选同时可用按顺序取首个，不并跑、不互校（覆盖：有米标→V型法）。
+- **户数口径**：①层户数标注（`X户` 或 `*N`/`xN`：乘号后数字即户数）→直读；②无标注→数图标；③无图标才数皮线。**三口径选定即出数，互不校验**。
+- 方法池见「测量方式架构」；信号定义在 `methods/signals.json`（13 个信号，各带 `consequence`）+ `ftth.py plan`（逐条打印后果与 `risk_forecast`）。
 
 ### C2 门禁契约：退出码语义
 
 | rc | 语义 | 动作 | 适用范围 |
 |---|---|---|---|
 | `0` | 正常 | 继续下一步 | 全部脚本 |
-| `2` | **输入不足**：有未作答项（`unknown`）/ 坐标缺失或必须修项 / 计数法归层为 0 | **停**。补探查后重跑 `plan`，或按 C5 列待确认项；**不得直接出表** | `parse` `/` `coverage` `/` `coverage-vshape` 门禁；`ledger_elements.py`；`count_box_icons.py` |
-| `3` | **早失败**：① 子任务本图未提供（`absent`）→ 跳过 + 降级路径，**不是错误、不需重试**；② **提取不完整**（如图签「有楼名零层户」）→ **禁止当完整结果出表** | 按语义分支处置 | ① 入口门禁；② `read_titleblock_households.py` |
-| 其他 | 命令自身失败 | 读 stderr 报错、修正输入后重跑 | 全部脚本 |
+| `2` | **输入不足**：未作答`unknown`/坐标缺失/必须修项/归层0 | **停**，补探查重跑`plan`或按C5交人；**禁出表** | `parse`/`coverage`/`coverage-vshape`门禁；`ledger_elements`；`count_box`（示意画法走`3`） |
+| `3` | **早失败**：① `absent`→跳过+降级（非错误）；② 提取不完整→禁当完整出表；③ 示意画法确认→回落皮线 | 按分支处置；③仅`count_box` | ① 入口门禁；② `read_titleblock`；③ `count_box` |
+| `4` | 写盘/缓存失败 | 读stderr重跑 | 见scripts_reference §退出码语义 |
+| 其他 | 命令自身失败；缺第三方依赖发`1`（环境类，与输入类`2`区分） | 读 stderr 重跑 | 全部脚本 |
 
 > 脚本级机器护栏（正则捕获组自检 / `[CONFIG-IGNORED]` / 单元歧证据明细 / 台账字段表）见 [scripts_reference.md](references/scripts_reference.md) §脚本级机器护栏。
 
-### C3 交接契约：`handoff` 申报制（2026-09-13 用户裁定）
+### C3 交接契约：`handoff` 申报制
 
-Step 1a 向解析阶段传递画像，**至少**回答两项：**① 编号↔楼栋/单元对照关系**（有没有？编号可读否？安装位置＝楼栋/单元/安装楼层是否同图可读）、**② 系统图选法**（分纤箱位置 / 覆盖范围 / 每层户数各用什么方法统计——**只申报方法，结果由第二步跑出**）。**这是申报制，不是存在性检查**：没有对照关系的图纸**也得过**；有就说有、没有就说没有，均附证据。
+**至少**回答两项：**① 编号↔楼栋/单元对照关系**（有无？可读否？安装位置同图可读否）、**② 系统图选法**（分纤箱位置/覆盖范围/每层户数各用什么方法——**只申报方法，结果由第二步跑出**）。**申报制，非存在性检查**：没有对照关系的图纸也得过，有则说有、无则说无，均附证据。
 
-| 怎么答 | 含义 | 是否阻塞 |
-|---|---|---|
-| `present` | 图上有（附证据：编号数 / 图标实况 / 选定方法） | 不阻塞 |
-| `absent` | 确实没有（附证据 **+ 降级路径**：下游改用现有的什么校验；此为**缺项替代校验路径**，与方法池选法无关——方法之间同级、无降级） | **不阻塞** |
-| `variant` | 形态变体（如仅文字提及无图标，附证据） | 不阻塞 |
-| `unknown` | 判不了 / 没判 → 计入 `completeness.未作答` | **阻塞 → rc=2** |
-
-- `absent` 项逐条写进 `completeness.缺失项及降级路径`；`ok = 未作答为空 且 不可解析为空`。
-- **② 的「分纤箱位置（安装楼层）」「每层户数」缺任一 ⇒ `不可解析` ⇒ rc=2**（系统图必备）；「覆盖范围」可 `absent` + 降级（如改用「户数×层数守恒」），**不阻塞**；只有前置信号 `unknown` 才算未作答。
-- `②…安装楼层方法`随选定方法导出（读取标注 或 区间法），**不得断言方法池里不存在的方法**。
+- `present` / `absent`（附证据 + 降级路径；方法同级无降级）/ `variant` 均**不阻塞**；`absent` 项写进 `completeness.缺失项及降级路径`；`ok = 未作答为空 且 不可解析为空`。
+- `unknown`（判不了/没判）→ 计入 `completeness.未作答` → **阻塞 rc=2**。
+- **②「分纤箱位置（安装楼层）」「每层户数」缺任一 ⇒ 不可解析 ⇒ rc=2**（系统图必备）；「覆盖范围」可 absent+降级，不阻塞；前置信号 unknown 才算未作答。安装楼层方法随选定方法导出（读取标注或区间法），不得断言方法池不存在的方法。
 
 > 字段级定义、`completeness` 结构、`gate.status` 评估、JSON 示例、接入 SOP 见 [measurement_methods.md §4.4](references/measurement_methods.md)。
 
-### C4 判定契约：对照表判据（2026-09-13 收紧）
+### C4 判定契约：对照表判据
 
-**只看内容、不看图名** —— 总图 / 光缆路由图 / 综合布线系统图都只是叫法。
-
-编号须与楼栋/单元标注**同行**才算对照表：
-
-- `|dy| ≤ 本图行距`（行距由本图楼层标注的相邻 y 差量出，**不预设坐标值**）；`|dx| ≤ 主体 x 跨度 15%`
-- 若多数编号与 `X户`/`Xm*N` 同行 → **判 `absent`**（编号属各楼系统图，无对照表可用）
-
-> 旧判据的实测背景与量测细节见 [measurement_methods.md §4.5](references/measurement_methods.md)。
+**只看内容不看图名**。编号须与楼栋/单元标注**同行**才算对照表：`|dy|≤本图行距`（由楼层标注 y 差量出）；`|dx|≤主体 x 跨度 15%`。多数编号与 `X户`/`Xm*N` 同行→判 absent（编号属各楼系统图）。实测背景见 [measurement_methods.md §4.5](references/measurement_methods.md)。
 
 ### C5 异常契约：待确认项四列格式
 
@@ -159,61 +142,60 @@ Step 1a 向解析阶段传递画像，**至少**回答两项：**① 编号↔�
 
 ### C6 输出契约：表结构与行数恒等式
 
-- **九级地址树**（每级节点各占一行）：`行数 = 1 + 1 + 楼栋数 + 单元数 + Σ层数 + Σ户数`。不满足即**报错停止**（检出"整层丢失 / 复制份数算错"最有效）；前 5 级每行重复填、节点行右侧留**空字符串**。
+- **九级地址树**（每级节点各占一行）：`行数 = 1 + 1 + 楼栋数 + 单元数 + Σ层数 + Σ户数`，不满足即**报错停止**（检出「整层丢失 / 复制份数算错」最有效）；前 5 级每行重复填、节点行右侧留**空字符串**。
 - **扁平表**（每户一行）：24 列 A~X，格式严格跟模板 `assets/标准地址表模板.xlsx`，**数据全部从 DXF 独立生成**。
-- **表头**：必须取自项目已定稿的表（`gen_9level_addressbook.py --header-xlsx`），**禁止自造**。两种形态**不可互替**。
+- **表头**：必须取自项目已定稿的表（`gen_9level_addressbook.py --header-xlsx`），**禁止自造**；两种形态**不可互替**。
 - **回读校验**：出表后必须回读复核上列三项，**不通过即视为未交付**。
 
-> 24 列对照表见 [addressbook_template.md](references/addressbook_template.md) §回读校验与 AIGC 水印行；九级填写规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)。Step 2 门禁与 Step 4 实现均引用本条，**不再复述公式**。
+> 24 列对照表见 [addressbook_template.md](references/addressbook_template.md) §回读校验与 AIGC 水印行；九级填写规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)。Step 2 门禁与 Step 4 实现均引用本条，**不复述公式**。
 
 ### C7 调用契约：路径、解释器与命令纪律
 
+> **校验**：`ftth_launcher.py` 在派生业务脚本前置 `FTTH_VIA_LAUNCHER=1`，`write_json` 见之即在产物顶层写 `_via_launcher: true`（布尔真值，非时间戳/路径）；`scripts/check_launch_path.py` 反查产物目录，缺该键即判疑似绕过启动器直调（rc=2）。run_smoke T4e/T17b 有正反用例与形状覆盖反查。
+
 | 项 | 规则 |
 |---|---|
-| **脚本路径** | 技能脚本一律从本技能 `scripts/` 目录（即 SKILL.md 所在目录）调用；**禁止猜测或拼造其他用户目录 / 技能副本路径**（按不存在的目录试跑单次白耗分钟级） |
-| **解释器** | 一律走启动器 `python "<技能目录>\scripts\ftth_launcher.py" <子命令或.py脚本>`（首参以 `.py` 结尾即转发该脚本；启动器内部真实探测带 ezdxf 的解释器，环境变量 `FTTH_PYTHON` 指定解释器绝对路径）。入口 `python` **无需带 ezdxf**（只负责启动启动器本身），业务脚本一律由启动器选中的解释器执行；**禁止绕过启动器直调业务脚本**（宿主 runtime 常劫持 PATH 且无 ezdxf，实测每个新会话必踩） |
-| **禁内联** | **禁止内联多行 `python -c "…"`**（引号被 shell 吃掉）；分析脚本一律先落盘再执行（同 L0-I6 探查纪律） |
+| **脚本路径** | 一律从本技能 `scripts/`（SKILL.md 所在目录）调用；**禁止猜测或拼造其他用户目录 / 技能副本路径**（按不存在的目录试跑单次白耗分钟级） |
+| **解释器** | 走启动器 `python "<技能目录>\scripts\ftth_launcher.py" <子命令或.py脚本>`（首参以 `.py` 结尾即转发；启动器探测带 ezdxf 的解释器，`FTTH_PYTHON` 可指定）。入口 `python` 无需带 ezdxf；**禁绕过启动器**（宿主 PATH 常无 ezdxf）。例外见 scripts_reference §解释器契约 |
+| **禁内联** | **禁止内联多行 `python -c "…"`**（引号被 shell 吃掉）；分析脚本一律先落盘再执行（同 I6 探查纪律） |
 | **禁 pip** | **不要用 `pip` 补装依赖**——镜像不可达时报错会伪装成「包不存在」 |
 
 > 解释器候选清单、退出码 9 语义、探测细节见 [scripts_reference.md](references/scripts_reference.md) §解释器契约。
 
-### C8 结果状态契约：两字段正交（2026-09-18 立）
-
-每个结论须带**机器可枚举**的结果状态。原 `判定依据` / `依据来源` 是自由文本 —— 人可读、**机器不可判**，且脚本侧产出不全，契约形同虚设：
+### C8 结果状态契约：两字段正交
 
 | 字段 | 取值 | 含义 |
 |---|---|---|
-| `result_origin` | `measured` / `derived` / `unresolved` | 结论怎么来的：**图上直读或几何测量** / **按规则算出**（V型、断口、区间法） / **无解** |
-| `result_confirmation` | `settled` / `pending` | 定案没有：`settled` 可进成品；`pending` 待裁决，**禁止进成品**（§5.6 底线 3） |
+| `result_origin` | `measured`/`derived`/`unresolved` | 图上直读或几何测量 / 按规则算出（V型/断口/区间法）/ 无解 |
+| `result_confirmation` | `settled`/`pending` | settled 可进成品；pending 禁进成品 |
 
-- **两字段正交，不得合成单值**：「怎么来的」≠「定案没有」。例：按 `*16` 算出的户数是 `derived` **且** `pending`（算得出，但须人裁）——合成一个值必丢一半信息。
-- **与 C1 信号层区分**：C1 的 `present/absent/variant/unknown` 回答「图上有没有」（**事实层**），本契约回答「怎么来的 / 定案没有」（**结果层**）。**三层不得共用一套枚举**。
-- **校验**：`ftth.py inspect` 的 **C9 项**扫描全部产物，`pending` 或 `unresolved` 非空即 FAIL；产物未携带本字段判 **SKIP**（老产物不得因缺字段被误拦成 FAIL）。
-- **覆盖申报（2026-09-18 补，P1）**：C9 必须显式申报「扫了哪些来源、其中哪些来源有字段」。**已提供但零字段的来源判 `WARN` 并点名** —— 否则闸门只报了 parse 侧就宣称「均已定案」，看着绿、实则有一半产物根本没核。
-- **产出方必须落地（2026-09-18 补，P0）**：`parse_dxf_structured.py` 的**分纤箱级**已产出两字段（含 `依据来源`，带 `E-DXF-TEXT:` / `E-DXF-GEOM:` 前缀，与 L1-C9 等级表对齐）。**只定义不产出 = 闸门形同虚设**（本契约曾立了整天而产出方零落地，C9 恒为 SKIP 从未拦下任何东西）。**新增产出方时须同步落地**，否则 C9 的 PASS/FAIL 无意义。
-- **待裁决项必须有作用域，否则静默放行（2026-09-18 补，P0）**：疑点须能按对象串**机械**关联到 **楼栋/单元/箱** 才产生 `pending`；判范围全技能唯一实现且带楼栋维度 —— [coverage_rules.md §待裁决项的作用域](references/coverage_rules.md)。
+- **两字段正交**：「怎么来的」≠「定案没有」。V型算出=derived；与图签不符列待确认=同时 pending。`*N`/`xN`=measured+settled。
+- **与 C1 分层**：C1 答「图上有没有」（事实层），本契约答「怎么来的/定案没有」（结果层），不共用枚举。
+- **校验**：`inspect` C9 项扫描全部产物，pending/unresolved 非空即 FAIL；缺字段判 SKIP（老产物不误拦）。C9 须显式申报扫了哪些来源、哪些有字段；已提供但零字段的来源判 WARN 并点名。
+- **产出方须落地**：`parse_dxf_structured.py` 分纤箱级已产出两字段；新增产出方须登记 `contract_coverage`（见 L1 节首）。
+- **pending 须有作用域**：疑点须能机械关联到楼栋/单元/箱才产生 pending（[coverage_rules.md §待裁决项的作用域](references/coverage_rules.md)）。
 
-### C9 证据来源等级（2026-09-18 立）
+### C9 证据来源等级（2026-09-18 立，与Step2自检C9不同名目）
 
-来源冲突按等级取信。**三个要点**：① `E-DXF-TEXT`（文字直读）与 `E-DXF-GEOM`（几何 / INSERT 属性）**无全序** —— 谁优先由场景规则定（箱位即图形符号 > 编号文字）；② `E-IMG`（视觉 OCR）**只能用于发现疑点，不得覆盖 `E-DXF-*`**；③ **「人工」必须拆成 `E-HUMAN-RULING`（用户本会话裁定＝I5-A，最高）与 `E-HUMAN-GUESS`（肉眼推测，最低）**，笼统把人工定为最低会与 I5-A 直接打架。完整表（含 A′/B′ 分档）见 [operations_discipline.md §五·补](references/operations_discipline.md)。
+来源冲突按等级取信（人工拆`E-HUMAN-RULING`最高/`E-HUMAN-GUESS`最低），完整表见 [operations_discipline.md §五·补](references/operations_discipline.md)。
 
 ## Agent 状态机（迁移门禁）
 
-> 本节**不新增规则**，只把已有条款表达为「什么状态下不允许往下走」的迁移门，使其可机械核对。**核对器：`ftth.py transitions --project-dir <项目目录>`**（`scripts/check_transitions.py`；三本台账全缺时给 rc=3，刻意不给「通过」）。与 L0 冲突时**以 L0 为准**。
+> 本节**不新增规则**，只把已有条款表达为可机械核对的迁移门。**核对器：`ftth.py transitions --project-dir <项目目录>`**（三本台账全缺给 rc=3）。与 L0 冲突时以 L0 为准。
 
 ```
-INPUT ──► PROBE ──► PLAN ──┬─ 有 unknown ──────► REPROBE / USER
-                           ▼
-                         PARSE ──┬─ 矛盾 ───────► USER（C5）
-                                 ├─ 不完整 ─────► REPROBE / USER
-                                 ▼
-                              INSPECT ──┬─ hard gate FAIL ──► STOP
-                                        ▼
-                             USER VALIDATION ──┬─ 有 pending ──► USER（C5）
-                                               ▼
-                                   LOCKED BASELINE（裁决已落盘）
-                                               ▼
-                                     ASSEMBLE ──► OUTPUT ──► READ-BACK VALIDATION
+INPUT ─► PROBE ─► PLAN ─┬─ unknown ─► REPROBE / USER
+                        ▼
+                      PARSE ─┬─ 矛盾 ────► USER（C5）
+                            ├─ 不完整 ──► REPROBE / USER
+                            ▼
+                          INSPECT ─┬─ hard gate FAIL ─► STOP
+                                   ▼
+                        USER VALIDATION ─┬─ 有 pending ─► USER（C5）
+                                          ▼
+                              LOCKED BASELINE（裁决已落盘）
+                                          ▼
+                                ASSEMBLE ─► OUTPUT ─► READ-BACK VALIDATION
 ```
 
 | # | 禁止迁移 | 依据 |
@@ -223,16 +205,15 @@ INPUT ──► PROBE ──► PLAN ──┬─ 有 unknown ──────
 | 3 | 用脚本默认值 / 历史档案消除 `pending` | L0-I5-D |
 | 4 | `INSPECT` 任一 hard gate FAIL → `ASSEMBLE` | Step 2 / L1-C6 |
 | 5 | `USER VALIDATION` 尚有未裁决 `pending` → `OUTPUT` | Step 3 / Step 4 前置 |
+| 6 | **申报态与证据不符**：`状态.json` 申报 `LOCKED BASELINE`/`ASSEMBLE`/`OUTPUT` 而 `pending` 未清 / 闭包 FAIL / 成品不存在 | L1-C2（口径见 [operations_discipline.md](references/operations_discipline.md) §九） |
 
-**锁定基准（LOCKED BASELINE）**：用户裁决按 I6「落盘纪律」写三本台账，机械形态＝`理解快照.json`（值 / 来源 / **状态=已确认**）＋`裁决台账.json`（问题 / 裁决原文 / 裁决人 / 适用范围）。**只在对话里说过的裁决不算锁定**；新解析值与之冲突时按 L0-I4 停下，**不得覆盖**。
+> **当前态可观测**：①~⑤是否定式检查，缺正向锚点。`ledger_state.py state-set` 落 `状态.json`，判据 #6 与台账/闭包/成品对拍；未申报只判 WARN 不拦门。枚举权威＝`ledger_state.py` 的 `STATES`（口径见 [operations_discipline.md](references/operations_discipline.md) §九）。
 
-**回读校验（READ-BACK VALIDATION）**：出表后按 L1-C6 复核行数恒等式与户级字段，**不通过即视为未交付**。
+**锁定基准**：用户裁决按 I6 写台账，机械形态＝`理解快照.json`（值/来源/状态=已确认）＋`裁决台账.json`（问题/裁决原文/裁决人/适用范围）。**对话说的不算锁定**；新值冲突按 I4 停、不覆盖。**回读校验**见 **L1-C6**。
 
-## 图纸信息模型：八项（2026-09-14 立三要素，2026-09-18 扩八项，最顶层）
+## 图纸信息模型：八项（最顶层）
 
-> **一张 FTTH 竣工图上，需要读的只有八样东西。八样读全，标准地址表即可直接推出，不需要任何额外的工程判断。**
-
-**图纸叫什么名字不作判据**（总图 / 光缆路由图 / 综合布线系统图都只是叫法），一律**按内容特征**识别。
+> **一张 FTTH 竣工图上，需要读的只有八样东西。八样读全，标准地址表即可直接推出，不需要任何额外的工程判断。** 图纸叫什么名字不作判据（总图 / 光缆路由图 / 综合布线系统图都只是叫法），一律**按内容特征**识别。
 
 | # | 项 | 回答什么问题 |
 |---|---|---|
@@ -243,7 +224,7 @@ INPUT ──► PROBE ──► PLAN ──┬─ 有 unknown ──────
 | ⑤ | **每层户数** | 每层展开几行 |
 | ⑥ | **分纤箱编号** | 这个箱是谁 |
 | ⑦ | **分纤箱安装楼层** | 装在哪层 |
-| ⑧ | **分纤箱覆盖楼层** | 管哪些层（**首选直读**；否则由皮线米数 V 型 或 竖干断口推出） |
+| ⑧ | **分纤箱覆盖楼层** | 管哪些层（**直读优先·尚未接入产出口**；否则**有米标走 V 型**，无则竖干断口） |
 
 **组装规则（八项 → 标准地址表）**
 
@@ -253,69 +234,65 @@ P列(某层某户) = 该层所属分纤箱编号
 安装位置      只作校验，不参与分配
 ```
 
-**来源数与校验分流（2026-09-18 用户裁定）**：逐项数该元素在图上**有几处可用来源** —— `0 处`先自证「真的没有」（**「没找到」≠「图上没有」**），仍无则待确认；`1 处`**直接采信**（能直读的绝不推导）；`≥2 处`**互相比对**，不一致时**可推理可推荐、列全选项交人选，不裁决**。**禁止为比对自创算法**。细则见 [operations_discipline.md §五](references/operations_discipline.md) / [coverage_rules.md](references/coverage_rules.md)。
+**来源数分流**：逐项数图上**独立来源数**（换算法复算不算）——`0` 先自证「真的没有」（没找到≠图上没有），仍无则待确认；`1` **直接采信**；`≥2` **互相比对**，不一致列全选项交人选不裁决。禁自创比对算法（细则见 [operations_discipline.md §五](references/operations_discipline.md) / [coverage_rules.md](references/coverage_rules.md)）。
 
 **执行纪律**
 
-- **八项必须逐栋 × 逐单元读全**，缺一不可。缺少任何一项，先回到图纸找它的**其他承载形式**（换图层、换写法、换实体类型），**不得因为"这个写法没匹配上"就判它不存在**（配合「镜像铁律」，要求 absent 项必须自证）。
-- **必须推导时跑方法池**（并跑互证见 **L1-C1**）。
-- **引用纪律**：技能内文档/代码互相引用一律用**章节名或条目名**（`L0-I#` / `L1-C#`），**禁止写行号**——行号随插入失效，留下静默指错的"死引用"。
-- **读全后先做一次"八项体检"**：楼号 / 单元数 / 楼层 / 每层户数 / 箱号+安装层 / 覆盖结论，齐全才允许生成表。
-- **同一要素多处出现时必须交叉校验**：编号 / 安装位置 / 每层户数在图纸多处出现时，各处表述须统一；矛盾按 §五 分级处置（**不得静默择一、不得脚本自动取舍**）。
+- **八项逐栋×逐单元读全**：缺项先找其他承载形式（换图层/写法/实体类型），**不得因「这个写法没匹配上」就判不存在**（absent 须自证）；必须推导时跑方法池（取法见 **L1-C1**）。
+- **引用纪律**：文档/代码互引只用章节名或条目名（`L0-I#`/`L1-C#`），**禁写行号**（随插入失效）。
+- **读全后先做八项体检**：六要素齐全才允许生成表。
+- **同一要素多处出现须交叉校验**；矛盾按 [operations_discipline.md §五](references/operations_discipline.md) 分级处置，不静默择一。
 
 ## 测量方式架构
 
-> **核心原则（2026-09-12 用户确立）：方法按测量原理命名，禁止用小区名冠名；没有统一模式，每张图纸按标注情况从方法池选组合。**
-> 完整架构（方法池详表、铁律全文、算法细节、实测判据、标准流程详解、图纸类型参考表）见 [references/measurement_architecture.md](references/measurement_architecture.md)。
+> **核心原则：方法按测量原理命名，禁止用小区名冠名；没有统一模式，每张图纸按标注情况从方法池选组合。** 完整架构（方法池详表、铁律全文、算法细节、实测判据、标准流程详解、图纸类型参考表）见 [measurement_architecture.md](references/measurement_architecture.md)。
 
-方法池（四种，按测量原理命名；互为**平行候选**、无主用/备用/降级之分 —— 2026-09-13 用户裁决）：
+方法池（四种，按测量原理命名；互为**平行候选**、无主用/备用/降级之分）：
 
 | 测量方法 | 测什么 | 判定依据 |
 |---|---|---|
-| **读取标注** | 图上明确写了的量：编号、楼层、户数、米数、芯数等（含图签形态栋级 `N层/M户`+`N单元`） | 直读文字标注内容与坐标 |
+| **读取标注** | 图上明确写了的量：编号、楼层、户数、米数、芯数等（含图签形态栋级 `N层/M户`+`N单元`） | 直读文字内容与坐标 |
 | **区间法**（楼层带归属） | ① 每层户数（皮线标注/家居配线箱图标落带）；② 分纤箱安装楼层 | 楼层线切 y 轴成带，`y_i ≤ y < y_{i+1}` 归属第 i 层 |
 | **竖线法**（端点直推） | 分纤箱覆盖楼层（需干净竖干连线） | 沿竖干追踪，断头端点定覆盖分界 |
 | **V型计算** | 分纤箱覆盖楼层（需皮线米数标注；写法不固定，检测器与生产脚本须全兼容） | 米数 V 形：谷底=安装层，相邻谷底间米数最大行=分界（该行归下段） |
 
-**每层户数实体优先级（2026-09-16 用户裁决）**：`X户` 直读最高 → 其次家居配线箱图标（每户一个、贴皮线末端；零重复，皮线须先按 `(x,y,内容)` 去重）→ 再次皮线标注。图标不可用的三种情形（无图标 /「每单元每层一个」示意画法配 `xN` 乘数 / rc=2）回落皮线。**选法与图标法可用性前置见 L1-C1**；`*N`/`xN` 乘数一律列待裁决、**不得自行相乘**。
+**每层户数优先级**：见 **L1-C1**（①层户数标注直读 → ②无标注数家居配线箱图标（每户一个、贴皮线末端，皮线先按 `(x,y,内容)` 去重）→ ③无图标才数皮线）。图标不可用三情形（无图标/示意画法/rc=2）回落皮线。
 
-**方法选择规则**：信号在则用、信号缺则换同级方法；多路信号同时成立时**并跑互证**，不一致交用户。共同前置 `floor_scale`（楼层刻度可建带）——区间法、竖线法②③步、V型谷底定层都依赖它；无楼层刻度只剩纯文字直读。**标准流程＝探查 → 解析 → 自检 → 出表**（探查是"测量的指挥"——自己不测量，只定怎么测）。
+**选法规则**：信号在则用、缺则换同级方法；多路同时成立按候选顺序取首个。共同前置 `floor_scale`（区间法、竖线法、V型谷底定层均依赖）；无楼层刻度只剩纯文字直读。**标准流程＝探查→解析→自检→出表**（探查是「测量的指挥」——只定怎么测，自己不测量）。
 
 **铁律**（**违反即返工**；只列条目名与关键判据，全文与实测反例见 [measurement_architecture.md](references/measurement_architecture.md)）：
 
-① **禁止跨用途混用**：竖线法/V型只测覆盖，区间法只测户数与安装楼层；严禁「按安装楼层排序切分」当覆盖判据。
-② **镜像铁律**：画像检测器与生产脚本的写法兼容表必须同步维护；信号判 `absent` 须附反证材料。
-③ **present 须过形态检验**：命中文字形态须与生产脚本消费形态一致。
-④ **档案差异项不得静默**：`archive_comparison` 差异项必须人工复核后才可 skip。
-⑤ **箱位残差超阈 ≠ 位置不可信**：区分「找不到箱」与「安装层标注冲突」，附几何最近层（层名+距离）。
-⑥ **接手既有产物必须重跑信号核对**：入口固定为「读画像信号表 → 重选方法」，禁止继承上轮方法。
-⑦ **多地块分带**（09-17 修正）：每带 = 本带图名 y → 上邻带图名 y（最上带取顶）；取中点或取下邻带图名均吞邻带内容。
-⑧ **箱位锚 x 邻域门禁**（09-15）：箱锚到米数列 x 距离 ≤ k×字高中位（默认 k=10），超阈者显式登记、不得静默丢弃。
-⑨ **竖线法前置五条**：图面「分纤箱」简称锚点 / 竖线按专用图层过滤 / 文字-图形偏移校正 / 逐候选层各配一次 / 锚点 (x,y) 二维聚类一节多箱。
+① 禁跨用途混用：竖线/V型只测覆盖，区间法只测户数与安装层；禁「按安装层排序切分」当覆盖判据。
+② 镜像铁律：检测器与脚本写法兼容表同步维护；absent 须附反证。
+③ present 须过形态检验：命中文字形态与脚本消费形态一致。
+④ 档案差异项不得静默：须人工复核后才可 skip。
+⑤ 箱位残差超阈≠位置不可信：区分「找不到箱」与「安装层冲突」，附几何最近层。
+⑥ 接手既有产物必须重跑信号核对：入口固定「读画像→重选方法」，禁继承上轮方法。
+⑦ 多地块分带：每带＝本带图名 y→上邻带图名 y（最上带取顶）；取中点吞邻带内容。
+⑧ 箱位锚 x 邻域门禁：箱锚到米数列 x 距离≤k×字高中位（默认k=10），超阈登记不静默丢。
+⑨ 竖线法前置五条：简称锚点/专用图层过滤/偏移校正/逐候选层各配一次/锚点二维聚类一节多箱。
+⑩ y 坐标用途边界（2026-10-06 立）：y 坐标回答"它在谁的辖区里"——**包含判定/容差贴合/区间对位合法**（楼栋-单元空间归属、楼层带归属、竖线法连续体认领、图标贴合皮线末端）；y 距离回答"它离谁最近"——**最近邻比较推算安装/覆盖楼层禁止作为结果来源**（2026-09-18 裁决）。正例=云峰（竖线法连续体认领+图标贴合，全 y 包含判定）；反例=柳辛庄 band8（箱编号画布线图区、离米数列 40~59×字高，最近邻必错配 → 走"窗口内无箱号锚"登记待裁决不硬凑）。详见 [measurement_architecture.md](references/measurement_architecture.md) 铁律⑩。
 
-**覆盖判定是解析阶段的独立必做步骤**：必须为**每个分纤箱**给出 `覆盖楼层`、`判定依据`（∈ 竖线法 / V型计算 / 待确认）、`依据来源`（数据源图层 + 坐标区间）。**严禁省略**：判不了就显式写 `判定依据=待确认` 并列入待确认清单，**不得留空、不得用"整栋楼"或"按安装楼层排序切分"填充**。
+**覆盖判定是解析阶段独立必做**：每箱必给 `覆盖楼层`、`判定依据`（∈读取标注/竖线法/V型计算/人工裁决/待确认，**首段须为枚举词**）、`依据来源`（图层+坐标区间）。判不了显式写 `判定依据=待确认` 列入清单，**不留空、不用「整栋楼」填充**。
 
 ## 栋级入户规模：读取标注（图签形态）+ 采集表三来源协议
 
 **触发条件**（任一命中即走本路径）：图签层有成对标注 `N#楼` + `N层/M户` + `N单元`；或项目另附《楼宇信息采集表》。
 
-采集表（逐栋逐单元）=**第一来源**，图签标注（逐栋）=**第二来源（独立复核）**；**逐栋**比对 `(单元数, 层数, 每层户数)`，不一致即列双方数值 + 坐标交人裁定，**禁止自动择一**；**聚合计数不作判据**。图签脚本 rc=3（提取不完整）见 **L1-C2**，不得当完整结果出表。
+采集表（逐栋逐单元）=**第一来源**，图签标注（逐栋）=**第二来源（独立复核）**；**逐栋**比对 `(单元数, 层数, 每层户数)`，不一致即列双方数值 + 坐标交人裁定，**禁止自动择一**；**聚合计数不作判据**。图签脚本 rc=3（提取不完整）见 **L1-C2**，不得当完整结果出表。来源角色、几何关系、地块分段、`--patch` 裁定覆盖表、键名与执行序、待确认项模板与机器护栏见 [titleblock_and_intake_table.md](references/titleblock_and_intake_table.md)、[scripts_reference.md](references/scripts_reference.md)；脚本 `read_titleblock_households.py`。
 
-> **完整协议**（来源角色、几何关系、地块分段、`--patch` 裁定覆盖表、键名与执行序、待确认项模板）与机器护栏见 [titleblock_and_intake_table.md](references/titleblock_and_intake_table.md)、[scripts_reference.md](references/scripts_reference.md)；脚本 `scripts/read_titleblock_households.py`。
-
-**九级地址表 = 地址树展开**（**不是"每户一行"的扁平表**，两者**不可互替**）：每一级节点自身占一行；**行数恒等式硬门禁**见 **L1-C6**（`gen_9level_addressbook.py` 内置校验）；前 5 级每行重复填、节点行右侧留空字符串；填写 / 户号规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)。
+**九级地址表 = 地址树展开**（**不是「每户一行」的扁平表**，两者**不可互替**）：每一级节点自身占一行，**行数恒等式硬门禁**见 **L1-C6**（`gen_9level_addressbook.py` 内置校验）；填写 / 户号规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)。
 
 ## 运行环境与模板
 
-- **环境**：Python 3.x + `ezdxf` + `openpyxl`；DWG→DXF 由用户侧 ODA 完成（**助手不调用**）；**脚本产物一律由 Python 自己写文件**（勿重定向，默认产出 UTF-16）。解释器确认一次后本会话不再重探 —— 完整环境表见 [scripts_reference.md](references/scripts_reference.md) §环境与命令纪律。
-- **模板**：`assets/标准地址表模板.xlsx`（Sheet「标准地址」，24 列 A~X，无合并单元格），**示例行只示格式、不得照搬数据**；24 列对照表见 [addressbook_template.md](references/addressbook_template.md)；输出契约见 **L1-C6**。
+- **环境**：Python 3.x + `ezdxf` + `openpyxl`；DWG→DXF 由用户侧 ODA 完成（**助手不调用**）；**脚本产物一律由 Python 自己写文件**（勿重定向，默认产出 UTF-16）。解释器确认一次后本会话不再重探（完整环境表见 [scripts_reference.md](references/scripts_reference.md) §环境与命令纪律）。
+- **模板**：`assets/标准地址表模板.xlsx`（Sheet「标准地址」，24 列 A~X，无合并单元格），**示例行只示格式、不得照搬数据**；24 列对照表见 [addressbook_template.md](references/addressbook_template.md)。
 
 ## 工作流
 
 ### Step 0: 确认DXF文件
 
-- 用户直接提供DXF文件路径，助手无需做任何格式转换；DWG→DXF 由用户侧转换（用户请求辅助时说明 ODA 操作步骤）
-- **脚本路径与调用纪律**：见 **L1-C7 调用契约**（全局唯一出处）。
+用户直接提供 DXF 路径，助手不做格式转换；DWG→DXF 由用户侧转换（用户请求辅助时说明 ODA 操作步骤）。**脚本路径与调用纪律**见 **L1-C7**（全局唯一出处）。
 
 ### Step 1: 探查 → 解析
 
@@ -327,122 +304,105 @@ P列(某层某户) = 该层所属分纤箱编号
 python "<技能目录>\scripts\ftth_launcher.py" dump_geom.py --dxf 图纸.dxf
 ```
 
-产出图纸同目录 `<DXF>.geom.json`（文字/INSERT/线段/图层统计/包围盒，含 `closed` 标记）。下方探查清单第 1 项的全部几何统计，以及本会话后续任何内联临时查询，**读该 JSON 即可，不再回原图解析**。
+产出图纸同目录 `<DXF>.geom.json`（文字/INSERT/线段/图层统计/包围盒）；后续几何统计或临时查询读该 JSON，不再回原图。⚠️ 三坑与 schema 见 [pipeline_details.md §16](references/pipeline_details.md)；整组顶点/块属性走 `load_dxf`。
 
-⚠️ `geom.json`三坑（读错白跑一轮）与schema见[pipeline_details §16]；要整组顶点/块属性走`load_dxf`，不走`load_geom`。
-
-对每张新DXF，先用ezdxf探查（**不预设任何项目特有参数**；全子项与判据见 [probe_checklist.md](references/probe_checklist.md)）：
+对每张新 DXF 先用 ezdxf 探查（**不预设任何项目特有参数**；全子项与判据见 [probe_checklist.md](references/probe_checklist.md)）：
 
 1. **六项基础探查**（图层/文字/采样/尺度/线段/INSERT；**按属性值识别设备、不按块名**）
-2. **对照表检查（如有，先做）**：按内容特征定位提映射（`--bldg-map` 优先几何；正则先枚举本图写法；映射须人工目视核对；absent/variant不推算）
-3. **单元×箱交叉清点**：双向差集，缺席记「未核」。
+2. **对照表检查（如有，先做）**：按内容特征定位提映射（`--bldg-map` 优先几何；正则先枚举本图写法；映射须人工目视核对；absent/variant 不推算）
+3. **单元×箱交叉清点**：双向差集，缺席记「未核」
 
-探查结果决定后续解析脚本使用的参数（图层名、文字类型、坐标阈值等），**不硬编码**。
+探查结果决定后续解析脚本的参数（图层名、文字类型、坐标阈值等），**不硬编码**。
 
-**Step 1a 的产物：图纸画像 `profile.json`（选法结果，必须显式产出）**
-
-探查不只产出参数，还必须产出**图纸画像**（各步骤该用哪个方法）。这就是「探查是测量的指挥：自己不测量，只定怎么测」的落地。
+**Step 1a 产物：图纸画像 `profile.json`**（选法结果，必须显式产出）——探查不只出参数，还须出画像，这是「探查是测量的指挥」的落地：
 
 ```
 ftth.py plan --dxf 图纸.dxf --probe config.json --out profile.json
 ```
 
-- 画像：`plan`逐信号判定写evidence（先核对`param_source_actual`）；与档案一致率低即新形态，走measurement_methods §4.2/§五接入SOP。
-- **交接契约与总图判据**见 **L1-C3** / **L1-C4**。
-
-**探查搜索纪律**：禁窄范围、禁关键词首扫、无标注查实体（见visual_model_lessons §四）。
+`plan` 逐信号判定写 evidence（先核对 `param_source_actual`）；与档案一致率低即新形态，走 measurement_methods §4.2/§五接入 SOP。交接契约与总图判据见 **L1-C3**/**L1-C4**。**搜索纪律**：禁窄范围、禁关键词首扫、无标注查实体（visual_model_lessons §四）。
 
 #### Step 1b: 结构化解析
 
-探查确定参数后，用 ezdxf 提取全部 FTTH 信息。脚本清单与职责（30 个文件）见 [scripts_reference.md](references/scripts_reference.md) §脚本清单与职责，**调用一律走 `ftth_launcher.py` 启动器**（见 **L1-C7**）。
+探查确定参数后，用 ezdxf 提取全部 FTTH 信息。脚本清单与职责（43 个文件）见 [scripts_reference.md](references/scripts_reference.md) §脚本清单与职责，**调用一律走 `ftth_launcher.py` 启动器**（见 **L1-C7**）。
 
-**入口**：统一入口 `ftth.py`（16 子命令：`pipeline` / `probe` / `plan` / `parse` / `coverage` / `coverage-vshape` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box` / `gen` / `budget` / `transitions` / `split-band` / `verify-truth`）；参数三级优先：命令行显式 > `--config` > 脚本默认值；**`ftth.py pipeline` 串跑 11 阶段（以 `_PIPE_STAGES` 为准，完整链见 [pipeline_details.md](references/pipeline_details.md) §11；只解析、不出表）**。子命令清单、依赖矩阵、可抄示例、批量编排见 [scripts_reference.md](references/scripts_reference.md)。**口径**：`count` = 皮线计数法、`count-box` = 家居配线箱图标法（旧名 `count-hdd`），同属区间法口径。
+**入口**：`ftth.py`（19 子命令：`pipeline`/`probe`/`plan`/`parse`/`coverage`/`coverage-vshape`/`inspect`/`assemble`/`apply-ruling`/`count`/`count-box`/`gen`/`budget`/`transitions`/`split-band`/`verify-truth`/`new-run`/`summary`/`verify-answer`）；参数优先级：命令行显式>`--config`>默认。**`ftth.py pipeline` 串跑 11 阶段**（以 `_PIPE_STAGES` 为准，完整链见 [pipeline_details.md](references/pipeline_details.md) §11；只解析不出表）。**口径**：`count`=皮线计数法、`count-box`=家居配线箱图标法，同属区间法口径。
 
-**必传参数**：完整参数表与三个高频坑见 [scripts_reference.md](references/scripts_reference.md)；最易踩的是 `--floor-pattern` **不得显式传 `(-?\d+)F`**——会让 `B1` 整层静默消失。**默认值仅供参考，换图先按 Step 1a 探查结果覆盖**。
+**必传参数**：完整参数表见 [scripts_reference.md](references/scripts_reference.md)；最易踩的是 `--floor-pattern` **不得显式传 `(-?[0-9]+)F`**——会让 `B1` 整层静默消失。**默认值仅供参考，换图先按 Step 1a 探查结果覆盖**。
 
-**正则传参一律写 `[0-9]`，不写 `\d`**（2026-09-18 复盘落地）：Windows 命令行 / Git Bash 会吃掉 `\d` 的反斜杠，**零命中且脚本仍 rc=0**。凡 `--fx-pattern` / `--title-pattern` / `--hu-pattern` / `--bldg-pattern` 等一律写字符类（`FX[0-9]+#?`）。判据：命中数为 0 时先怀疑正则被吃，**不得据零命中改判图纸无此元素**。
+**正则传参四坑**（原理与实测见 [pipeline_details.md §3](references/pipeline_details.md)；适用 `--fx-pattern`/`--title-pattern`/`--hu-pattern`/`--bldg-pattern`/`--floor-pattern`）：① 一律写 `[0-9]` 不写 `\d`——Windows 命令行 / Git Bash 会吃掉反斜杠，**零命中且脚本仍 rc=0**；② **值以 `-` 开头会被 argparse 当选项**（`--opt=-值` 同样失效）——负楼层写 `[-]?` 不写 `-?`；③ **捕获组只包数字**——`([0-9]+)户` 不写 `([0-9]+户)`（组含「户」曾致 `int('2户')` 崩，`floor_engine` 已加防御性提取）；④ **`--floor-pattern` 传则须含捕获组**——`([-]?[0-9]+)F` 不写 `[-]?[0-9]+F`（缺组致解析期 `m.group(1)` IndexError、崩点远离传参处；parse 参数自检已拦）。判据：**命中数为 0 时先怀疑正则被吃，不得据零命中改判图纸无此元素**。
 
-**脚本行为细则**（`apply-ruling` 批量落数 / 中间产物写保护 / `count-box --col-scale-map` / `inspect --fx-pattern` 产物自描述 / `ledger_elements.py` 元素台账 / 冷启动 vs 热启动 / pipeline 阶段顺序）—— 全文见 [pipeline_details.md](references/pipeline_details.md)。
+**脚本行为细则**（`apply-ruling` 批量落数 / 中间产物写保护 / `count-box --col-scale-map` / `inspect --fx-pattern` / `ledger_elements.py` 元素台账 / 冷启动 vs 热启动 / 阶段顺序）见 [pipeline_details.md](references/pipeline_details.md)。
 
-**`--fx-map` / `--bldg-map` 双回填，仅限画像 present**：**只有** `fx_overview_map=present`（图纸确有**真实集中总图对照表**）时才可用；absent/variant 一律不传、不回填——分纤箱所在楼层 / 覆盖 / 每层户数**只允许来自四种方法**（图上标注直读、V型计算、区间法、竖线法）与多方标注互验，「编号 y 坐标关联推算」**不在四法内、禁止作为来源**（2026-09-18 用户裁决，pipeline 已在 gate 层拦截）。`--fx-map` 只补 null、不覆盖已测值、重号不回填并登记交人；`--bldg-map` 三条边界：① 对照表无该编号 / 重号 / 楼栋名不在锚点内 → **保持原硬切并留痕**，不猜；② 对照表「楼栋」字段可能带单元后缀（`N#楼M单元`），须前缀解析后再匹配；③ 改派循环数据源必须是**全图文字**。不传而图确为对照表形态时，parse 会**逐栋 0 箱且 rc 仍为 0**（静默丢数）。**无对照表（absent）**：归属由**方法池**测定并逐箱写出依据、交人工复核。
+**`--fx-map`/`--bldg-map` 双回填，仅限画像 present**：仅 `fx_overview_map=present`（确有真实集中总图对照表）时可用；absent/variant 不传不回填——分纤箱楼层/覆盖/户数**只允许来自四法**（直读、V型、区间法、竖线法）与多方标注互验，「编号 y 坐标关联推算」**禁止作为来源**（pipeline 已拦截）。`--fx-map` 只补 null、不覆盖已测值、重号登记交人；`--bldg-map` 三边界：①对照表无该编号/重号/楼栋名不在锚点→保持原硬切留痕；②「楼栋」字段带单元后缀须前缀解析；③改派数据源必须是全图文字。不传而图确为对照表形态时 parse **逐栋 0 箱且 rc=0**（静默丢数）。**absent**：归属由方法池测定并逐箱写依据、交人工复核。
 
-**对照表认领箱的安装楼层取口径A（仅限 present）**：对照表有唯一映射且带非空安装楼层时取对照表值（标 `口径A:图上直写（总图对照表）`），区间法原值降级保留在 `区间法参考值` / `区间法参考误差` 供审计。**安装楼层口径共 3 个取值，输出必须原样标注**：`口径A:图上直写`、`口径A:图上直写（总图对照表）`、`口径B:区间法`。
+**对照表认领箱安装层取口径A（仅限 present）**：有唯一映射且带非空安装层时取对照表值，区间法原值降级保留供审计。**口径共 5 个，输出原样标注**：`口径A:图上直写`、`口径A:图上直写（总图对照表）`、`口径B:区间法`、`口径A′`、`口径B′`（后两者见 pipeline_details.md §9）。
 
-**必须解析**（判据与算法见 [measurement_methods.md](references/measurement_methods.md)、[coverage_rules.md](references/coverage_rules.md)）：FTTH 标注层文字 / 楼栋 / 单元 / 分纤箱编号及位置 / 安装楼层（**须标注口径 A 或 B**）/ 每层户数 / 覆盖范围（独立必做，三字段齐全）/ 必要连线 / 栋级入户规模 / 所有证据坐标。
+**必须解析**：八项（图纸信息模型）+ 覆盖范围三字段（独立必做）+ 栋级入户规模 + 所有证据坐标；安装楼层**须标注口径 A/A′/B/B′**；判据与算法见 [measurement_methods.md](references/measurement_methods.md)、[coverage_rules.md](references/coverage_rules.md)。
 
-**安装楼层与户数楼层归属必须同用区间法，禁止"最近楼层线法"**（取最近楼层线会越过带中点误判；细则见 [measurement_methods.md §3.5](references/measurement_methods.md)）。
+**安装楼层与户数楼层归属必须同用区间法，禁止「最近楼层线法」**（取最近楼层线会越过带中点误判；细则见 [measurement_methods.md §3.5](references/measurement_methods.md)）。**与对照表交叉校验**比对编号/楼栋/单元/安装层四项，冲突时**口径A优先于口径B**（直读>推算）且任一方不得静默丢弃。**覆盖判定属解析阶段**：出表只组装不判定——换覆盖测量方式只改解析，出表不动。
 
-**与对照表交叉校验**：比对**编号 / 所属楼栋 / 单元 / 安装楼层**四项。冲突时**口径A 优先于口径B**（直读 > 推算，属客观判据），但**双方数值须一并列入待确认项交用户裁决**，**不得任一方被静默丢弃**。**覆盖判定归属解析阶段**：出表阶段只组装不做判定——换覆盖测量方式只改解析，出表不动。
-
-> ⚠️ **两条硬约束（违反即判解析失败）**：**① 覆盖分界只能由竖干物理断口（或连线直读）确定** —— 严禁按安装楼层排序切分、严禁取箱附近全部竖干 min~max；**② 楼栋/单元归属必须以图纸自带的编号↔楼栋单元对照关系为准** —— 严禁用标题 x 区间硬切（系统图区常两行交错排布、按标题 x 中分**必然串行**）。**对法、实测反例与其余前置约束**（`--wire-layer` 图层来源统计等）见 [coverage_rules.md](references/coverage_rules.md) §零。
+> ⚠️ **两条硬约束（违反即判解析失败）**：**① 覆盖分界只能由竖干物理断口（或连线直读）确定**——严禁按安装楼层排序切分、严禁取箱附近全部竖干 min~max；**② 楼栋/单元归属必须以图纸自带的编号↔楼栋单元对照关系为准**——严禁用标题 x 区间硬切（系统图区常两行交错排布，按标题 x 中分**必然串行**）。对法、实测反例与其余前置约束（`--wire-layer` 图层来源统计等）见 [coverage_rules.md](references/coverage_rules.md) §零。
 
 #### Step 1c: 户号生成
 
-根据每层户数（DXF直读）生成户号。**完整规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)**，三条硬点：① 默认 `楼层×100+序号`；② **某层无户数标注即不生成户号**，列待确认项；③ 负楼层按 `B+楼层×100+序号`（B1层3户 → B101/B102/B103），**格式以模板为准**。`gen_addressbook.py` 已支持 B101/B102 与中文楼层名转换。
+按每层户数（DXF 直读）生成户号。**完整规则见 [titleblock_and_intake_table.md §四](references/titleblock_and_intake_table.md)**，三条硬点：① 默认 `楼层×100+序号`；② **某层无户数标注即不生成户号**，列待确认项；③ 负楼层按 `B+楼层×100+序号`（B1 层 3 户 → B101/B102/B103），**格式以模板为准**。`gen_addressbook.py` 已支持 B101/B102 与中文楼层名转换。
 
 ### Step 2: 自检
 
-解析完成后进行内部交叉校验。**完整清单（26 条，含实测案例叙述）见 [step2_selfcheck.md](references/step2_selfcheck.md)**——出表前必须逐条过。
+解析完成后内部交叉校验。**完整清单（26 条，含实测案例）见 [step2_selfcheck.md](references/step2_selfcheck.md)——出表前必须逐条过。**
 
 **三条硬门禁（任一 FAIL 不得出表）**
 
-1. **一体化闭合核查（自检第一步，2026-09-16）**：先跑 `ftth.py inspect`（`inspect_closure.py`），一次出齐 C1~C10（十项名与判据见 [step2_selfcheck.md](references/step2_selfcheck.md) §C1~C10）。清单内事项**禁止再临时编写 `inspect_*.py`**。
-2. **计数守恒**：出表行数 = 源户数之和；地址树行数恒等式（硬门禁）见 **L1-C6** —— 不成立**报错停止**。
-3. **矛盾即停**：两类图纸互验、双来源数值、覆盖两法并跑——任何不一致按 **L0-I4** 停下、列入待确认项交人工介入，**禁止静默择一**。
+1. **一体化闭合核查**：先跑 `ftth.py inspect`，一次出齐 C1~C10（十项名与判据见上）。清单内事项禁再写 `inspect_*.py`。
+2. **计数守恒**：出表行数＝源户数之和；地址树恒等式见 **L1-C6**，不成立报错停止。
+3. **矛盾即停**：任何不一致按 **L0-I4** 停下列待确认，禁静默择一。
 
-**其余必查项（四条硬点；完整 26 条清单见 [step2_selfcheck.md](references/step2_selfcheck.md) —— 出表前必须逐条过）**
+**其余必查项（三条硬点）**
 
-- **口径**：户数先判形态（箱=层+xN→count-box rc=2拦断；皮线先去重）；归属用区间法。
-- **空集合不得判 PASS**：核查项在「有效对象数 = 0」时只能判 `SKIP` 并写明原因，**不得判 PASS，也不得把空集合的合计写成 `0`**（实测 C5 曾输出「整图户数合计 0」、C8 曾对 0 个单元判 PASS）—— 否则「**没取到数**」会看起来像「**数就是 0**」，属最隐蔽的静默丢数。未取到数须显式交接给图标法（`count-box`）。
-- **覆盖三字段+交叉**：逐箱三字段齐全；有真值表必跑verify反查；户数以逐层标注图为准（不读平面图）；乘数处图标数≠户数交裁决。
+- **口径**：户数按 **L1-C1** 优先级取首个可用者（直读 → 图标 → 皮线；皮线先去重）；归属用区间法。
+- **空集合不得判 PASS**：有效对象数=0 时只能判 `SKIP` 写明原因，不得判 PASS、不得把空集合合计写 `0`——否则「没取到数」看起来像「数就是 0」。未取到数须交接图标法（`count-box`）。
+- **覆盖三字段+交叉**：逐箱三字段齐全；有真值表必跑 verify 反查；户数以逐层标注图为准（不读平面图）。
 
 ### Step 3: 提交用户校验
 
-- 自检通过后生成总览表（Markdown）提交用户复核；用户用 DWG 原图与脚本输出 JSON 核对
-- 包含：分纤箱总览表（编号/楼号/单元/安装楼层+口径标注）+ 楼层表（每层户数/皮线）+ 待确认项清单
-- **待确认项必须包含**：所有 DXF 无法直接回答、且助手也无法通过已验证方法判定的问题（如竖线法与 V 型计算均失败的双箱覆盖分界、分光方式、户级归属、未标注户数层等），以及自检中发现的所有矛盾
-- **待确认清单统一格式**：见 **L1-C5**（四列）。
-- **「已确认事项」防伪条款**：见 **L0-I3**（必须能引用本会话中用户的原话，否则一律列入待确认）
-- 用户校验过的数据锁定为基准值，后续步骤只能新增不能覆盖；**落盘见 I6「落盘纪律」，「Agent 状态机 · 锁定基准」给出机械形态**
-- 待确认项中的**分光方式**问题，按 [splitter_rules.md](references/splitter_rules.md) 的「DXF直读项 vs 待确认项」规则呈现线索，不得只写结论
+- 自检通过后生成总览表（Markdown）提交用户复核（用户用 DWG 原图与脚本输出 JSON 核对），含：分纤箱总览表（编号/楼号/单元/安装楼层+口径标注）+ 楼层表（每层户数/皮线）+ 待确认项清单。
+- **待确认项必须包含**：所有 DXF 无法直接回答、且助手也无法通过已验证方法判定的问题（如竖线法与 V 型计算均失败的双箱覆盖分界、户级归属、未标注户数层等），以及自检中发现的所有矛盾；**统一按 L1-C5 四列**呈现。
+- **「已确认事项」防伪**：见 **L0-I3**（须能引用本会话用户原话，否则一律列入待确认）。用户校验过的数据锁定为基准值，后续只能新增不能覆盖（落盘见 I6「落盘纪律」，机械形态见「Agent 状态机·锁定基准」）。
 
 ### Step 4: 生成标准地址表（成品）
 
-**前置（三者齐备才允许生成 xlsx）**：Step 2 三条 hard gate 全 PASS、所有待确认项已获用户明确裁决并落盘、基准值已锁定（见「Agent 状态机」）。
+**前置（三者齐备才允许生成 xlsx）**：Step 2 三条 hard gate 全 PASS、所有待确认项已获用户明确裁决并落盘、基准值已锁定（见「Agent 状态机」）；gen 另须 `--inspect` 闭合绑定（rc0＋指纹一致＋重扫无阻塞，缺一即 rc=2）。
 
-- **每户一行**
-- **地址结构**（9级）：前5级用户提供（省/市/区/街道/小区）；后4级助手填写（楼栋/单元/楼层/户）
-- **户号**：按 Step 1c 规则生成，格式以模板为准；此处只核对生成结果与之一致
-- **关联分纤箱编号**：每行标注该户所属分纤箱编号（严格按解析阶段判定的覆盖范围填写）
-- **双箱覆盖**：按解析阶段判定的覆盖范围分配各楼层用户到对应分纤箱（竖线法或 V 型计算结果；若为待确认项则等用户裁决后填写）
-- 输出格式：xlsx，保存到桌面或用户指定位置（覆盖已存在文件时按 **L0-I6「交付纪律」** 先探测占用）
+- **每户一行**；**地址结构**（9级）：前5级用户提供（省/市/区/街道/小区），后4级助手填写（楼栋/单元/楼层/户）。
+- **户号**：按 Step 1c 规则生成，格式以模板为准；此处只核对生成结果与之一致。
+- **关联分纤箱编号**：每行标注该户所属分纤箱编号**＋（安装楼层）**（如 `FX01#（5F）`；覆盖与安装楼层均按解析判定值，细则见 addressbook_template.md）。
+- **双箱覆盖**：按解析阶段判定的覆盖范围分配各楼层用户到对应分纤箱（竖线法或 V 型计算结果；若为待确认项则等用户裁决后填写）。
+- 输出 xlsx 到桌面或用户指定位置（覆盖已存在文件时按 **I6「交付纪律」** 先探测占用）。
 
-**实现方式**：`gen_addressbook.py` —— `--dxf-json` 解析 JSON、`--coverage-json` 裁决后覆盖 JSON、`--template` 仅取表头列结构（**不复制示例数据**）、`--addr` 前5级地址（**留空须显式传空串**，省略会回退读模板第2行示例值，与留空不等价）。生成后**回读校验**（**L1-C6**）。完整参数与可抄示例见 [scripts_reference.md](references/scripts_reference.md)。
+**实现方式**：`gen_addressbook.py` —— `--dxf-json` 解析 JSON、`--coverage-json` 裁决后覆盖 JSON、`--inspect` 闭合 JSON（必传）、`--template` 仅取表头列结构（**不复制示例数据**）、`--addr` 前5级地址（**留空须显式传空串**，省略会回退读模板示例值）。生成后**回读校验**（**L1-C6**）；完整参数与可抄示例见 [scripts_reference.md](references/scripts_reference.md)。
 
-**多楼栋合并**：逐栋解析→`merge_json`合并→gen；全楼合计户数先`split_units`拆分（用户确认规则）。
-
-**九级树**：用`gen_9level`（不用gen_addressbook）；`--header-xlsx`必需（表头取定稿表）；恒等式见L1-C6；单元数>1同配置展开须核对。
+**多楼栋合并**：逐栋解析→`merge_json`合并→gen；全楼合计户数先`split_units`拆分（用户确认规则）。**九级树**：用 `gen_9level`（不用 gen_addressbook）；`--header-xlsx` 必需（表头取定稿表）；恒等式见 **L1-C6**；单元数>1 同配置展开须核对。
 
 ## 参考文件
 
 > **维护原则（唯一权威定义）**：同一条规则**只设一个权威定义**，其他位置**只引用、不复制全文**；两处不一致时**以更新日期较新者为准并向用户回报**。
-> **体量纪律（2026-09-18 收紧；闸门 `ftth.py budget` / `scripts/check_budget.py`）**：本文件是每次会话**首屏全量加载**的唯一文件，工具输出有**通用截断（实测 51,200 B，无开关）**。**预警线 47,000 B（触及即新增默认进 `references/`，本文件只留引用）／硬上限 49,000 B（触及即禁写，先外移再新增）**；**`references/` 单文件同受 47,000 B 约束**。**净增为零**：每加一条须同时外移等量。修订记录 / 案例叙述 / 参数表 / 详细清单写 `SKILL_CHANGELOG.md` 或 `references/`。**阈值依据与拆分层级**见 [pipeline_details.md §15](references/pipeline_details.md)（含「为何不能再往下压」的实测边界）；改前改后各跑 `ftth.py budget`（当前基线见 SKILL_CHANGELOG.md）。
+> **体量纪律（闸门 `ftth.py budget`）**：本文件是每次会话**首屏全量加载**的唯一文件，工具输出有**通用截断（实测 51,200 B，无开关）**。**预警线 47,000 B（触及即新增默认进 `references/`）／硬上限 49,000 B（触及即禁写，先外移再新增）**；**`references/` 单文件同受 47,000 B 约束**。**净增为零**：每加一条须同时外移等量；修订记录 / 案例叙述 / 参数表写 `SKILL_CHANGELOG.md` 或 `references/`。阈值依据与拆分层级见 [pipeline_details.md §15](references/pipeline_details.md)；改前改后各跑 `ftth.py budget`。
 
 | 参考文件 | 内容 |
 |---|---|
-| [measurement_architecture.md](references/measurement_architecture.md) | 架构完整版：方法池详表 / 铁律全文 / 算法细节 / 标准流程详解 / 分带与箱位锚门禁 |
-| [probe_checklist.md](references/probe_checklist.md) | Step 1a 探查清单完整版（全子项与判据） |
-| [scripts_reference.md](references/scripts_reference.md) | 脚本参数表 / 统一入口机制 / 画像信号 / 调用契约细则 / `geom.json` schema / 元素台账字段 |
+| [measurement_architecture.md](references/measurement_architecture.md) | 方法池详表 / 铁律全文 / 算法细节 / 标准流程详解 / 分带与箱位锚门禁 |
+| [probe_checklist.md](references/probe_checklist.md) | Step 1a 探查清单全子项与判据 |
+| [scripts_reference.md](references/scripts_reference.md) | 脚本参数表 / 统一入口 / 画像信号 / 调用契约细则 / `geom.json` schema / 元素台账字段 |
 | [step2_selfcheck.md](references/step2_selfcheck.md) | Step 2 自检完整清单（26 条，含实测案例） |
-| [measurement_methods.md](references/measurement_methods.md) | 信号驱动选法 / 图纸类型参考 / manifest 规范 / handoff 字段级定义 / 总图判据实测背景 |
-| [titleblock_and_intake_table.md](references/titleblock_and_intake_table.md) | 图签形态三来源协议 + 九级地址树出表 |
-| [coverage_rules.md](references/coverage_rules.md) | 覆盖范围判定规则（竖线法 / V型 / 待确认）+ 两条硬约束全文 |
-| [splitter_rules.md](references/splitter_rules.md) | 分光方式线索呈现（DXF 直读项 vs 待确认项） |
+| [measurement_methods.md](references/measurement_methods.md) | 信号驱动选法 / 图纸类型 / manifest 规范 / handoff 字段级定义 / 总图判据背景 |
+| [titleblock_and_intake_table.md](references/titleblock_and_intake_table.md) | 图签三来源协议 + 九级地址树出表 |
+| [coverage_rules.md](references/coverage_rules.md) | 覆盖判定（竖线法 / V型 / 待确认）+ 两条硬约束全文 |
 | [visual_model_lessons.md](references/visual_model_lessons.md) | 降级兜底规范与踩坑教训 |
 | [addressbook_template.md](references/addressbook_template.md) | 模板 24 列对照表 |
-| [pipeline_details.md](references/pipeline_details.md) | 流水线串跑入口 / Step 1b 细则：脚本行为 / 参数细节 / 口径A 与回填实现 / `geom.json` schema 三坑 / 体量阈值依据 |
-| [operations_discipline.md](references/operations_discipline.md) | 会话效率实测 / 断流处置 / 矛盾分级处置 / 三本台账口径 |
-| [dxf_parsing_benchmark.md](references/dxf_parsing_benchmark.md) | GitHub DXF 解析生态对标调研：8 项可借鉴改进候选（待用户裁决、未实施）+ 6 项明确不借鉴 |
+| [pipeline_details.md](references/pipeline_details.md) | 串跑入口 / Step 1b 脚本行为 / 参数细节 / 口径A 与回填实现 / `geom.json` 三坑 / 体量阈值依据 |
+| [operations_discipline.md](references/operations_discipline.md) | 会话效率 / 断流处置 / 矛盾分级 / 三本台账 / **契约落地与当前态**（§九·补）/ **权威矩阵** |
+| [dxf_parsing_benchmark.md](references/dxf_parsing_benchmark.md) | GitHub DXF 生态对标：8 项可借鉴候选（待裁决、未实施）+ 6 项明确不借鉴 |
 
 ## 版本修订记录
-> 本文档不再保留条目正文；**完整修订记录见 [SKILL_CHANGELOG.md](SKILL_CHANGELOG.md)**。
+> 本文档不保留条目正文；**完整修订记录见 [SKILL_CHANGELOG.md](SKILL_CHANGELOG.md)**。

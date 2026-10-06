@@ -61,10 +61,11 @@ FTTH 系统图里每一户的入户端都画一个「家居配线箱」图标（
   （"图标数 / Σ(层×单元)"须与图签读数对照，脚本不自行推断。）
 - **楼层平面图**里的同类图标**不作为户数依据**（平面图一个户型只画一个图标 = 示意
   画法，且其周边没有系统图那种皮线图元）——这类图标在 C 级里被自动分离出来，不混入户数。
-- 遇 `*N` 乘数标注（如 `*16`）**不得自行相乘**：按 SKILL.md 原则二（遇到不认识的
-  标注主动询问用户）列入 `待裁决_乘数标注`，含义与落层口径由用户裁决后再改数。
-- 户数结论须与皮线标注口径（`count_households.py`）或 `X户` 标注**并跑互证**；
-  两者不一致即暂停交用户，不得自动择一。
+- 遇 `*N` 乘号标注（如 `*16` / `x2`）：**乘号后数字即该处户数**（2026-09-27 用户裁决），
+  属「读取标注（直读）」形态、优先级高于本法 —— 正常路径下这类图会走直读、本脚本
+  不会被选中；万一残存，列入 `乘号式户数标注` 仅作**登记**，不作乘数、不参与户数计算。
+- 本法结论**不再与皮线口径（`count_households.py`）或 `X户` 标注并跑互证**
+  （2026-09-27 用户裁决：三口径选定即出数，互不校验 —— 交叉校验纯属耽误时间）。
 
 退出码
 ------
@@ -74,7 +75,11 @@ FTTH 系统图里每一户的入户端都画一个「家居配线箱」图标（
       → 两种情形，脚本会打印诊断区分：
         ① 皮线图层没找对 → 用 `--wire-layer` 显式指定后重跑；
         ② 本图图标不是「每户一个」（如每单元每层一个的示意画法）→ 本法不适用，
-           改走图签 / 楼宇采集表口径。空结果不得当成功消费。
+           按 L1-C1（2026-09-16 裁决）回落皮线（count_households.py）；
+           图签读数（read_titleblock_households.py）仍作为 C10 第二来源交叉核验。
+           空结果不得当成功消费。  # 2026-09-26：处置口径统一到 L1-C1（此前误写改走图签）。
+  3 = L1-C2（2026-09-26）：示意画法自判确认 → 本图未提供「每户一个」图标，
+      该子任务本图不适用，申报制跳过+降级（L1-C1 回落皮线），不是错误、不需重试。
 """
 import argparse
 import json
@@ -91,13 +96,14 @@ from ftth_common import (
     measure_column_step,
     HOME_BOX_STRONG_KEYS, HOME_BOX_WEAK_KEYS,
     kw_split_ascii, kw_hit,
-    protect_out_path, auto_scaled,
+    protect_out_path, auto_scaled, ensure_console_utf8, write_json,
+    HU_MULT_RE,
 )
 
 import ezdxf
 import os
 
-sys.stdout.reconfigure(encoding="utf-8")
+ensure_console_utf8()
 
 # 内置统一楼层解析（与 ftth.py / count_households.py 一致：支持 3F / -1F / B1 / WF）
 FLOOR_RE = re.compile(r"^(B\d+|WF|W\d+F|F\d+|夹层|屋面|屋顶层|-?\d+F)$")
@@ -112,8 +118,11 @@ WEAK_KEYS = HOME_BOX_WEAK_KEYS
 
 DEFAULT_WIRE_KEYS = ("wire", "皮线", "fiber", "光缆", "光纤")
 DEFAULT_WIRE_EXCLUDE = ("cabletray", "cable_tray", "桥架", "槽", "支架")
-# 乘数标注：*16 / * 16 / x16
-MULT_RE = re.compile(r"^[\*xX]\s*(\d{1,3})$")
+# 乘号式户数标注（`*16` / `x2` / `×3`）：**唯一真源在 ftth_common**（与 plan_methods.py
+# 共用同一份正则，不得各留副本）。2026-09-27 用户裁决：**乘号后数字即该处户数**，
+# 属「读取标注（直读）」形态、优先级最高 —— 本脚本只对残存者**登记**，不再按
+# "待裁决乘数"上报（旧口径「不得自行相乘」已废）。
+MULT_RE = HU_MULT_RE
 
 
 def log(*a):
@@ -345,6 +354,8 @@ AUTO_RATIOS = {
 }
 # 图纸量不出层高时的兜底（无楼层刻度列 / 极简图）。仅供无法定标时使用，
 # 且日志会显式标注"未定标"，避免被当成"已按图纸刻度校准"。
+# 退役条件：同 analyze_coverage.py 未定标兜底（两处同源 AUTO_FALLBACK，收口时合并；
+# 分支预算纪律 §十一）。
 AUTO_FALLBACK = {"search_radius": 80.0, "region_pad": 150.0, "col_x_tol": 1.0,
                  "col_gap": 40.0, "square_min": 2.0, "square_max": 60.0,
                  "grid_cell": 40.0, "tol_bucket": 0.5, "tol_scan_max": 200.0,
@@ -394,7 +405,7 @@ def diagnose_no_bond(cands, search_radius):
     但两者就是不相邻时，必须能区分两种根因，否则会误判成"参数没调对"而反复空跑：
       ① 皮线图层没找对（换 --wire-layer 即可解决）；
       ② 本图图标根本不是「每户一个」，而是「每单元每层一个」的示意画法
-         （柳辛庄即此类：图标配 `x2`/`x3` 乘数标注，且图上无皮线图元）。
+         （柳辛庄即此类：图标配 `x2`/`x3` 乘号标注，且图上无皮线图元）。
     """
     kw = [c for c in cands if (c["强命中"] or c["弱命中"] or c["块名命中"])]
     if not kw:
@@ -413,11 +424,76 @@ def diagnose_no_bond(cands, search_radius):
         log("[诊断] → 本图多半**根本没有入户皮线图元**。")
     log("[诊断] 两种可能，必须判清后再决定口径（不得硬凑）：")
     log("        ① 皮线图层没找对 —— 用 --wire-layer 显式指定后重跑；")
-    log("        ② 本图图标是「每单元每层一个」的**示意画法**（常配 `x2`/`x3` 乘数标注")
-    log("           表明该点代表几户）→ 不是「每户一个」，**本法不适用**，应改走图签")
-    log("           （`read_titleblock_households.py`）/楼宇采集表口径，如实申报。")
+    log("        ② 本图图标是「每单元每层一个」的**示意画法**（常配 `x2`/`x3` 乘号标注")
+    log("           表明该点代表几户）→ 不是「每户一个」，**本法不适用**，按 L1-C1")
+    log("           （2026-09-16 裁决）回落皮线（`count_households.py`）；图签读数")
+    log("           （`read_titleblock_households.py`）仍作为 C10 第二来源交叉核验，如实申报。")
+    # 2026-09-26：处置口径统一到 L1-C1（此前误写改走图签）；示意画法判据（Δy≈层高 / 图标数≈Σ层×单元）不动。
     log("           判据：同一 x 列内相邻图标的 Δy 是否恒等于一个层高；")
     log("                 图标总数是否 ≈ Σ(层数×单元数) 而非 Σ(层数×单元数×每层户数)。")
+
+
+
+def schematic_self_judge(cands, col_x_tol, col_gap, step):
+    """示意画法判据①的纯坐标自判（2026-09-26，柳辛庄实测驱动）。
+
+    动机：门禁说「两种可能，必须判清后再决定口径」，但判据①（同一 x 列内
+    相邻图标 Δy 恒等于一个层高）不需要皮线端点、纯图标坐标即可判定 —— 脚本
+    本可自判，不应把判断推给人工。
+    实现：候选图标按 x 聚类成列（与主流程同口径：col_x_tol 聚 x、col_gap 切
+    y 断口 run），每列按 y 排序算相邻 Δy 取众数（复用 dy_mode）；主要列
+    （图标数最多的列）的 Δy 众数 ≈ 层高（±20%）→ 示意画法确认。
+    step = 脚本已量出的图纸尺度锚（层高）；量不出（None）则无法自判。
+    返回 (确认?, 明细dict)；明细含各列 Δy 众数（定案诊断打印用）。
+    产物通道：门禁段无已开的 JSON 输出通道，故只在 stdout 留
+    [DIAG-SCHEMATIC-ICONS] 固定 token 行供流水线识别（两法选简单可靠的）。
+    """
+    pool = [c for c in cands
+            if c.get("在图区") and (c.get("强命中") or c.get("弱命中") or c.get("块名命中"))]
+    pool_why = "关键词命中+图区内"
+    if not pool:
+        pool = [c for c in cands if c.get("在图区")]
+        pool_why = "图区内全部候选（无关键词命中）"
+    if not pool:
+        pool = list(cands)
+        pool_why = "全图全部候选（无图区限定）"
+    groups = []
+    for c in sorted(pool, key=lambda z: (z["x"], z["y"])):
+        if groups and c["x"] - groups[-1]["xs"][-1] <= col_x_tol:
+            groups[-1]["xs"].append(c["x"])
+            groups[-1]["items"].append(c)
+        else:
+            groups.append({"xs": [c["x"]], "items": [c]})
+    cols = []
+    for gp in groups:
+        v = sorted(gp["items"], key=lambda z: z["y"])
+        runs, cur = [], [v[0]]
+        for c in v[1:]:
+            if c["y"] - cur[-1]["y"] <= col_gap:
+                cur.append(c)
+            else:
+                runs.append(cur)
+                cur = [c]
+        runs.append(cur)
+        for run in runs:
+            xs_r = [c["x"] for c in run]
+            mode, share = dy_mode([c["y"] for c in run])
+            cols.append({"列x": sum(xs_r) / len(xs_r), "n": len(run),
+                         "Δy众数": mode, "占比": share})
+    if not cols:
+        return False, {"候选集": pool_why, "候选数": len(pool), "列Δy众数": []}
+    main = max(cols, key=lambda r: r["n"])
+    info = {"候选集": pool_why, "候选数": len(pool),
+            "列Δy众数": [[r["列x"], r["Δy众数"], r["n"], r["占比"]] for r in cols],
+            "主列x": main["列x"], "主列Δy众数": main["Δy众数"], "层高": step}
+    # 主导性守卫：判据①原文是"恒等于" —— 主列须有 ≥2 个间隔且众数过半，
+    # 否则"杂乱"（众数恰落层高、但只占一半）会被误判为示意画法。误判的代价
+    # （走错回落口径）远大于漏判（维持 rc=2 人工判），故从严。
+    gaps = main["n"] - 1
+    ok = bool(step and main["Δy众数"] is not None
+              and gaps >= 2 and main["占比"] > 0.5
+              and abs(main["Δy众数"] - step) <= 0.20 * step)
+    return ok, info
 
 
 # ---------------------------------------------------------------- 主流程
@@ -479,6 +555,7 @@ def side_spectrum(dxs_side, side):
     不判异常）。无主导谱判据：成员<2，或无显著簇（簇=相邻值相对差≤10%的组，
     显著=成员≥2，与 mode_base 同口径），或最大显著簇未过半数——跨刻度列组的
     偏移本就各不相同，无共识谱可比对时强行比对即制造误报。
+    退役条件：全图统一几何配对模型落地后与 mode_base 合并（分支预算纪律 §十一）。
     """
     n = len(dxs_side)
     if n < 2:
@@ -615,7 +692,7 @@ def main():
                        args.insert_blocks.split(",") if args.insert_blocks else None)
     except Exception as e:
         log("[ERROR] 读取 DXF 失败：%s" % e)
-        sys.exit(1)
+        sys.exit(2)  # C2 rc=2：DXF读取失败（输入类，同文件其余输入错一致）
 
     wires, polys, inserts, texts = (data["wires"], data["polys"],
                                     data["inserts"], data["texts"])
@@ -754,6 +831,25 @@ def main():
         log("")
         log("!" * 74)
         log("[门禁] 已中止：无法从图纸自身量测贴合容差（%s）。" % tol_why)
+        # 2026-09-26：示意画法判据①纯坐标自判（不需要皮线端点）。确认则打印定案诊断、
+        # L1-C1 降级路径与 [DIAG-SCHEMATIC-ICONS] token，以 rc=3（L1-C2：本图不适用，
+        # 申报制跳过+降级，不是错误）退出；不确认则维持原 rc=2「两种可能」文案。
+        _sch_ok, _sch_info = schematic_self_judge(
+            cands, args.col_x_tol, args.col_gap, step)
+        if _sch_ok:
+            log("[定案] 候选图标 %d 个（%s），主要列 x=%.1f 列内相邻图标 Δy 众数=%.1f ≈ 层高 %.1f（±20%%内）"
+                % (_sch_info["候选数"], _sch_info["候选集"],
+                   _sch_info["主列x"], _sch_info["主列Δy众数"], step))
+            for _cx, _cm, _cn, _cs in _sch_info["列Δy众数"]:
+                log("[定案]   列 x=%.1f：Δy众数=%s（n=%d，占比%.0f%%）"
+                    % (_cx, ("%.1f" % _cm) if _cm is not None else "—", _cn, _cs * 100))
+            log("[定案] →「每单元每层一个」示意画法（每层 1 个图标），不是「每户一个」，**本法不适用**，如实申报。")
+            log("[定案] 降级路径：按 L1-C1（2026-09-16 裁决）回落皮线（`count_households.py`）；")
+            log("[定案] 图签读数（`read_titleblock_households.py`）仍作为 C10 第二来源交叉核验。")
+            log("[DIAG-SCHEMATIC-ICONS] 示意画法确认：主列Δy众数=%.1f≈层高%.1f（容差±20%%），rc=3 申报制跳过"
+                % (_sch_info["主列Δy众数"], step))
+            log("!" * 74)
+            sys.exit(3)
         diagnose_no_bond(cands, args.search_radius)
         log("[门禁] 处置：用 --tol / --wire-layer 修正后重跑；空结果不得当成功消费。")
         log("!" * 74)
@@ -888,6 +984,7 @@ def main():
            备选有谱支撑时才切换；两者都有谱支撑时保留最近（不动）。
         显式 --col-scale-map 指定的列永不参与自动修正。
         返回 {col_idx: (新sc, 新dx, 说明)}；无修正返回 {}。
+        退役条件：pick_scale 改用 y 分带 + 本栋优先自动判定后删除本函数（分支预算纪律 §十一）。
         """
         fix = {}
         if not scales or not init_pairs:
@@ -1139,7 +1236,7 @@ def main():
             _shared.setdefault(r["刻度列x"], []).append(r["列x"])
     shared_scale = {k: v for k, v in _shared.items() if len(v) > 1}
 
-    # ---- 乘数标注 ----
+    # ---- 乘号式户数标注 ----
     mults = []
     for lay, s, x, y in texts:
         m = MULT_RE.match(s)
@@ -1227,14 +1324,50 @@ def main():
 
     if mults:
         log("")
-        log("⚠ 图上存在 *N 乘数标注 %d 处 —— 按 SKILL.md 原则二**不得自行相乘**，" % len(mults))
-        log("  其含义与落层口径须交用户裁决后再改数：")
+        log("i 图上存在乘号式户数标注 %d 处（`*16`/`x2` 一类）——" % len(mults))
+        log("  乘号后数字即该处户数，属**直读**形态、不由本法消费（这类图应走直读）；仅登记坐标：")
         for m in mults[:20]:
             log("    %-6s (%.1f, %.1f)  图层=%s" % (m["标注"], m["x"], m["y"], m["图层"]))
 
+    # 2026-09-27（八轮迭代，缺陷 E1 · 户数构成）：产物自述「不可信」的列（刻度偏移
+    #   异常列 / 共用刻度列组里的图标列）此前被**整列计入** `归层后总户数`，且不单列 ——
+    #   人工看到的是一个干净总数，看不出里面有多少待核对（实测某图 331 户中 231 户
+    #   落在共用刻度列形态、20 户落在偏移异常列）。「登记了不可信」不等于「拦住了结果」：
+    #   合计字段不给构成，下游就会把待核对户数当已核户数消费。
+    #   处置：**不改任何数值**（剔除属逐对象弃解，会丢解），只把构成显式化 + 日志告警。
+    _untrusted_reason = {}
+    for _o in (scale_outliers or []):
+        _x = _o.get("列x")
+        if _x is not None:
+            _untrusted_reason.setdefault(round(float(_x), 1), []).append("刻度偏移异常")
+    for _sx, _cols in sorted(shared_scale.items()):
+        for _cx in (_cols or []):
+            _untrusted_reason.setdefault(round(float(_cx), 1), []).append("共用刻度列组")
+    _untrusted_cols = []
+    _n_untrusted = 0
+    for _r in (results or []):
+        _cx = _r.get("列x")
+        if _cx is None:
+            continue
+        _reasons = _untrusted_reason.get(round(float(_cx), 1))
+        if not _reasons:
+            continue
+        _n = int(_r.get("图标数") or 0)
+        _n_untrusted += _n
+        _untrusted_cols.append({"列x": round(float(_cx), 1), "图标数": _n,
+                                "刻度列x": _r.get("刻度列x"),
+                                "原因": "、".join(sorted(set(_reasons)))})
+    if _untrusted_cols:
+        log("")
+        log("⚠ 归层后总户数 %d 户中，有 %d 户落在自述不可信的列上" % (total, _n_untrusted))
+        log("  （刻度偏移异常列 / 共用刻度列组）—— 这些列的归层结果须人工核对后才可消费：")
+        for _c in _untrusted_cols[:20]:
+            log("    列x=%.1f  %d 户  原因=%s" % (_c["列x"], _c["图标数"], _c["原因"]))
+        log("  合计字段未剔除这些户（剔除=丢解），但「户数构成」已单列，不得当作已核户数。")
+
     out = {
         "口径": "家居配线箱图标法（贴皮线末端）",
-        "输入": args.dxf,
+        "输入": os.path.basename(args.dxf),
         "参数": {
             "皮线图层": data["wire_layers_used"],
             "图区y": [round(ry0, 2), round(ry1, 2)] if ry0 is not None else None,
@@ -1257,6 +1390,17 @@ def main():
         "候选数": len(cands), "分级统计": {k: lv.get(k, 0) for k in ("A", "B", "C", "-")},
         "贴末端图标数": len(hit),
         "归层后总户数": total,
+        # E1（2026-09-27）：总户数的构成拆分。总户数**不剔除**待核对列（剔除即丢解），
+        #   但必须单列「其中多少户落在自述不可信的列上」，否则下游把待核对当已核消费。
+        "户数构成": {
+            "总户数": total,
+            "待核对户数": _n_untrusted,
+            "可信户数": total - _n_untrusted,
+            "待核对列": _untrusted_cols,
+            "口径说明": ("待核对 = 落在「刻度偏移异常列」或「共用刻度列组」图标列上的户数；"
+                         "这两类列本文件已自述归层不可信/须人工核对。合计含待核对户数，"
+                         "人工核对前**不得当作已核户数**消费。"),
+        },
         "未归属图标数": unassigned,
         # 2026-09-16（P0-1）：刻度列配对偏移异常清单。非空即表示**本列归层不可信**，
         # 须人工核对刻度列归属后重跑（不得当成"已完成的户数"直接消费）。
@@ -1272,13 +1416,14 @@ def main():
                                     "y": round(c["y"] / 500) * 500},
                              "x": c["x"], "y": c["y"], "块名": c["块名"],
                              "文本": c["文本"][:60]} for c in excl],
-        "待裁决_乘数标注": mults,
+        "乘号式户数标注": mults,
         "说明": ("1 个贴皮线末端的家居配线箱图标 = 1 户；判定依据为几何贴合"
                  "（恒定小偏移），不依赖块名，也不要求图上写 HDD 字样。"
-                 "户数须与皮线标注口径或『X户』标注并跑互证；不一致即交用户裁决。"),
+                 "本法**不与皮线口径或『X户』标注并跑互证** —— 户数口径按优先级"
+                 "（直读 → 图标 → 皮线）选定后即出数，互不校验（2026-09-27 用户裁决）。"),
     }
     # ---- 门禁：贴末端图标 > 0 但归层后合计 = 0 ----
-    # 常见成因：本图不是「每户一个箱」，而是「每层一个箱 + xN 乘数标注」形态 ——
+    # 常见成因：本图不是「每户一个箱」，而是「每层一个箱 + xN 乘号标注」形态 ——
     # 图标数 = 层数 × 单元数，本身**不等于户数**，归层必然得 0。
     # 原实现会 rc=0 写出「归层后总户数 = 0」，下游把 0 户当成功结果消费。
     # 判据与既有「空结果不得当成功消费」一致：非空却归层为 0，同样是空结果。
@@ -1288,18 +1433,16 @@ def main():
         log("!" * 74)
         log("[门禁] 已中止：贴皮线末端图标 %d 个，但**归层后户数合计 = 0**。" % len(hit))
         log("[门禁] 原因：%d/%d 列的楼层刻度列未配对。" % (_ns, len(results)))
-        log("[门禁] 常见成因：本图不是「每户一个箱」，而是「每层一个箱 + xN 乘数标注」，")
+        log("[门禁] 常见成因：本图不是「每户一个箱」，而是「每层一个箱 + 乘号式户数标注」，")
         log("[门禁]          图标数 = 层数×单元数，本身不等于户数 —— 本法不适用于该形态。")
         log("[门禁] 处置：① 用 --floor-layer 显式指定楼层标注图层后重跑；")
-        log("[门禁]       ② 确无逐层楼层标注时，改走图签参数法（read_titleblock_households.py）")
-        log("[门禁]          或按乘数标注口径人工裁决后再出表。")
+        log("[门禁]       ② 确无逐层楼层标注时，改走**直读**（`*N`/`xN` 的乘号后数字即该处户数）")
+        log("[门禁]          或图签参数法（read_titleblock_households.py）。")
         log("!" * 74)
         sys.exit(2)
 
     if args.out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
+        write_json(args.out, out)
         log("")
         log("已写出 %s" % args.out)
 

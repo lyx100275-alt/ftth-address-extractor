@@ -13,7 +13,7 @@ AIGC:
 
 > **本文件是什么**：SKILL.md 「Step 1b: 结构化解析」的**细则层** —— 脚本行为、参数细节、实现背景与实测案例。SKILL.md 只保留**协议与硬约束**（要点式）。
 > **为什么拆**（2026-09-18）：SKILL.md 触体量硬上限（实测 55,391 B > 49,000 B 硬上限、> 51,200 B 宿主截断线）。按「净增为零原则」外移；且这些内容本质属**细则**而非**协议**，SKILL.md 自身定位即"只承载协议 / 状态机 / 硬约束 / 名目清单"。
-> **链接写法**：本文件内引用按**技能根目录视角**书写（与 `references/` 现有约定一致）：`references/xxx.md` 指技能根下 `references/` 目录。
+> **链接写法**：Markdown 链接按**所在文件目录**解析 —— 本文件在技能根，故外链写 `references/xxx.md`；`references/` 内的文件**互相引用写裸文件名**（如 `coverage_rules.md`）；行内代码提及仍按技能根视角写，便于全仓检索。
 > **体量**：单文件同受 47,000 B 约束。
 >
 > 相关：`references/scripts_reference.md`（脚本参数表 / 统一入口机制 / `geom.json` schema）、`references/coverage_rules.md`（两条硬约束全文）、`references/measurement_methods.md`（算法与判据）。
@@ -24,7 +24,7 @@ AIGC:
 
 调度 `pipeline` / `probe` / `plan` / `parse` / `coverage` / `coverage-vshape` / `inspect` / `assemble` / `apply-ruling` / `count` / `count-box` / `gen` 等子命令；**`ftth.py pipeline` 一条命令串跑 `geom → probe → plan → titleblock → fxmap → fx_locations → unit_gaps → parse → coverage → count_box → inspect`（只解析、不出表，实测 38.7s → 18.4s）**；参数三级优先：命令行显式 > `--config` > 脚本默认值。
 
-子命令清单、依赖矩阵、可抄示例、`--config` 机制、批量编排 `ftth_batch.py` 见 `references/scripts_reference.md`。**口径**：`count` = 皮线计数法；`count-box` = 家居配线箱图标法（旧名 `count-hdd`），两者同属区间法口径；`extract_fx_map.py` / `read_titleblock_households.py` / `gen_9level_addressbook.py` 为直调脚本。
+子命令清单、依赖矩阵、可抄示例、`--config` 机制见 `references/scripts_reference.md`；批量编排 `ftth_batch.py` 见本文件 §19。**口径**：`count` = 皮线计数法；`count-box` = 家居配线箱图标法（旧名 `count-hdd`），两者同属区间法口径；`extract_fx_map.py` / `read_titleblock_households.py` / `gen_9level_addressbook.py` 为直调脚本。
 
 ## 2. 必传参数与三个高频坑
 
@@ -32,13 +32,24 @@ AIGC:
 
 ## 3. 正则传参为什么一律写 `[0-9]`
 
-Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测 `--fx-pattern "FX\d+#?"` **零命中且脚本仍 rc=0**，调用方误判为"图上没有箱"。故凡传正则类参数（`--fx-pattern` / `--title-pattern` / `--hu-pattern` / `--bldg-pattern` …）**一律写字符类**：`FX[0-9]+#?`、`([0-9]+)#楼`。
+Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测 `--fx-pattern "FX\d+#?"` **零命中且脚本仍 rc=0**，调用方误判为"图上没有箱"。故凡传正则类参数（`--fx-pattern` / `--title-pattern` / `--hu-pattern` / `--bldg-pattern` / `--cable-pattern` / `--unit-pattern` …）**一律写字符类**：`\d`→`[0-9]`、`\s`→`[ ]`，如 `FX[0-9]+#?`、`([0-9]+)#楼`。probe 建议的 `cable_pattern` 里 `\d`/`\s` 常同时出现，照抄建议值即零命中且 rc=0 静默（2026-10-02 凤鸣朝阳实测：建议值含 4 处 `\d`、4 处 `\s`，全部安全化后 148 条米数全命中）。
 
 **判据**：命中数为 0 时先怀疑正则被吃，**不得据零命中改判图纸无此元素**（零命中 ≠ 无元素，与「空结果不得当成功消费」同则）。
 
 ## 4. 人工裁决批量改数 `apply-ruling`
 
-裁决结论用 `ftth.py apply-ruling --json <assembly.json> --ruling <裁决清单.json>` 一次落数，**禁止为每条裁决现写临时脚本手改 JSON**。只做机械落数：缺字段不改、找不到目标硬失败并列出候选键；**裁决值含乘号一律拒绝**（`4*16` 须人工展开成 `64` —— 乘数是裁决项，脚本不做乘法）。
+裁决结论用 `ftth.py apply-ruling --json <assembly.json> --ruling <裁决清单.json>` 一次落数，**禁止为每条裁决现写临时脚本手改 JSON**。只做机械落数：缺字段不改、找不到目标硬失败并列出候选键；**裁决值须为绝对户数、含乘号一律拒绝**（`4*16` 须人工展开成 `64`）—— 乘号式 `*N`/`xN` 标注属**直读**形态、读数在解析阶段取出、不经裁决，脚本不做乘法。
+
+**两种产物、两条通路**：出表输入 JSON（`--json assembly.json`）支持 `户数 / 安装楼层 / 覆盖范围 / 删除楼层 / 删除单元`；coverage 产物（`--json coverage.json`，含顶层「需人工裁决」）支持 `解除待裁决`。
+
+**`解除待裁决`（2026-09-27 补）**：把已落盘的人工裁决**机械回灌**到 coverage 产物，消除恒消不掉的 `pending`（契约见 [operations_discipline.md](operations_discipline.md) §七.1/§七.5）。对象串须与清单里的**逐段一致**（楼栋/单元/箱，复用以 `parse_ruling_scope` 为唯一实现的分段口径，不做子串匹配）；`裁决人` 必填；命中项的 `阻塞` 置 `false` 并留痕，命中对象的箱 `result_confirmation` 置 `settled`（`result_origin` 不动）；**不删条目、不改「事项」文字**。示例：
+
+```json
+{"裁决": [{"类型": "解除待裁决", "对象": "4#配套楼/FX22#", "裁决原文": "-1f",
+          "裁决人": "用户", "适用范围": "4#配套楼/FX22# 安装楼层"}]}
+```
+
+**裁决回灌后必须重组（2026-10-02 云峰实测）**：`解除待裁决` 产出新 coverage 产物（如 `coverage_ruled.json`）后，**此前用旧 coverage 组装的 assembly 一律作废重跑** —— assemble 的 provenance 记录的是旧 coverage 指纹，gen 出口门禁按 provenance 链比对（`--dxf-json` 须为 inspect 所核 parse 本身、或源自 inspect 所核 coverage 的组装产物），旧组装产物判「非源自被检查 coverage 的组装产物」**禁出表**。正确顺序：`coverage → apply-ruling(解除待裁决) → coverage_ruled → inspect(用 coverage_ruled 重跑) → assemble(--coverage coverage_ruled) → apply-ruling(户数类) → gen(--parse 组装产物 --coverage coverage_ruled)`。inspect 也须用裁决后 coverage 重跑，C9 才能见到 settled（实测：回灌后未重组直接 gen，出口门禁指纹不一致 rc=2；按上述顺序重走后 rc=0）。
 
 ## 5. 中间产物写保护
 
@@ -82,9 +93,12 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 
 **故**：对照表有**唯一**映射且带非空安装楼层时，`安装楼层` 取对照表值，口径标 `口径A:图上直写（总图对照表）`、来源标 `fxmap对照表`；区间法原值原样降级保留在 `区间法参考值` / `区间法参考误差` 两个字段供审计（证据不丢）。两条判据不同时成立则一切照旧 —— 不猜、不放宽。
 
-**安装楼层口径因此共 3 个取值**：`口径A:图上直写`（本楼系统图内直写）、`口径A:图上直写（总图对照表）`（对照表直写、跨图区）、`口径B:区间法`（本楼系统图楼层带区间法）—— 输出中必须原样标注用的是哪一个。
+**安装楼层口径因此共 5 个取值**：`口径A:图上直写`（本楼系统图内直写）、`口径A:图上直写（总图对照表）`（对照表直写、跨图区）、`口径B:区间法`（本楼系统图楼层带区间法）、`口径A′`、`口径B′`（后两者见下条双源标签区分）—— 输出中必须原样标注用的是哪一个。
 
 **双源标签区分（一百零二）**：`BDG_MAP` 有两个填充源 —— ① `--bldg-map` 文件（extract_fx_map.py 产物，总图对照表，仅 present 时）；② 图上箱位直写证据（build_fx_direct_evidence，直写自证，absent 时补①未覆盖的编号）。逐箱标签**按实际填充源区分**：① 走现标签（`fxmap对照表` / `E-DXF-TEXT:总图对照表…`）；② 标 `箱位直写标注（fx_locations）` / `E-DXF-TEXT:图上箱位直写标注（N号楼M单元K层，…）`、口径 `口径A′:图上箱位直写标注（…）`。B′ 级（只到单元、安装层走区间法）落在区间分支时，依据来源标直写、不标对照表。数值语义（安装楼层值/误差/result 字段）不受影响，只修标签。
+
+
+**待确认口径（2026-09-27二轮，与SKILL L1-C5对齐）**：对照表**唯一映射+非空安装楼层**的直写值走②类有客观判据自判（区间法原值降级留痕+C3双源交叉作第二来源），不另列待确认项；**非唯一映射/空值/重号**情形双方数值须一并列入待确认项交用户裁决。
 
 **注意**：对照表值本质仍是「图上标注直读」来源；absent 时无对照表口径，但图上箱位直写证据（A′/B′，见 operations_discipline.md §五·补分档）仍可产出 settled 安装楼层 —— 标签须如上指向直写源，不得指向不存在的 fxmap.json。
 
@@ -159,7 +173,7 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 并由 `inspect` 阶段作为 **C10** 的输入透传（`--titleblock`）。
 
 **为什么要有它**：画像早已把该信号判为 present 并写明「构成三来源协议的第二来源」，
-但 `pipeline` 的阶段列表里没有它、C1~C9 也没有对应检查 —— **规则写在文档里、没有代码执行它**。
+但 `pipeline` 的阶段列表里没有它、当时的 C1~C9 也没有对应检查 —— **规则写在文档里、没有代码执行它**。
 实测某图 7 栋的图签读数与系统图逐栋一致，可这条独立来源验证**从未发生过**。
 
 **行为约定**
@@ -234,8 +248,60 @@ ftth.py pipeline --dxf "<图.dxf>" --outdir "<产物目录>" --project-dir "<项
   申报制）不中止，记为该阶段「不适用」。
 - **覆盖方法由画像决定** —— 读 `handoff.②系统图选法.覆盖范围.脚本` 映射为 `coverage-vshape` / `coverage`，
   **不在此处二次推断**；画像申报 `absent` 时该阶段合法缺席（rc=3）。
+- **rc=3 不豁免出表前置（2026-09-27 P1-2）** —— `rc=3`＝「本图不提供该子任务数据」，只允许**结束解析**，
+  **不等于该字段可以跳过**。覆盖范围属标准地址表重要字段：`rc=3` → 覆盖零产出 → `inspect` **C6 FAIL**；
+  即便有产物而 `判定依据=待确认` 也是 `pending` → **C9 FAIL**。两条都须走 L0-I4 / L1-C5 人工裁决并落盘，
+  才允许 Step 4 出表（原文见 [coverage_rules.md §待确认](coverage_rules.md)）。
+- **能力表门禁（2026-09-27 P0-1）** —— `plan` 之后立即核对「画像申报脚本 ∈ 本入口能力表
+  （`ftth.py _PIPE_CAPABILITY`）」，不一致即 **rc=2 停下报人**；此前「映射不到」被当「本图不适用」
+  静默跳过，最优证据反而把结果拦死（实测覆盖主线 `parse_dxf_structured.py` 无产出口）。
 - 耗时台账落 `<outdir>/pipeline_timing.json`（逐阶段 rc ＋ 秒数）—— **排障与优化都以它为准，不凭印象**。
 - **各阶段参数自洽**：`probe` 产物 `config.json` 同时作为 `--probe` 与 `--config` 传给 `plan`，
   再传给 `parse` / `coverage*`，与手工逐条调用等价；**校验口径不因走流水线而放宽**。
+
+## 19. 批量编排 `ftth_batch.py`（外移自 `scripts_reference.md`，2026-09-26）
+
+> 外移原因：`scripts_reference.md` 达 46,982 B、距预警线仅剩 18 B（`ftth.py budget` 实测）。
+> 本节原文逐字搬入（2026-09-17 立）；子命令清单/依赖矩阵/可抄示例仍在 `scripts_reference.md`。
+
+多张 DXF 时**不要逐图手敲、更不要自造批量脚本**：一个入口跑完
+「逐图 probe → parse → coverage → merge_json 合并 → batch_overview 总览」。
+
+### 快路径（所有图共用参数）
+
+```powershell
+python "$SK\scripts\ftth_launcher.py" ftth_batch.py --dxf 图A.dxf --dxf 图B.dxf --out-dir batch_out `
+    --title-pattern "(\d+)#.*?系统图" --text-layer 文字
+```
+
+### 清单模式（每图独立参数）—— `--plan batch.json`
+
+```json
+{
+  "out_dir": "batch_out",
+  "common": {"--title-pattern": "..."},
+  "items": [
+    {"dxf": "C:/.../图A.dxf", "name": "图A",
+     "common": {"--text-layer": "文字"},
+     "parse": {"--hu-pattern": "(\\d+)户"},
+     "coverage": {"--wire-layer": "WIRE"},
+     "skip_coverage": false}
+  ]
+}
+```
+
+### 契约
+
+| 项 | 约定 |
+|---|---|
+| 解释器 | 子进程 = **当前解释器**（启动器确认过带 ezdxf 的那个）；`--python` 可显式锁定；全程不裸调 `python` |
+| 参数路由 | 先跑 `ftth.py <子命令> --help` 建各步骤参数表，透传参数**只转发给接受它的步骤**（如 `--vert-dx` 只进 coverage）；**无人接受 ⇒ 开工前 rc=2 报错**，防整轮子调用作废 |
+| 禁传 | `--out`/`--out-dir` 由编排统一管理，透传即报错；`--plan` 与 `--dxf` 互斥 |
+| --config 串联 | probe 成功的图，其输出自动作为该图 parse/coverage 的 `--config`（透传显式给了 --config 则不覆盖） |
+| 容错 | 单图/单步失败**不中断**批次；`--skip-existing` 断点续跑（输出已存在且可解析即跳过）；`--timeout-sec` 单步超时（默认 3600） |
+| 产物 | `<out_dir>/<图名>/<图名>_<step>.json`；`batch_overview.md`（人读总表）+ `batch_overview.json`（机读明细：命令行、rc、耗时、失败尾迹）；parse 有成功时自动 merge 为 `<批次名>_合并.json`（`--no-merge` 关闭） |
+| 退出码 | 0=全部成功；1=部分失败；2=全部失败或前置错误（参数/清单/DXF 不存在）；`--dry-run` 只打印将执行的命令并写计划总览 |
+| 重名 | 图名重复自动加序号（`图A`、`图A_2`） |
+| 前缀匹配 | 本入口 argparse 已禁前缀缩写（`allow_abbrev=False`）：`--out` 不会被吞成 `--out-dir`，未知参数一律落入透传被拦截 |
 
 > AI生成

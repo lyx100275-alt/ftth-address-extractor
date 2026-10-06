@@ -23,12 +23,15 @@ import re
 import sys
 from collections import Counter, defaultdict
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 from ftth_common import (
     setup_logger, load_dxf, collect_texts, cluster_by_x, assign_floor_by_interval,
-    clean_text, is_floor_text, require_params,
+    clean_text, is_floor_text, require_params, ensure_console_utf8, write_json,
 )
+from evidence_builder import (  # V3 Evidence 层：对照表条目统一楼层对象（只构造、不定案）
+    SOURCE_DIRECT, SOURCE_DERIVED, SOURCE_UNRESOLVED,
+    CTX_TOTAL_MAP, CTX_UNKNOWN, make_evidence_id, unified_installation_floor)
+
+ensure_console_utf8()
 
 log = setup_logger("extract_fx_map")
 
@@ -108,6 +111,8 @@ DESC_FLOOR_RE = re.compile(r"(\d+)\s*层")
 #   + 尾部多了「M单元K层」，22 条对照表**一条都挂不上**，箱归属整段静默为空）。
 #   故此处把描述拆成规范字段，「原始描述」另存留证，不丢原文。
 #   写法容错：`号楼` 与 `#楼` 两种楼号写法都收；单元号可缺省（单单元楼栋）。
+#   本正则刻意窄于 ftth_common.DESC_POS_RE（不收配套/商业/附属：对照表描述列无此类写法，
+#   放宽只会引入误匹配；需宽口径时改调 common 版）。
 DESC_POS_RE = re.compile(r"(\d+)\s*(?:号楼|#\s*楼)\s*(?:(\d+)\s*单元)?\s*(\d+)\s*层")
 LAYERS = [x.strip() for x in (args.text_layer or "").split(",") if x.strip()]
 TYPES = [x.strip().upper() for x in args.text_type.split(",") if x.strip()]
@@ -329,11 +334,36 @@ for fx in fx_items:
         entry["安装楼层"] = "%dF" % _desc_floor
         entry["安装楼层口径"] = "口径A′:箱表描述内直写（『N号楼M单元K层』的 K 层）"
     elif best_floor:
-        entry["安装楼层"] = best_floor
         if best_floor_dist <= 5.0:
+            # 紧贴同行（|dy|≤5.0）= 编号与楼层标注并排直写 → 口径A 直读。
+            entry["安装楼层"] = best_floor
             entry["安装楼层口径"] = "口径A:图上直写"
         else:
-            entry["安装楼层口径"] = "口径B:y坐标关联"
+            # 2026-10-06（一百六十）：y 最近邻关联退役（用户裁决 2026-09-18：
+            # "编号 y 坐标关联推算"不在四种测量方法内）。best_floor 是 y 最近
+            # 的楼层标注，>5.0 说明编号与该标注非紧贴同行 —— 取它当安装楼层
+            # 属"y 最近邻推算"，禁止作为结果来源。安装楼层保持 None，下游
+            # parse 回填分支（要求"安装楼层"非空）自然不采信 → 四法外推算
+            # 无法经对照表通路进成品。证据留痕交人 / 交四法（区间法/V型/
+            # 竖线/直读）。注：空间归属（楼栋/单元）不受影响，仍按 (x,y)
+            # 几何分区定（见 SKILL.md 铁律⑩）。
+            entry["安装楼层"] = None
+            entry["安装楼层口径"] = "未定：y最近邻不作来源（2026-09-18裁决）"
+            entry["最近楼层标注_留证"] = best_floor
+            entry["最近楼层距离_留证"] = round(best_floor_dist, 2)
+    # 2026-09-30（一百三十，V3 Evidence）：对照表条目统一楼层对象（只加不改）。
+    #   对照表坐标系恒为总图（total_map）；口径A=直写，无值=unresolved
+    #   （>5.0 的 y 最近邻自一百六十起不再赋值，退役为 None/unresolved）。
+    _fx_cal = str(entry.get("安装楼层口径") or "")
+    if entry.get("安装楼层") is None:
+        _fx_src, _fx_ctx = SOURCE_UNRESOLVED, CTX_UNKNOWN
+    elif _fx_cal.startswith("口径A"):
+        _fx_src, _fx_ctx = SOURCE_DIRECT, CTX_TOTAL_MAP
+    else:
+        _fx_src, _fx_ctx = SOURCE_DERIVED, CTX_TOTAL_MAP
+    entry["安装楼层统一"] = unified_installation_floor(
+        entry.get("安装楼层"), _fx_src, _fx_ctx,
+        make_evidence_id(_fx_ctx, fx_id), note=_fx_cal)
 
     entry["原始编号"] = fx_id
     _by_id[fx_id].append(entry)
@@ -437,10 +467,8 @@ if _dup_ids:
                 + (" 等" if len(_dup_ids) > 8 else "")))
 
 try:
-    os.makedirs(os.path.dirname(os.path.abspath(OUT)) or ".", exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        write_json(OUT, result, log=log)
 except IOError as e:
     log.error(f"无法写入输出文件: {OUT}\n{e}")
-    sys.exit(1)
+    sys.exit(4)  # C2 rc=4：写盘失败
 log.info(f"\n已保存: {OUT}")

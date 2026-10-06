@@ -3,6 +3,10 @@
 """
 FTTH 户数统计脚本（通用版）
 统计 DXF 中"1芯皮线光纤"类文字标注的数量，按 1条皮线=1户 的规则估算每层户数。
+# 2026-09-26：文字若自带根数声明（如 `3Px2芯x40m`，命名组 count_px/count_m，
+#   与 parse_dxf_structured.CABLE_FORM_RES 组名约定一致），按声明根数展开
+#   （n Px = n 户，实测柳辛庄 band9-1块地 54 条 `3Px2芯x40m` 少计 2/3 的教训）；
+#   无 count 组或 n≤1 时维持 1 户/条。展开逐条留痕，适用性需用户确认。
 
 背景：部分图纸不写"X户"，而是用"1芯皮线光纤"逐条标注每户的入户皮线。
 此时每层户数 = 归属该层的皮线文字条数。此规则需用户确认适用性。
@@ -26,7 +30,9 @@ FTTH 户数统计脚本（通用版）
     --x-y-gap         同层两户皮线的y间距参考（缺省=按 0.2 倍层高自适应；仅参考不参与判定）
 
 说明：
-- 输出为"线索"：皮线归属楼层采用 y 坐标关联（口径B），需用户对照图纸原图复核，不作为结论。
+- 输出为"线索"（LEGACY 独立脚本，不进 pipeline）：皮线归属楼层采用区间法
+  （皮线点落在楼层线切成的带内即归属该层），需用户对照图纸原图复核，不作为结论。
+  注：安装/覆盖楼层只由四法产出，y 最近邻关联不作为来源（2026-09-18 裁决）。
 - 每条皮线归属到"所在楼层区间带"对应的楼层——按 y 坐标排序楼层线，
   相邻两条楼层线之间的区域即为该层的归属区间（区间法，详见 measurement_methods.md §3.5）。
   落在最低楼层线以下的皮线不归属任何楼层，标为"未归属"。
@@ -40,8 +46,6 @@ import re
 import sys
 from collections import Counter, defaultdict
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 from ftth_common import (
     DEFAULT_MATCH_TOL, DEFAULT_X_CLUSTER, DEFAULT_X_Y_GAP,
     setup_logger, bldg_num, floor_num_or_zero,
@@ -50,8 +54,10 @@ from ftth_common import (
     assign_floor_by_interval, parse_floor_label,
     clean_text, is_floor_text, require_params,
     floor_step_from_texts, set_expand_bldg_ranges, validate_scale_anchor,
-    floor_mark_conflicts,
+    floor_mark_conflicts, ensure_console_utf8, write_json,
 )
+
+ensure_console_utf8()
 
 log = setup_logger("count_households")
 
@@ -111,17 +117,41 @@ FIBER_RE = re.compile(args.fiber_pattern) if args.fiber_pattern else None
 SPECIAL_RE = re.compile(args.special_pattern) if args.special_pattern else None
 
 
+def _fiber_units(text):
+    """单条皮线文字折算户数（2026-09-26：按标注声明的根数展开，实测 `3Px2芯x40m` 按1户计少 2/3）。
+
+    --fiber-pattern fullmatch 命中后，检查以 `count` 开头的命名组（count_px /
+    count_m，与 parse_dxf_structured.CABLE_FORM_RES 的组名约定一致）：取到整数
+    n>1 时该文字按 n 户计；无该组或 n≤1 时维持 1 户/条。不改正则与归属逻辑。
+    """
+    try:
+        m = FIBER_RE.fullmatch(clean_text(text))
+    except Exception:
+        return 1
+    if not m:
+        return 1
+    try:
+        gd = m.groupdict()
+    except Exception:
+        return 1
+    best = 1
+    for k, v in gd.items():
+        if not k.startswith("count") or v is None:
+            continue
+        try:
+            n = int(float(str(v).strip()))
+        except (ValueError, TypeError):
+            continue
+        if n > best:
+            best = n
+    return best if best > 1 else 1
+
+
 def _clean(s):
     """统一文字清洗（走 ftth_common.clean_text）。"""
     return clean_text(s)
 
 
-def _is_floor_text(s):
-    """楼层标注判定：统一走 ftth_common.is_floor_text（支持 3F / 17F / -1F / B1 / B2 / WF）。
-
-    显式传了 --floor-pattern 时额外兼容该正则。
-    """
-    return is_floor_text(s, FLOOR_RE)
 
 doc, msp = load_dxf(DXF_PATH, log)
 
@@ -137,7 +167,7 @@ if args.probe:
     log.info("\n== 楼层标注（--floor-pattern 匹配）样例 ==")
     shown = 0
     for t in texts:
-        if _is_floor_text(t["内容"]):
+        if is_floor_text(t["内容"], FLOOR_RE):
             tag = "【特殊楼层】" if SPECIAL_RE.match(_clean(t["内容"])) else ""
             log.info(f"  {t['内容']!r} @ ({t['x']:.1f},{t['y']:.1f}) {tag}")
             shown += 1
@@ -169,7 +199,7 @@ if not bldg_anchors:
 _TOL_RATIOS = {"match_tol": 1.0, "x_cluster": 2.0 / 3.0, "x_y_gap": 0.2}
 _TOL_FALLBACK = {"match_tol": DEFAULT_MATCH_TOL, "x_cluster": DEFAULT_X_CLUSTER,
                  "x_y_gap": DEFAULT_X_Y_GAP}
-_step, _basis = floor_step_from_texts(texts, _is_floor_text)
+_step, _basis = floor_step_from_texts(texts, lambda t: is_floor_text(t, FLOOR_RE))
 # 2026-09-16（P0-2）：尺度锚**可信性**校验 —— "量出 step" 不等于 "量对 step"。
 #   实测某图楼层标注被污染后量出 step=1.6（还不到一个字高），
 #   随后全部皮线判"未归属"，脚本仍 rc=0 照写 JSON。故此处先校验再用。
@@ -217,8 +247,8 @@ for t in texts:
 result = {
     "DXF文件": os.path.basename(DXF_PATH),
     "DXF版本": doc.dxfversion,
-    "说明": "户数=皮线条数（1条1芯皮线光纤=1户），需用户确认规则适用；皮线归属为口径B(y坐标关联)，需对照图纸原图复核；"
-            "户数以系统图为准（2026-09-13 裁定：不再读取楼层平面图）",
+    "说明": "户数=皮线条数（1条1芯皮线光纤=1户），需用户确认规则适用；皮线归属采用区间法（落楼层带判定，非 y 最近邻推算），需对照图纸原图复核；"
+            "户数以系统图为准（2026-09-13 裁定：不再读取楼层平面图）；本脚本为 LEGACY 线索输出、不作为结论、不进 pipeline",
     "参数": {
         "text_layer": LAYERS,
         "text_type": TYPES,
@@ -243,7 +273,7 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
     _floor_raw = []
     for t in bldg_txt:
         txt = clean_text(t["内容"])
-        if _is_floor_text(txt):
+        if is_floor_text(txt, FLOOR_RE):
             if SPECIAL_RE is not None and SPECIAL_RE.match(txt):
                 special_floors[txt] = t["y"]
             else:
@@ -279,33 +309,54 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
     floor_items = [(fl, fy) for fl, fy in floor_marks.items()]
 
     # 每层皮线条数
-    floor_hu = {}   # 楼层名 -> 皮线条数
-    match_details = []   # 每条皮线的归属记录
+    floor_hu = {}   # 楼层名 -> 折算后户数（2026-09-26：已按标注根数展开；文字条数见 floor_txt_n）
+    floor_txt_n = {}  # 楼层名 -> 皮线文字条数（展开前）
+    match_details = []   # 每条皮线的归属记录（含“户数”=该条折算户数）
+    _expanded = []    # 被展开的文字留痕（内容、根数、坐标、归属楼层）
     unmatched = []
     if floor_marks:
         # 区间法：统一调用 ftth_common.assign_floor_by_interval
         for t in sorted(fibers, key=lambda t: t["y"]):
             y = t["y"]
+            _n = _fiber_units(t["内容"])
             fl_name, dist = assign_floor_by_interval(y, floor_items, tol=args.match_tol)
             if fl_name is None:
-                unmatched.append({"y": y, "x": t["x"], "最近楼层": None, "距离": dist})
+                unmatched.append({"y": y, "x": t["x"], "最近楼层": None, "距离": dist,
+                                  "内容": clean_text(t["内容"]), "户数": _n})
+                if _n > 1:
+                    _expanded.append({"内容": clean_text(t["内容"]), "根数": _n,
+                                      "x": t["x"], "y": y, "归属楼层": None})
+                    log.info("  展开 x%d：%r @ (%.1f,%.1f) → 未归属（折 %d 户）",
+                             _n, clean_text(t["内容"]), t["x"], y, _n)
                 continue
-            floor_hu[fl_name] = floor_hu.get(fl_name, 0) + 1
-            match_details.append({"y": y, "x": t["x"], "归属": fl_name, "距离": dist})
+            floor_hu[fl_name] = floor_hu.get(fl_name, 0) + _n
+            floor_txt_n[fl_name] = floor_txt_n.get(fl_name, 0) + 1
+            match_details.append({"y": y, "x": t["x"], "归属": fl_name, "距离": dist,
+                                  "内容": clean_text(t["内容"]), "户数": _n})
+            if _n > 1:
+                _expanded.append({"内容": clean_text(t["内容"]), "根数": _n,
+                                  "x": t["x"], "y": y, "归属楼层": fl_name})
+                log.info("  展开 x%d：%r @ (%.1f,%.1f) → %s（折 %d 户）",
+                         _n, clean_text(t["内容"]), t["x"], y, fl_name, _n)
 
-    # 列统计
+    # 列统计（2026-09-26：列内同时报告文字条数与折算后户数；“条数”口径不动）
     col_stats = []
     for c in columns:
         ys = sorted(m["y"] for m in c["members"])
+        _col_units = sum(_fiber_units(m.get("内容", "")) for m in c["members"])
         col_stats.append({
             "x": round(c["x"], 1),
             "条数": len(c["members"]),
+            "折算户数": _col_units,
             "y_min": ys[0],
             "y_max": ys[-1],
         })
 
     _srt = lambda kv: floor_num_or_zero(kv[0], args.floor_pattern, use_fullmatch=True)
 
+    # 本栋折算后户数（=全部皮线文字按根数展开后的户数；无展开时等于文字条数）
+    _bldg_units = sum(_fiber_units(t.get("内容", "")) for t in fibers)
+    _bldg_asg_units = sum(floor_hu.values()) if floor_hu else 0
     result["楼栋"][bldg] = {
         "标题": bldg_anchors[bldg]["内容"],
         "楼层标注": {k: v for k, v in sorted(floor_marks.items(), key=_srt)},
@@ -316,16 +367,23 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
         # 本栋识别到的皮线总数（=该栋全部皮线字条数）。守门用，
         # 与「各线归属明细+未归属」之和不必然相等——无楼层标注时归属循环不执行。
         "皮线条数": len(fibers),
+        # 2026-09-26：已按标注声明的根数展开（n Px = n 户），适用性需用户确认。
+        "折算后户数": _bldg_units,
+        "已归属折算户数": _bldg_asg_units,
+        "每层文字条数": dict(sorted(floor_txt_n.items(), key=_srt)),
+        "根数展开明细": _expanded,
         # 同坐标重复绘制被去重掉的条数（"皮线条数"已是去重后的真实条数）
         "重复绘制条数": _dup_n,
         "每层户数线索": dict(sorted(floor_hu.items(), key=_srt)),
         "各线归属明细": match_details,
         "未归属皮线": unmatched,
     }
-    # 控制台摘要
+    # 控制台摘要（2026-09-26：同时报告文字条数与折算后户数）
     log.info(f"\n===== {bldg} =====")
-    log.info("  皮线列: " + str([f"x={c['x']} 条数={c['条数']}" for c in col_stats]))
+    log.info("  皮线列: " + str([f"x={c['x']} 条数={c['条数']} 折算户数={c['折算户数']}" for c in col_stats]))
     log.info(f"  每层户数线索: {floor_hu}")
+    log.info(f"  文字条数 {len(fibers)} 条 / 折算后户数 {_bldg_units} 户"
+             + (f"（含 {len(_expanded)} 条根数展开）" if _expanded else ""))
     if unmatched:
         log.info(f"  未归属: {len(unmatched)}条")
     if _dup_n:
@@ -347,6 +405,13 @@ _tot_fiber = sum(v.get("皮线条数", 0) for v in result["楼栋"].values())
 _tot_un = sum(len(v["未归属皮线"]) for v in result["楼栋"].values())
 _tot_asg = sum(len(v["各线归属明细"]) for v in result["楼栋"].values())
 _tot_dup = sum(v.get("重复绘制条数", 0) for v in result["楼栋"].values())
+# 2026-09-26：根数展开汇总（守门口径不动，仍按文字条数守门；折算后户数仅报告）。
+_tot_units = sum(v.get("折算后户数", v.get("皮线条数", 0)) for v in result["楼栋"].values())
+_tot_expanded = sum(len(v.get("根数展开明细", [])) for v in result["楼栋"].values())
+if _tot_expanded:
+    result["说明"] += ("；已按标注声明的根数展开（n Px = n 户），适用性需用户确认"
+                       "（文字 %d 条 / 折算 %d 户，%d 条被展开）"
+                       % (_tot_fiber, _tot_units, _tot_expanded))
 _no_floor = [b for b, v in result["楼栋"].items()
              if v.get("皮线条数") and not v["楼层标注"]]
 _gate = []
@@ -372,6 +437,8 @@ elif _tot_fiber and args.max_unmatched_ratio:
 
 result["自检"] = {
     "皮线总条数": _tot_fiber,
+    "折算后户数": _tot_units,
+    "根数展开条数": _tot_expanded,
     "重复绘制条数": _tot_dup,
     # 楼层标注自洽性冲突（同名多址 / 次序倒挂）——非空即"结果可能被同形非楼层文字污染"
     "楼层标注冲突": {b: v["楼层标注冲突"] for b, v in result["楼栋"].items()
@@ -396,25 +463,25 @@ if _soft:
 if _gate and not args.allow_lossy:
     log.error("")
     log.error("!" * 74)
-    log.error("! 出表守门**失败**，已中止（未写出 JSON，退出码 1）：")
+    log.error("! 出表守门**失败**，已中止（未写出 JSON，退出码 2）：")
     for _g in _gate:
         log.error("!   · %s" % _g)
     log.error("! 提示：本结果是线索而非结论；请先修正参数/图纸口径再重跑。")
     log.error("! 确认要保留这份有损结果时，加 --allow-lossy 重跑。")
     log.error("!" * 74)
-    sys.exit(1)
+    # 2026-09-26：有损结果无 --allow-lossy 是"必须修项"（L1-C2 rc=2：停），
+    # 不是命令自身失败（rc=1）。上游凭 rc=2 走"补探查/列待确认项"处置。
+    sys.exit(2)
 
 try:
-    os.makedirs(os.path.dirname(os.path.abspath(OUT)) or ".", exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        write_json(OUT, result, log=log)
 except IOError as e:
     log.error(f"无法写入输出文件: {OUT}\n{e}")
-    sys.exit(1)
+    sys.exit(4)  # C2 rc=4：写盘失败
 
 log.info(f"\n户数统计完成 → {OUT}")
-log.info("自检：皮线 %d 条 / 已归属 %d / 未归属 %d（守门=%s）",
-         _tot_fiber, _tot_asg, _tot_un, result["自检"]["守门"])
+log.info("自检：皮线 %d 条 / 折算后户数 %d 户 / 已归属 %d / 未归属 %d（守门=%s）",
+         _tot_fiber, _tot_units, _tot_asg, _tot_un, result["自检"]["守门"])
 if result["自检"]["楼层标注冲突"]:
     log.warning("自检：%d 栋存在楼层标注自洽性冲突，归属楼层需人工对照原图复核：%s",
                 len(result["自检"]["楼层标注冲突"]),

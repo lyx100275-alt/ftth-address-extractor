@@ -27,9 +27,9 @@ import json
 import os
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
+from ftth_common import setup_logger, bldg_num, ensure_console_utf8, write_json
 
-from ftth_common import setup_logger, bldg_num
+ensure_console_utf8()
 
 log = setup_logger("split_units")
 
@@ -141,11 +141,9 @@ for bldg_name, bldg_data in result["楼栋"].items():
 log.info(f"\n拆分完成: {len(result['楼栋'])} 栋楼, 共 {total_households} 户")
 
 # 写入
-os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
 try:
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-except IOError as e:
+    write_json(args.out, result, log=log)
+except OSError as e:  # C2 rc=4：写盘失败（含ensure_parent；IOError过窄）
     log.error(f"无法写入输出文件: {args.out}\n{e}")
-    sys.exit(1)
+    sys.exit(4)  # C2 rc=4：写盘失败
 log.info(f"已保存: {args.out}")

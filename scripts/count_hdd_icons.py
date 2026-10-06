@@ -13,7 +13,8 @@ import os
 import runpy
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
+# 注：本 shim 正常流程无任何输出（直接 runpy 转发，目标脚本自备控制台兜底），
+# 故不设裸 reconfigure；仅存的 CJK 输出在报错分支，GBK 可编码，无需切换。
 
 _TARGET = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "count_box_icons.py")

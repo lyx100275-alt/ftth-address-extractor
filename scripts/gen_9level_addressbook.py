@@ -211,9 +211,11 @@ def main(argv=None):
                    for u in blds.values() for c in u.values())
         expect = 2 + len(blds) + n_unit + n_floor + n_hu
         if not a.no_verify and len(rows) != expect:
-            raise SystemExit(f'[守恒校验失败] {site}: 实得 {len(rows)} 行 ≠ '
-                             f'应有 {expect} 行（基础1+小区1+楼栋{len(blds)}+单元{n_unit}+'
-                             f'楼层{n_floor}+户{n_hu}）')
+            _msg = (f'[守恒校验失败] {site}: 实得 {len(rows)} 行 ≠ '
+                    f'应有 {expect} 行（基础1+小区1+楼栋{len(blds)}+单元{n_unit}+'
+                    f'楼层{n_floor}+户{n_hu}）')
+            print(_msg, file=sys.stderr)
+            sys.exit(2)  # C2 rc=2：恒等式不成立禁出表（原raise SystemExit(str)隐式rc=1）
         ws = wb.create_sheet(site[:31])
         ws.append(list(header))
         for r in rows:

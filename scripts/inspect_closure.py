@@ -32,7 +32,7 @@
                               [--fx-pattern "FL\\d+-FX\\d+"] [--json 机读输出.json]
 
 退出码：
-    0 = 无 FAIL（WARN/INFO 不影响）；2 = 存在 FAIL 项，不得出表；1 = 输入/解析错误。
+    0 = 无 FAIL（WARN/INFO 不影响）；2 = 存在 FAIL 项，不得出表（与L1-C2的2同码异义，此处2=门禁拦下）；1 = 保留值，当前无发射点（输入/解析错误统一走2）。
 
 与 verify_coverage_truth.py 的分工：
     本脚本用于**出表前**（无需 xlsx，查 parse/coverage/geom 三源闭合）；
@@ -42,36 +42,23 @@ import argparse
 from ftth_common import bldg_num_or_none  # 楼号提取：失败返 None（勿与 bldg_num 失败返 0 混用）
 from ftth_common import is_bldg_level_container  # 楼栋级兜底容器判据（全技能唯一实现）
 from ftth_common import floor_num  # 楼层归一统一入口（B1/B2/WF/3F/-1F），2026-09-25 P1-10
+from ftth_common import norm_floor  # 全技能唯一实现（2026-09-27收敛双副本，含室剥离+N层回退）
+# 覆盖判定依据的机器词表唯一来源（2026-09-27 P0-3）：本模块只引用，不另抄一份。
+from ftth_common import coverage_method_of, COVERAGE_METHODS  # C6 判定依据枚举校验
+from ftth_common import is_shared_title  # 「一窗多栋」共享标题判据（全技能唯一实现，C9 追加项用）
 import json
 import os
 import re
 import sys
 from collections import Counter, OrderedDict
+from ftth_common import ensure_console_utf8, write_json, sha256_file
+from conflict_engine import (  # V3 Conflict 层：议题构造与纯集合运算唯一入口（只产议题、不定案）
+    collect_fxmap_gap, fxmap_issues, collect_unassigned,
+    floor_mismatch_issue, run_c9, summarize as summarize_issues,
+    issue as _new_issue, ISSUE_MISSING_RECORD, ISSUE_FLOOR_MISMATCH,
+    ISSUE_PENDING_STATE)
 
-sys.stdout.reconfigure(encoding="utf-8")
-
-
-def norm_floor(v):
-    """楼层名归一化 → 整数。无法识别返回 None。
-
-    2026-09-25（评审 P1-10）：删本地漂移版，改调 ftth_common.floor_num 统一入口
-    （支持 3F/-1F/B1/B2/WF），加「N层」后缀回退（parse_floor_label 不认中文后缀）。
-    """
-    if v is None:
-        return None
-    t = str(v).replace("　", "").replace(" ", "").strip()
-    # 先走共享统一入口（B1/B2/WF/3F/-1F 等）
-    n = floor_num(t, use_fullmatch=True)
-    if n is not None:
-        return n
-    # 共享版不认的「N层」后缀在此回退（与 gen_addressbook 收口范本同则）
-    m = re.fullmatch(r"(-?\d+)(?:层|F)", t)
-    if m:
-        return int(m.group(1))
-    m = re.fullmatch(r"[Bb](\d+)(?:层|F)?", t)
-    if m:
-        return -int(m.group(1))
-    return None
+ensure_console_utf8()
 
 
 def fmt_floor(v):
@@ -125,6 +112,76 @@ def count_box_summary(K):
     return "；".join(parts)
 
 
+def shared_copy_check(C, R):
+    """C9 追加：共享窗**源节点**的证据副本必须已降级（2026-10-04 R1 缺陷 D1）。
+
+    形态（实测某分带图）：`[共享]N-M号楼综合布线系统图` 窗节点自身产出了一份箱记录；
+    同一批箱又被「共享组逐楼栋展开」复制进成员楼栋条目（该单元带 `来源共享窗` == 窗键）。
+    两处都带 result_confirmation 时，同一物理箱被计两次，且状态可能互斥 —— 窗节点按
+    **整窗**作用域判 pending、成员楼栋按**本栋**判 settled。后果：C9 主闸以「幽灵 pending」
+    把整链拦在出表前（成员侧本已 settled），或反向经 apply_ruling 把副本重写回 settled
+    造成假绿。故：**已展开到成员楼栋**的源节点副本必须已去 result_origin /
+    result_confirmation、留 `副本归属` 指针；未降级即 FAIL 并逐箱列出。
+
+    **未展开**（成员侧无任何 `来源共享窗` == 该窗键的条目）时，窗节点是唯一载体，照旧带
+    字段 —— 降级即丢解，故不判 FAIL。本项在无共享窗时不产检查行（不适用，不冒充已核）。
+
+    不做的事：不自动降级（产出方职责），不判谁对谁错（L0-I4，只登记议题）。
+    """
+    if not isinstance(C, dict):
+        return []
+    buildings = C.get("楼栋") or {}
+    if not any(is_shared_title(_k) for _k in buildings):
+        return []
+    bad = []
+    for _bk, _bv in buildings.items():
+        if not isinstance(_bv, dict) or not is_shared_title(_bk):
+            continue
+        # 成员楼栋侧持有的箱号（按 来源共享窗 == 本窗键）
+        member_codes = set()
+        for _obk, _obv in buildings.items():
+            if _obk == _bk or not isinstance(_obv, dict):
+                continue
+            for _uk, _uv in ((_obv.get("单元") or {}) or {}).items():
+                if not isinstance(_uv, dict):
+                    continue
+                if str(_uv.get("来源共享窗") or "").strip() != str(_bk).strip():
+                    continue
+                for _bx in (_uv.get("分纤箱") or []):
+                    if isinstance(_bx, dict) and str(_bx.get("编号") or "").strip():
+                        member_codes.add(str(_bx["编号"]).strip())
+        if not member_codes:
+            continue                      # 未展开 ⇒ 源节点是唯一载体，不得降级
+        for _uk, _uv in ((_bv.get("单元") or {}) or {}).items():
+            if not isinstance(_uv, dict):
+                continue
+            for _bx in (_uv.get("分纤箱") or []):
+                if not isinstance(_bx, dict):
+                    continue
+                _code = str(_bx.get("编号") or "").strip()
+                if _code and _code in member_codes and (
+                        "result_confirmation" in _bx or "result_origin" in _bx):
+                    bad.append((_bk, _uk, _code, _bx.get("result_confirmation")))
+    if bad:
+        for _bk, _uk, _code, _st in bad[:20]:
+            R.emit("  x 共享窗源节点 %s/%s 副本 %s 未降级（confirmation=%s）"
+                   % (_bk, _uk, _code, _st))
+        if len(bad) > 20:
+            R.emit("  ... 另有 %d 项未列出" % (len(bad) - 20))
+        R.check("C9", "共享窗证据副本降级", "FAIL",
+                "%d 个源节点副本仍带结果状态字段 —— 成员侧已展开同号箱，"
+                "跨节点状态互斥（幽灵 pending 或反向假绿）" % len(bad))
+        return [_new_issue(ISSUE_PENDING_STATE, _code,
+                           candidates=["源节点=%s/%s" % (_bk, _uk),
+                                       "confirmation=%s" % _st],
+                           evidence=["共享窗证据副本未降级，与成员楼栋同号箱并存"],
+                           note="同一物理箱跨节点状态互斥；产出方须降级副本并留 `副本归属`")
+                for _bk, _uk, _code, _st in bad]
+    R.check("C9", "共享窗证据副本降级", "PASS",
+            "共享窗源节点副本已全部降级（或该窗未展开到成员楼栋）")
+    return []
+
+
 def _c7_one_line(it):
     """C7「需人工裁决」单条压成一行（对象｜事项｜说明）。
 
@@ -162,11 +219,15 @@ def main():
                     help="count_box_icons.py 的图标法 JSON（可选）。本图 parse 侧无分纤箱"
                          "（箱体只画图标、不写编号）时，用它提供箱清单的替代口径；"
                          "否则 C2/C3/C4/C6 在零箱数据上会得出无意义的 PASS。")
-    ap.add_argument("--fx-pattern", default=r"FL\d+-FX\d+", help="分纤箱编号正则")
+    ap.add_argument("--fx-pattern", default=r"FL\d+-FX\d+", help="分纤箱编号正则（仅哨兵：未显式给出时改读parse产物自带值，见下；禁直接用于匹配）")
     ap.add_argument("--titleblock", dest="titleblock_json", default=None,
                     help="read_titleblock_households.py 输出的图签读数 JSON（可选）。"
                          "提供后 C10 做「图签 vs 系统图」逐栋互证；不提供则 C10 判 SKIP"
                          "（写明本次未做交叉校验，不得当作已核）")
+    ap.add_argument("--fx-map", dest="fx_map_json", default=None,
+                    help="总图 FX 对照表 JSON（extract_fx_map.py 产物，可选）。"
+                         "parse floor-mode=nofloor 时 C3 改比 coverage vs 对照表，需本输入；"
+                         "不提供则 C3-nofloor 判 SKIP（写明本次未做交叉校验，不得当作已核）")
     ap.add_argument("--json", dest="json_out", default=None, help="机读结果输出路径（可选）")
     args = ap.parse_args()
 
@@ -190,6 +251,17 @@ def main():
             print("[inspect] --fx-pattern 未显式给出，自 parse 产物取: %s" % _fp)
 
     R = Report()
+    # 2026-09-30（一百三十一，V3 Conflict）：机读冲突议题出口（只追加、不参与 rc）。
+    #   各门禁判据/文案一律不动；议题由 conflict_engine 纯构造，issue_id 确定性去重。
+    conflict_issues = []
+    _seen_issue_ids = set()
+
+    def _track_issues(new_issues):
+        for _it in (new_issues or []):
+            _iid = str((_it or {}).get("issue_id") or "")
+            if _iid and _iid not in _seen_issue_ids:
+                _seen_issue_ids.add(_iid)
+                conflict_issues.append(_it)
     # 2026-09-25（评审 P0-4）：以下输入类错误按 L1-C2 应为 rc=2（补探查/须修），
     #   不是 rc=1（会被读成「脚本坏了」）。全部 return 1 → return 2。
     try:
@@ -247,6 +319,7 @@ def main():
     R.emit("coverage : %s" % (args.coverage_json or "（未提供，C3 跳过；C6 按覆盖零产出判 FAIL）"))
     R.emit("geom     : %s" % (args.geom_json or "（未提供，C4 跳过）"))
     R.emit("count-box: %s" % (args.count_box_json or "（未提供）"))
+    R.emit("fx-map   : %s" % (args.fx_map_json or "（未提供，C3-nofloor 不可核）"))
     R.emit("=" * 72)
 
     # ---------- C0 数据集非空门禁（2026-09-16 修复 P0-4） ----------
@@ -304,6 +377,11 @@ def main():
     else:
         R.check("C1", "楼栋单元全貌", "INFO", "楼号序列连续：%s" % "/".join("%d#" % n for n in nums))
 
+    # 2026-09-30（一百三十二，V3 Phase A）：parse 去决策标记（C2/C3 双模式开关）。
+    #   full（默认；老产物无该键按 full）走 legacy 逐字节老路；nofloor 走新分支。
+    _parse_nofloor = (str(((P.get("参数") or {}) if isinstance(P, dict) else {}).get("floor_mode")
+                          or "full").strip().lower() == "nofloor")
+
     # ---------- C2 安装楼层口径分布 ----------
     R.emit()
     R.emit("--- C2 分纤箱安装楼层口径分布（parse 侧） ---")
@@ -316,7 +394,37 @@ def main():
             null_boxes.append((blk, un, fid, err))
     for k, v in dist.items():
         R.emit("  %-44s %d" % (k, v))
-    if null_boxes:
+    if _parse_nofloor:
+        # 2026-09-30（一百三十二）：parse 去决策——parse 侧 null 是声明行为，不拦；
+        #   改核 coverage 侧安装楼层（判据与 legacy 同形：null 即 FAIL，空集不得 PASS）。
+        _cov_null = []
+        _cov_n = 0
+        for _blk2, _bv2 in ((C.get("楼栋") or {}).items() if isinstance(C, dict) else []):
+            for _un2, _uv2 in (((_bv2 or {}).get("单元") or {}).items()):
+                for _fx2 in (((_uv2 or {}).get("分纤箱") or [])):
+                    _cov_n += 1
+                    if _fx2.get("安装楼层") is None:
+                        _cov_null.append((_blk2, _un2, _fx2.get("编号")))
+        if C is None:
+            R.check("C2", "安装楼层口径分布", "SKIP",
+                    "parse 去决策（floor-mode=nofloor）且未提供 coverage —— "
+                    "安装楼层无来源可核，不得读作已核")
+        elif _cov_n == 0:
+            R.check("C2", "安装楼层口径分布", "FAIL",
+                    "parse 去决策（floor-mode=nofloor），coverage 侧 0 箱，"
+                    "无安装楼层口径可核（空集合不得判 PASS）")
+        elif _cov_null:
+            for _blk2, _un2, _fid2 in _cov_null[:20]:
+                R.emit("  ✗ %s/%s/%s coverage 侧安装楼层=null" % (_blk2, _un2, _fid2))
+                R.fail("C2", "%s/%s/%s coverage 侧安装楼层未关联" % (_blk2, _un2, _fid2))
+            R.check("C2", "安装楼层口径分布", "FAIL",
+                    "coverage 侧 %d/%d 箱安装楼层未关联（parse 去决策，本项核 coverage 侧）"
+                    % (len(_cov_null), _cov_n))
+        else:
+            R.check("C2", "安装楼层口径分布", "PASS",
+                    "coverage 侧 %d/%d 箱均有安装楼层（parse 去决策，本项核 coverage 侧）"
+                    % (_cov_n, _cov_n))
+    elif null_boxes:
         for blk, un, fid, err in null_boxes:
             R.emit("  ✗ %s/%s/%s 安装楼层=null（误差 %s）" % (blk, un, fid, err))
             R.fail("C2", "%s/%s/%s 安装楼层未关联" % (blk, un, fid))
@@ -342,15 +450,118 @@ def main():
     # ---------- C3 安装楼层双源交叉 ----------
     R.emit()
     R.emit("--- C3 安装楼层双源交叉（parse vs coverage） ---")
-    if C is None:
-        R.check("C3", "安装楼层双源交叉", "SKIP", "未提供 coverage JSON")
-    else:
-        cmap = {}
+    # 2026-09-30（一百三十二）：cmap（coverage 箱索引）是 C3-legacy 与 C6 共用的；
+    #   nofloor 分支改比 coverage vs 对照表、不消费它，但 C6 在两种模式下都要——
+    #   故在此统一构建，与门禁分支无关（构建内容与原 legacy 内联逐字一致）。
+    cmap = {}
+    if C is not None:
         for blk, bv in (C.get("楼栋") or {}).items():
             for un, uv in (bv.get("单元") or {}).items():
                 for fx in (uv.get("分纤箱") or []):
                     cmap.setdefault(fx.get("编号"), []).append(
-                        (blk, un, fx.get("安装楼层"), (fx.get("覆盖范围线索") or {}).get("覆盖楼层")))
+                        (blk, un, fx.get("安装楼层"),
+                         (fx.get("覆盖范围线索") or {}).get("覆盖楼层"),
+                         fx.get("判定依据"),
+                         fx.get("安装楼层统一") or {},
+                         # r[6]=依据来源（2026-10-05 一百五十九新增，仅 C6 判性质用）：
+                         #   覆盖为空有两种截然不同的成因，此前一律报「缺线索」，把
+                         #   「两来源不一致、待裁决」伪装成「没找到线索」，人工据此会
+                         #   往「补提取逻辑」的错误方向排查；实为有线索但冲突、须裁决。
+                         fx.get("依据来源")))
+    # 2026-09-30（一百三十，V3 Evidence）：parse 侧统一楼层上下文索引
+    #   （只读展示用；comparison 判据仍是 legacy 安装楼层归一值，不动）。
+    punified = {}
+    for _blk, _bv in (buildings.items()):
+        for _un, _uv in ((_bv.get("单元") or {}).items()):
+            for _fx in ((_uv.get("分纤箱") or [])):
+                _fid2 = _fx.get("编号")
+                if _fid2 and _fid2 not in punified:
+                    _pu = _fx.get("安装楼层统一") or {}
+                    punified[_fid2] = (_pu.get("coordinate_context"),
+                                       _pu.get("installation_floor_source"))
+    if _parse_nofloor:
+        # 2026-09-30（一百三十二）：parse 去决策——parse 腿摘掉，改比
+        #   coverage vs 总图对照表（--fx-map）。判据与 legacy 同形，仍 FAIL 拦下；
+        #   跨体系差值疑似假冲突（V3§8），须先确认语义再裁决，不得自动择一。
+        R.emit("  i parse 去决策（floor-mode=nofloor）：本项改比 coverage vs 总图对照表")
+        _fxmap_obj = None
+        if args.fx_map_json:
+            try:
+                _fxmap_obj = json.load(open(args.fx_map_json, encoding="utf-8"))
+            except Exception as e:
+                print("fx-map JSON 读取失败：%s" % e)
+                return 2
+        _fmap = {}
+        if isinstance(_fxmap_obj, dict):
+            for _fe in (_fxmap_obj.get("FX映射表") or []):
+                if isinstance(_fe, dict) and str(_fe.get("编号") or "").strip():
+                    _fno = str(_fe["编号"]).strip()
+                    if _fno not in _fmap:
+                        _fmap[_fno] = (_fe.get("安装楼层"), _fe.get("安装楼层统一") or {})
+        if C is None:
+            R.check("C3", "安装楼层双源交叉", "SKIP", "未提供 coverage JSON")
+        elif _fxmap_obj is None:
+            R.check("C3", "安装楼层双源交叉", "SKIP",
+                    "parse 去决策（floor-mode=nofloor）但未提供 --fx-map 对照表 —— "
+                    "双源交叉不可核，不得读作已核")
+            R.warn("C3", "parse 去决策但未提供 --fx-map —— coverage 侧安装楼层未经第二来源交叉验证")
+        else:
+            _n3_ok = _n3_bad = _n3_miss = _n3_tot = 0
+            for _blk3, _bv3 in (C.get("楼栋") or {}).items():
+                for _un3, _uv3 in ((_bv3 or {}).get("单元") or {}).items():
+                    for _fx3 in ((_uv3 or {}).get("分纤箱") or []):
+                        _fid3 = _fx3.get("编号")
+                        _cfl3 = _fx3.get("安装楼层")
+                        _cu3 = _fx3.get("安装楼层统一") or {}
+                        _frec = _fmap.get(_fid3) if _fid3 else None
+                        _n3_tot += 1
+                        if _frec is None:
+                            R.emit("  ✗ %s（%s/%s）对照表中无记录" % (_fid3, _blk3, _un3))
+                            R.fail("C3", "%s 对照表无记录" % _fid3)
+                            _track_issues([_new_issue(
+                                ISSUE_MISSING_RECORD, "%s（%s/%s）" % (_fid3, _blk3, _un3),
+                                candidates=["coverage有记录", "对照表无记录"],
+                                evidence=["总图对照表缺 %s" % _fid3],
+                                note="一侧无记录，无法双源交叉，须人工确认")])
+                            _n3_miss += 1
+                            continue
+                        _ffl3, _fu3 = _frec
+                        _cctx3 = _cu3.get("coordinate_context")
+                        _fctx3 = (_fu3 or {}).get("coordinate_context")
+                        if norm_floor(_cfl3) == norm_floor(_ffl3):
+                            _n3_ok += 1
+                        else:
+                            R.emit("  ✗ %s（%s/%s）coverage=%s[%s] vs 对照表=%s[%s]" % (
+                                _fid3, _blk3, _un3, _cfl3, _cctx3 or "legacy",
+                                _ffl3, _fctx3 or "legacy"))
+                            if _cctx3 and _fctx3 and _cctx3 != _fctx3:
+                                R.emit("    疑似假冲突：两侧分属不同坐标语义体系（V3§8）——"
+                                       "须先确认语义是否同一再裁决")
+                            R.fail("C3", "%s 安装楼层双源不一致 coverage=%s 对照表=%s"
+                                   % (_fid3, _cfl3, _ffl3))
+                            _track_issues([_new_issue(
+                                ISSUE_FLOOR_MISMATCH, "%s（%s/%s）" % (_fid3, _blk3, _un3),
+                                candidates=["coverage=%s" % _cfl3, "对照表=%s" % _ffl3],
+                                evidence=["coverage坐标系=%s" % (_cctx3 or "legacy"),
+                                          "对照表坐标系=%s" % (_fctx3 or "legacy")],
+                                note="安装楼层双源不一致；跨坐标体系差值疑似假冲突（V3§8），"
+                                     "须先确认语义再裁决")])
+                            _n3_bad += 1
+            if not boxes:
+                R.check("C3", "安装楼层双源交叉", "FAIL",
+                        "parse 侧 0 箱，双源无交集可核（空集合不得判 PASS）")
+            elif _n3_tot == 0:
+                R.check("C3", "安装楼层双源交叉", "FAIL",
+                        "coverage 侧 0 箱，双源无交集可核（空集合不得判 PASS）")
+            else:
+                _st3 = "PASS" if (_n3_bad == 0 and _n3_miss == 0) else "FAIL"
+                R.check("C3", "安装楼层双源交叉", _st3,
+                        "一致 %d / 不一致 %d / 无记录 %d（coverage 共 %d 箱）"
+                        % (_n3_ok, _n3_bad, _n3_miss, _n3_tot))
+    elif C is None:
+        R.check("C3", "安装楼层双源交叉", "SKIP", "未提供 coverage JSON")
+    else:
+        # cmap/punified 已在分支外统一构建（见上；C6 共用），此处只跑门禁循环。
         n_ok = n_bad = n_miss = 0
         # 2026-09-18 修复：coverage 提供了 JSON，但其**箱级记录为 0** 时，原实现会把
         #   parse 侧每个箱都判「coverage 无记录」= FAIL —— 把「第二来源结构上无常」
@@ -374,15 +585,40 @@ def main():
             if not recs:
                 R.emit("  ✗ %s（%s/%s）coverage 中无记录" % (fid, blk, un))
                 R.fail("C3", "%s coverage 无记录" % fid)
+                # 2026-09-30（一百三十一）：无记录议题入机读出口（判据不动）。
+                _track_issues([_new_issue(
+                    ISSUE_MISSING_RECORD, "%s（%s/%s）" % (fid, blk, un),
+                    candidates=["parse有记录", "coverage无记录"],
+                    evidence=["coverage箱级记录缺 %s" % fid],
+                    note="一侧无记录，无法双源交叉，须人工确认")])
                 n_miss += 1
                 continue
             cfl_vals = {norm_floor(r[2]) for r in recs}
             if norm_floor(fl) in cfl_vals:
                 n_ok += 1
             else:
-                R.emit("  ✗ %s（%s/%s）parse=%s vs coverage=%s" % (
-                    fid, blk, un, fl, "/".join(str(r[2]) for r in recs)))
+                # 2026-09-30（一百三十，V3 §8）： mismatch 时带出双方坐标语义体系。
+                #   跨体系差值（总图 vs 系统图/区间/V型）疑似假冲突——须先确认语义
+                #   是否同一再裁决，不得自动择一。判据不动（仍 FAIL），只丰富指引；
+                #   双方皆无统一字段的老产物走原报文（逐字节不变）。
+                _pctx, _psrc = punified.get(fid, (None, None))
+                _cctxs = sorted({str((r[5] or {}).get("coordinate_context") or "legacy")
+                                 for r in recs})
+                if _pctx or _cctxs != ["legacy"]:
+                    R.emit("  ✗ %s（%s/%s）parse=%s[%s/%s] vs coverage=%s[%s]" % (
+                        fid, blk, un, fl, _pctx or "legacy", _psrc or "?",
+                        "/".join(str(r[2]) for r in recs), "/".join(_cctxs)))
+                    if _pctx and "legacy" not in _cctxs and _pctx not in _cctxs:
+                        R.emit("    疑似假冲突：两侧分属不同坐标语义体系（V3§8：总图对照表与"
+                               "系统图/区间/V型不是同一坐标系）——须先确认语义是否同一再裁决")
+                else:
+                    R.emit("  ✗ %s（%s/%s）parse=%s vs coverage=%s" % (
+                        fid, blk, un, fl, "/".join(str(r[2]) for r in recs)))
                 R.fail("C3", "%s 安装楼层双源不一致 parse=%s coverage=%s" % (fid, fl, [r[2] for r in recs]))
+                # 2026-09-30（一百三十一）：双源不一致议题入机读出口（C3 自身 FAIL 判据不动）。
+                _track_issues([floor_mismatch_issue(
+                    fid, blk, un, fl, _pctx, _psrc,
+                    [r[2] for r in recs], _cctxs)])
                 n_bad += 1
         # 2026-09-16 修复 P0-4：parse 侧 0 箱时两源无交集，n_bad/n_miss 均为 0，
         #   原判据会给出 PASS —— 空集合不得判 PASS。
@@ -399,6 +635,14 @@ def main():
     # ---------- C4 FX 编号坐标归属 ----------
     R.emit()
     R.emit("--- C4 FX 编号坐标归属（geom 文字双向核对） ---")
+    unassigned_ids = []
+    for _u in ((P.get("未归属分纤箱") or []) if isinstance(P, dict) else []):
+        _fid_u0 = str((_u or {}).get("编号") or "").strip()
+        if _fid_u0:
+            unassigned_ids.append(_fid_u0)
+    # 2026-09-30（一百三十一）：未归属议题入机读出口（C4 自身 WARN/FAIL 判据不动）。
+    _track_issues(collect_unassigned((P.get("未归属分纤箱") or [])
+                                     if isinstance(P, dict) else []))
     if G is None:
         R.check("C4", "FX 编号坐标归属", "SKIP", "未提供 geom 缓存")
     else:
@@ -414,11 +658,7 @@ def main():
         #   误报成「漏收录」。两者严重程度不同，混为一谈会让闸门失去意义：
         #     漏收录 = 静默丢数（图上确有文字、产物里没有）⇒ FAIL；
         #     未归属 = 已收录、标 pending、不进成品、须人工裁决 ⇒ WARN。
-        unassigned_ids = []
-        for _u in ((P.get("未归属分纤箱") or []) if isinstance(P, dict) else []):
-            _fid_u = str((_u or {}).get("编号") or "").strip()
-            if _fid_u:
-                unassigned_ids.append(_fid_u)
+        #   （unassigned_ids 已在 C4 前预计算，此处直接复用，不重置。）
         parse_ids = set(parse_ids) | set(unassigned_ids)
         miss_in_geom = sorted(parse_ids - set(geom_ids))
         miss_in_parse = sorted(set(geom_ids) - parse_ids)
@@ -454,6 +694,90 @@ def main():
                     "；双向差集 0+0" % (len(geom_ids), len(parse_ids),
                                        len(set(unassigned_ids))))
 
+    # ---------- C4b 对照表对账硬门禁（2026-09-30，一百二十八，云峰P0-1） ----------
+    # 根因：fxmap 识别 23/23，但 parse 只进 16 箱，7 箱丢在改派漏斗（单元容器缺失/
+    #   重号配对超差/楼栋锚点未命中），旧 C4 只按 geom 双向差集核对 —— 未归属计入
+    #   parse_ids 后差集为 0，仅 WARN 放行，rc 仍 0（静默丢数）。
+    # 门禁：当 parse 产物带 BDGMAP归属（即本轮传了 --bldg-map/对照表）时，
+    #   `对照表唯一编号 == parse已归属编号数 + 未归属编号数` 必须成立，且未归属必须为 0；
+    #   否则 FAIL 禁止出表，并逐号点名缺失项。无 BDGMAP 时 SKIP（不改变旧行为）。
+    R.emit()
+    R.emit("--- C4b 对照表对账（fxmap→parse 硬门禁） ---")
+    _bdg = (P.get("BDGMAP归属") or {}) if isinstance(P, dict) else {}
+    _exp_list = _bdg.get("对照表编号清单") or []
+    _exp_n = _bdg.get("唯一编号")
+    if not _bdg or (_exp_n is None and not _exp_list):
+        R.check("C4b", "对照表对账", "SKIP", "parse 未带 BDGMAP归属（本轮未传 --bldg-map），不做对照表对账")
+    else:
+        # 2026-09-30（一百三十一）：集合运算走冲突引擎（collect_fxmap_gap），
+        #   下文分支只消费 gap 字段作门禁，报文逐字节不变。
+        #   旧产物只有计数无清单时，退化为计数核对（无法点名，仅判数量）。
+        _gap = collect_fxmap_gap(
+            _exp_list, _exp_n,
+            [f for _b, _u, f, *_r in boxes],
+            unassigned_ids)
+        _track_issues(fxmap_issues(_gap))
+        _n_asg = int(_gap.get("assigned") or 0)
+        _un_sorted = list(_gap.get("unassigned") or [])
+        _un_set = set(_un_sorted)
+        if _gap.get("mode") == "清单":
+            _missing = list(_gap.get("missing") or [])
+            _extra = list(_gap.get("extra") or [])
+            if _missing or _extra or _un_set:
+                for _m in _missing[:20]:
+                    R.emit("  ✗ 对照表有、parse 无：%s" % _m)
+                    R.fail("C4b", "%s 对照表有、parse 无（改派漏斗丢失）" % _m)
+                for _e in _extra[:20]:
+                    R.emit("  ✗ parse 已归属、对照表无：%s" % _e)
+                    R.fail("C4b", "%s parse 已归属、对照表无" % _e)
+                # 2026-10-05（一百五十九）：① 去掉 `and not _missing` —— 旧写法在有
+                #   missing 时**整段不报未归属**，属漏报；② 未归属按「是否在对照表内」
+                #   分两类报（见 conflict_engine.collect_fxmap_gap 同名注释），不再与
+                #   extra 混算（旧口径会把同一批编号同时报成「parse 有对照表无」和
+                #   「对照表有 parse 未归属」两种矛盾说法）。
+                if _un_set:
+                    _uin = _gap.get("unassigned_in") or []
+                    _uout = _gap.get("unassigned_out") or []
+                    if _uin:
+                        R.emit("  ✗ 对照表已定归属、parse 未落位（%d）：%s"
+                               % (len(_uin), "、".join(_uin[:12])))
+                        R.fail("C4b", "%d 个编号未落位（%s）—— 对照表已定归属、parse 未落位，"
+                                      "不得出表" % (len(_uin), "、".join(_uin[:12])))
+                    if _uout:
+                        R.emit("  ✗ parse 收录、对照表无此编号，且未落位（%d）：%s"
+                               % (len(_uout), "、".join(_uout[:12])))
+                        R.fail("C4b", "%d 个编号对照表外且未落位（%s）—— 需人工确认是否属本图"
+                               % (len(_uout), "、".join(_uout[:12])))
+                R.check("C4b", "对照表对账", "FAIL",
+                        "对照表 %d / parse已归属 %d / 未归属 %d（表内 %d、表外 %d）；"
+                        "缺失 %d、已归属多余 %d"
+                        % (int(_gap.get("expected") or 0), _n_asg, len(_un_set),
+                           len(_gap.get("unassigned_in") or []),
+                           len(_gap.get("unassigned_out") or []),
+                           len(_missing), len(_extra)))
+            else:
+                R.check("C4b", "对照表对账", "PASS",
+                        "对照表 %d == parse已归属 %d + 未归属 0" % (int(_gap.get("expected") or 0), _n_asg))
+        else:
+            # 无清单旧产物：只核计数
+            if _gap.get("mode") == "无":
+                R.check("C4b", "对照表对账", "SKIP", "BDGMAP归属无唯一编号/清单，无法对账")
+            elif _gap.get("aligned"):
+                R.check("C4b", "对照表对账", "PASS",
+                        "对照表 %d == parse已归属 %d + 未归属 0" % (int(_gap.get("expected") or 0), _n_asg))
+            else:
+                _exp_n = int(_gap.get("expected") or 0)
+                R.emit("  ✗ 对照表 %d / parse已归属 %d / 未归属 %d（数量不对齐）"
+                       % (_exp_n, _n_asg, len(_un_set)))
+                R.fail("C4b", "对照表与parse数量不对齐（对照表 %d，parse %d+未归属 %d）"
+                       % (_exp_n, _n_asg, len(_un_set)))
+                if _un_set:
+                    R.fail("C4b", "%d 个编号未归属（%s）—— 不得出表"
+                           % (len(_un_set), "、".join(sorted(_un_set)[:12])))
+                R.check("C4b", "对照表对账", "FAIL",
+                        "对照表 %d / parse已归属 %d / 未归属 %d"
+                        % (_exp_n, _n_asg, len(_un_set)))
+
     # ---------- C5 楼层表直读清单 ----------
     R.emit()
     R.emit("--- C5 楼层表直读清单（parse 侧，INFO） ---")
@@ -468,13 +792,32 @@ def main():
     #   「图上确实没有户数」与「我没读到户数」必须可区分。
     #   本项只**登记事实**、不下结论（地下车库/设备层/储藏层都是合法图面事实）。
     blank_rows = []             # (楼栋, 单元, 层名)
+    # 2026-10-05（P1）：**整单元 100% 空**需与「个别层无标注」分开登记。
+    #   背景：多单元/多栋共享同一系统图时，户数列常只有**一条**，而文字按 x 轴
+    #   划归单元时该列只落进其中一个单元 —— 其余单元整张楼层表全空。此时若只报
+    #   「N 个层行有刻度无户数」，会被读成「地下车库/设备层等合法图面事实」，
+    #   而真量级是**少计了整栋的一半**（实测某图 2 单元楼：图签 60 户 / 直读 30 户）。
+    #   「个别层空」与「整单元空」是两回事，混报即把未核呈现成已核。此处只**登记**，
+    #   不代判归属（共用列归谁只能由人裁）。
+    # 索引：0 总层行 / 1 两列皆空行 / 2 户数合计 / 3 **户数缺失行**（含"有布线但无户数"）
+    _unit_stat = {}
     for blk, un, fltab in units:
         rows = []
+        _st = _unit_stat.setdefault((blk, un), [0, 0, 0, 0])
         for fname, fv in fltab.items():
             hu, bx = fv.get("户数"), fv.get("布线")
+            _st[0] += 1
+            if hu is None:
+                _st[3] += 1          # 户数缺失（布线是否存在不影响，见下）
+            else:
+                try:
+                    _st[2] += int(hu)
+                except (TypeError, ValueError):
+                    _st[3] += 1
             if hu is not None or bx is not None:
                 rows.append((fv.get("fl_num", norm_floor(fname)), fname, hu, bx))
             else:
+                _st[1] += 1
                 blank_rows.append((blk, un, fname))
         rows.sort(key=lambda r: (r[0] is None, r[0]))
         subtotal = sum(r[2] for r in rows if isinstance(r[2], int))
@@ -486,57 +829,105 @@ def main():
             R.emit("      %-6s 户数 %-4s 布线 %s" % (fname, hu if hu is not None else "-", bx if bx is not None else "-"))
     # 空集合不得判 PASS，也不得把「没取到数」写成「合计 0」（实测某图户数列全空，
     # 旧实现输出「整图户数合计 0」，把「无户数列」伪装成「数就是 0」）。
+    # 2026-09-26（第4轮 Bug B）：皮线回落路径出现后，直读 SKIP 若 count-box 已有归层户数则改述来源（判定语义不动）。
+    _cb_has_hu = (isinstance(K, dict) and isinstance(K.get("归层后总户数"), (int, float))
+                  and K.get("归层后总户数") > 0)
+    _cb_src = ("直读侧无户数可核；户数已由 count-box 提供（口径=%s，归层合计 %s 户）"
+               % (K.get("口径"), K.get("归层后总户数"))) if _cb_has_hu else None
     if n_rows_total == 0:
         R.check("C5", "楼层表直读清单", "SKIP",
-                "全图 %d 个单元的楼层表均无任何非空行（户数/布线两列皆空）——"
-                "本图户数须由图标法（count-box）提供；不得读作合计 0" % len(units))
+                _cb_src if _cb_src else
+                ("全图 %d 个单元的楼层表均无任何非空行（户数/布线两列皆空）——"
+                 "本图户数须由图标法（count-box）提供；不得读作合计 0" % len(units)))
     elif n_hu_total == 0:
         R.check("C5", "楼层表直读清单", "SKIP",
-                "楼层表共 %d 个非空行，但「户数」列全空 —— 本图户数须由图标法（count-box）提供；"
-                "不得把「没有户数列」读作「合计 0」" % n_rows_total)
+                _cb_src if _cb_src else
+                ("楼层表共 %d 个非空行，但「户数」列全空 —— 本图户数须由图标法（count-box）提供；"
+                 "不得把「没有户数列」读作「合计 0」" % n_rows_total))
     else:
         _c5_note = ("整图户数合计 %d（来源：楼层表户数列，非空户数行 %d/%d）"
                     % (grand, n_hu_total, n_rows_total))
+        # ---- 整单元户数缺失检测：**独立于 blank_rows**（否则「全图每层都有布线值」时
+        #   blank_rows 为空，本检测会被整段跳过，而那恰恰是最需要报警的形态）。
+        #   口径必须是**户数缺失**（v[3]），不能是「两列皆空」（v[1]）：实测存在
+        #   「布线读到了（32m*2）、户数却是 None」的层 —— 它们不是 blank_rows，
+        #   于是在 C5 里既不进明细也不告警，户数凭空少一半却全无提示。
+        _all_blank = [(k, v) for k, v in _unit_stat.items()
+                      if v[0] > 0 and v[3] == v[0]]
+        if _all_blank:
+            _sib = {}
+            for (b, u), v in _unit_stat.items():
+                if v[2] > 0:
+                    _sib.setdefault(b, []).append((u, v[2]))
+            _susp = [(k, v) for k, v in _all_blank if k[0] in _sib]
+            if _susp:
+                # 注意：文案里的 100%% 是 %-格式化的转义（`100% ` 会被当成占位符）
+                R.emit("  ↓ ⚠ **整单元「户数」列 100%% 缺失**（%d 个）—— 同楼栋另有单元"
+                       "读到了户数，高度疑似「多单元共用同一条户数列、文字按 x 轴只归了"
+                       "其中一个单元」；此类单元的户号**不会生成**，出表将少计："
+                       % len(_susp))
+                for (b, u), v in _susp[:20]:
+                    _bro = "、".join("%s(%d户)" % (bu, bh) for bu, bh in _sib.get(b, []))
+                    R.emit("      %s/%s：%d 层户数全缺；同楼有户数的单元：%s"
+                           % (b, u, v[0], _bro or "(无)"))
+                if len(_susp) > 20:
+                    R.emit("      ... 另有 %d 个未列出" % (len(_susp) - 20))
+        _n_hu_missing_partial = (sum(v[3] for v in _unit_stat.values())
+                                 - sum(v[0] for k, v in _all_blank))
+        if _n_hu_missing_partial > 0:
+            R.emit("  ↓ 另有 %d 个层行「布线」有值而「户数」缺失（不构成整单元缺失，"
+                   "同样不生成户号）" % _n_hu_missing_partial)
         if blank_rows:
             R.emit("  ↓ 有楼层刻度、但「户数/布线」两列皆空的层（%d 行）：" % len(blank_rows))
             for _b, _u, _f in blank_rows[:40]:
                 R.emit("      %s/%s/%s" % (_b, _u, _f))
             if len(blank_rows) > 40:
                 R.emit("      ... 另有 %d 行未列出" % (len(blank_rows) - 40))
-            R.check("C5", "楼层表直读清单", "WARN",
-                    _c5_note + ("；另有 %d 个层行**有楼层刻度但无户数/布线标注** —— "
-                                "按 Step 1c 这些层不生成户号，须人工确认是否图纸事实"
-                                "（地下车库/设备层/储藏层等），明细见上" % len(blank_rows)))
+            _c5_extra = ("；另有 %d 个层行**有楼层刻度但无户数/布线标注** —— "
+                         "按 Step 1c 这些层不生成户号，须人工确认是否图纸事实"
+                         "（地下车库/设备层/储藏层等），明细见上" % len(blank_rows))
+        else:
+            _c5_extra = ""
+        if _all_blank:
+            _c5_extra += ("；**%d 个单元「户数」列整单元缺失**（见上 ⚠ 段）—— 与"
+                          "「个别层无标注」性质不同，实测多为多单元共用户数列而 x 轴只归了"
+                          "一个单元；不得按地下车库层等图面事实处理，确认前不得出表"
+                          % len(_all_blank))
+        if _c5_extra:
+            R.check("C5", "楼层表直读清单", "WARN", _c5_note + _c5_extra)
         else:
             R.check("C5", "楼层表直读清单", "INFO", _c5_note)
 
     # ---------- C5·count-box 质量透传（2026-09-25 云峰实跑 + opencode 审核返工）----------
     # 为什么放 C5：C5 的语义就是「每层户数从哪来、可信吗」。云峰实测 parse 楼层表
     #   全空 → C5 SKIP 说「户数须由图标法提供」，但 count_box.json 里的四类质量告警
-    #   （待裁决乘数 / 刻度偏移异常 / 共用刻度列 / 同一端点多候选）此前没有任何
-    #   inspect 出口——复用轮连 count_box.log 都不打印，*16 这类 P5 强制裁决项会
-    #   静默漏网。扩展 C5 而非新增检查 ID：SKILL.md 的 C1~C10 名目不能扩（体量红线）。
-    # 级别（opencode 审定）：乘数未裁决 → FAIL（P5 禁区 + C9「未定案不得出表」哲学：
-    #   带未裁决乘数出表 = 编造户数倍数）；其余三类 → WARN（须复核不阻塞，避免把
-    #   历史绿灯图批量变红）。C2 的 parse-0-箱分支另有偏移异常 FAIL，此处覆盖
-    #   parse 有箱的常规路径（云峰即此），不构成双闸。
+    #   （乘号式标注 / 刻度偏移异常 / 共用刻度列 / 同一端点多候选）此前没有任何
+    #   inspect 出口——复用轮连 count_box.log 都不打印。扩展 C5 而非新增检查 ID：
+    #   SKILL.md 的 C1~C10 名目不能扩（体量红线）。
+    # 级别（2026-09-27 用户裁决后调整）：**四类一律 WARN** —— 乘号式 `*N` 标注原按
+    #   "未裁决乘数"判 FAIL，现改判为「该处 N 户」的**直读**形态（不再是待裁决项），
+    #   其 FAIL 依据随之消失，降为登记性 WARN；其余三类本就 WARN（须复核不阻塞）。
+    #   C2 的 parse-0-箱分支另有偏移异常 FAIL，此处覆盖 parse 有箱的常规路径。
     # 格式纪律（与 C7 同一标准）：计数 + 单条不截断 + 明细指针 count_box.json。
     if K is not None:
-        _cb_m = K.get("待裁决_乘数标注") or []
+        _cb_m = K.get("乘号式户数标注") or []
         _cb_o = K.get("刻度偏移异常列") or []
         _cb_s = K.get("共用刻度列组") or []
         _cb_d = K.get("同一端点多候选") or []
         _cb_u = K.get("未归属图标数") or 0
         if _cb_m or _cb_o or _cb_s or _cb_d or _cb_u:
             R.emit()
-            R.emit("  count-box（图标法）质量告警：乘数 %d / 偏移异常列 %d / 共用刻度列组 %d / "
+            _cb_tag = ("count-box（皮线回落）质量告警"
+                       if "皮线回落" in str((K or {}).get("口径") or "")
+                       else "count-box（图标法）质量告警")
+            R.emit("  %s：乘号式标注 %d / 偏移异常列 %d / 共用刻度列组 %d / "
                    "多候选 %d / 未归属 %d；归层后总户数 %s"
-                   % (len(_cb_m), len(_cb_o), len(_cb_s), len(_cb_d), _cb_u,
+                   % (_cb_tag, len(_cb_m), len(_cb_o), len(_cb_s), len(_cb_d), _cb_u,
                       K.get("归层后总户数")))
             for _x in _cb_m[:20]:
-                R.emit("    ! 乘数标注：%s @(%s, %s) 图层=%s —— P5：不得自行相乘，"
-                       "含义与落层口径须人工裁决" % (_x.get("标注"), _x.get("x"),
-                                                     _x.get("y"), _x.get("图层")))
+                R.emit("    i 乘号式户数标注：%s @(%s, %s) 图层=%s —— 乘号后数字即该处户数"
+                       "（属直读形态），不由图标法消费" % (_x.get("标注"), _x.get("x"),
+                                                          _x.get("y"), _x.get("图层")))
             for _x in _cb_o[:20]:
                 R.emit("    ! 偏移异常列：列x=%s 偏移=%s —— %s"
                        % (_x.get("列x"), _x.get("刻度偏移"), _x.get("说明")))
@@ -544,13 +935,9 @@ def main():
                 R.emit("    ! 共用刻度列：刻度列x=%s ← 图标列 %s"
                        % (_x.get("刻度列x"), "、".join(str(v) for v in (_x.get("图标列x") or []))))
             if len(_cb_m) > 20:
-                R.emit("    ... 另有 %d 处乘数未列出（明细见 count_box.json）" % (len(_cb_m) - 20))
+                R.emit("    ... 另有 %d 处乘号式标注未列出（明细见 count_box.json）" % (len(_cb_m) - 20))
             if len(_cb_o) > 20:
                 R.emit("    ... 另有 %d 列偏移异常未列出（明细见 count_box.json）" % (len(_cb_o) - 20))
-            if _cb_m:
-                R.fail("C5", "图标法含待裁决乘数标注 %d 处（如 %s）—— 按 L0-P5 须人工"
-                       "裁决含义与落层口径后改数，未裁决不得出表"
-                       % (len(_cb_m), "、".join(str(x.get("标注")) for x in _cb_m[:4])))
             if _cb_o:
                 R.warn("C5", "图标法刻度偏移异常列 %d 个（列x=%s）—— 该列归层不可信，须人工"
                        "核对后重跑（可显式 --col-scale-map / --scale-max-dx）"
@@ -558,15 +945,26 @@ def main():
             if _cb_s:
                 R.warn("C5", "图标法共用刻度列组 %d 组 —— 「一条刻度列服务多个图标列」形态下"
                        "几何最近配对不可靠，须人工核对归属" % len(_cb_s))
+            # E1（2026-09-27）：把「合计里有多少户是不可信的」送到人工清单 ——
+            #   count_box 侧只登记列级不可信，合计字段若不带构成，下游会把待核对当已核消费。
+            _cb_hh = K.get("户数构成") or {}
+            _cb_nd = _cb_hh.get("待核对户数")
+            if isinstance(_cb_nd, int) and _cb_nd > 0:
+                R.warn("C5", "归层后总户数 %s 户中有 %d 户落在自述不可信的列上"
+                             "（刻度偏移异常列 / 共用刻度列组）—— 合计**未剔除**这些户"
+                             "（剔除=丢解），但人工核对前不得当作已核户数消费；"
+                             "明细见 count_box.json「户数构成」"
+                       % (K.get("归层后总户数"), _cb_nd))
             if _cb_d:
                 R.warn("C5", "图标法同一端点多候选 %d 处 —— 须人工复核是否重复绘制" % len(_cb_d))
             if _cb_u:
                 R.warn("C5", "图标法未归属图标 %d 个 —— 不计入任何列，已登记待确认" % _cb_u)
-            R.check("C5", "楼层表直读清单", "FAIL" if _cb_m else "WARN",
-                    "图标法质量告警：乘数%d/偏移异常%d/共用刻度%d/多候选%d/未归属%d；"
-                    "归层后总户数 %s；明细见 count_box.json"
+            R.check("C5", "楼层表直读清单", "WARN",
+                    "图标法质量告警：乘号式标注%d/偏移异常%d/共用刻度%d/多候选%d/未归属%d；"
+                    "归层后总户数 %s（其中待核对 %s 户）；明细见 count_box.json"
                     % (len(_cb_m), len(_cb_o), len(_cb_s), len(_cb_d), _cb_u,
-                       K.get("归层后总户数")))
+                       K.get("归层后总户数"),
+                       _cb_nd if isinstance(_cb_nd, int) else "?"))
 
     # ---------- C8 同单元跨层户数一致性（2026-09-17 新增） ----------
     # 为什么要它（实测依据）：
@@ -624,8 +1022,9 @@ def main():
     elif c8_units == 0:
         # 空集合不得判 PASS（与 C0/C2/C4 同则）：0 个单元 ≠ 0 个不一致。
         R.check("C8", "同单元跨层户数一致性", "SKIP",
-                "无单元可核（「有效层数 ≥3 且户数非空」的单元数 = 0）——"
-                "空集合不得判 PASS；本图户数须由图标法（count-box）提供")
+                _cb_src if _cb_src else
+                ("无单元可核（「有效层数 ≥3 且户数非空」的单元数 = 0）——"
+                 "空集合不得判 PASS；本图户数须由图标法（count-box）提供"))
     else:
         R.check("C8", "同单元跨层户数一致性", "PASS",
                 "%d 个单元各层户数一致（有效层数不足 3 的单元未纳入）" % c8_units)
@@ -647,6 +1046,8 @@ def main():
             R.check("C6", "覆盖闭合", "SKIP", "未提供 coverage JSON")
     else:
         n_ok = n_noclue = n_outof = 0
+        n_cluepend = 0   # 2026-10-05（一百五十九）：覆盖为空但属「两来源不一致待裁决」的箱数
+        n_badbasis = 0   # 2026-09-27（P0-3）：判定依据不在覆盖方法枚举内的箱数
         # 2026-09-19 修复（与 C3 同一条件、同一处置）：coverage 提供了 JSON，但**箱级
         #   记录为 0** 时，上面那个 `for blk, un, fid, ... in boxes` 循环里每个箱都会
         #   走到 `if not recs: continue` —— 循环体一次有效判定都没做，三个计数全 0，
@@ -687,10 +1088,34 @@ def main():
                 if not recs:
                     continue  # C3 已报
                 clue_sets = [set(r[3] or []) for r in recs]
+                # 2026-09-27（P0-3）：`判定依据` 必须**机器可枚举**（首段 ∈ COVERAGE_METHODS）。
+                #   自由文本 = 机器不可判；实测同一脚本内并存「V型计算」/「V形计算」两种写法，
+                #   下游按枚举解释即静默出错。空值同样 FAIL（如「判不了就写待确认」，不得留空）。
+                #   词表唯一来源 ftth_common.COVERAGE_METHODS，本处只引用（禁另抄一份）。
+                for _r in recs:
+                    if coverage_method_of(_r[4]) is None:
+                        R.emit("  ✗ %s（%s/%s）判定依据不可枚举：%r（须以 %s 之一开头）"
+                               % (fid, blk, un, _r[4], "/".join(COVERAGE_METHODS)))
+                        R.fail("C6", "%s 判定依据不在覆盖方法枚举内" % fid)
+                        n_badbasis += 1
                 if not any(clue_sets):
-                    R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
-                    R.fail("C6", "%s 缺覆盖范围线索" % fid)
-                    n_noclue += 1
+                    # 2026-10-05（一百五十九）：覆盖为空须**分因**呈现，不得一律说「缺线索」。
+                    #   实测柳辛庄某带 24 箱记录中 8 箱覆盖为空，其依据来源逐字写着
+                    #   「…（两来源不一致，待裁决）」、性质写着「…待确认」—— 是**有线索
+                    #   但两来源冲突、须人工裁决**，与「压根没找到线索」是两回事。混报会
+                    #   把「待裁决」呈现成「已尽力但无线索」，方向相反。两类均不得出表，
+                    #   故都计 FAIL，仅分类与报文不同。
+                    _src_txt = " ".join(str(r[6]) for r in recs if len(r) > 6 and r[6])
+                    if any(_k in _src_txt for _k in ("待裁决", "待确认", "不一致")):
+                        R.emit("  ✗ %s（%s/%s）覆盖**两来源不一致、待裁决**（非「无线索」）"
+                               " —— 明细见 C7 需人工裁决清单；不得按「补提取」方向排查"
+                               % (fid, blk, un))
+                        R.fail("C6", "%s 覆盖两来源不一致待裁决（非缺线索，见 C7）" % fid)
+                        n_cluepend += 1
+                    else:
+                        R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
+                        R.fail("C6", "%s 缺覆盖范围线索" % fid)
+                        n_noclue += 1
                     continue
                 fln = norm_floor(fl)
                 covered = any(fln in {norm_floor(x) for x in cs} for cs in clue_sets if cs)
@@ -706,9 +1131,14 @@ def main():
                 R.check("C6", "覆盖闭合", "FAIL",
                         "parse 侧 0 箱，覆盖闭合无对象可核（空集合不得判 PASS）")
             else:
-                st = "PASS" if (n_noclue == 0 and n_outof == 0) else "FAIL"
+                st = ("PASS" if (n_noclue == 0 and n_outof == 0 and n_badbasis == 0
+                                 and n_cluepend == 0) else "FAIL")
+                # 2026-10-05（一百五十九）：`覆盖待裁决` 单独计数并写进状态串 —— 与
+                #   「缺线索」分列，人工据此知道该去裁决还是去补提取（两者处置相反）。
                 R.check("C6", "覆盖闭合", st,
-                        "闭合 %d / 缺线索 %d / 安装层越界 %d" % (n_ok, n_noclue, n_outof))
+                        "闭合 %d / 缺线索 %d / 覆盖待裁决 %d / 安装层越界 %d / "
+                        "判定依据不可枚举 %d"
+                        % (n_ok, n_noclue, n_cluepend, n_outof, n_badbasis))
 
     # ---------- C7 覆盖自检透传 ----------
     R.emit()
@@ -719,16 +1149,39 @@ def main():
         for k in ("自检_v底vs箱符号", "自检_v形单调性", "自检_偏差门禁"):
             if k in C:
                 R.emit("  %s = %s" % (k, json.dumps(C[k], ensure_ascii=False)[:160]))
-        pend = C.get("需人工裁决")
-        if pend:
-            R.emit("  需人工裁决 %d 项：" % len(pend))
-            for it in pend:
-                _full = _c7_one_line(it)
+        pend = list(C.get("需人工裁决") or [])
+        # 同一条疑点可能**两路都带**（coverage 常把 parse 侧登记原样透传）。不去重会把
+        #   一条报成两条，人工清单虚增一倍、还会误以为是两个不同问题 —— 按 (对象, 事项) 去重。
+        def _c7_key(it):
+            if isinstance(it, dict):
+                return (str(it.get("对象") or ""), str(it.get("事项") or ""))
+            return (str(it), "")
+        _seen_pend = set(_c7_key(it) for it in pend)
+        # 2026-09-27（十五轮迭代 R2，缺陷 D3）：parse 侧登记的「需人工裁决」此前**不带出**
+        #   —— C7 只读 coverage 的顶层键，parse 产物里登记了却进不了人工清单，等于
+        #   「登记了疑点但拦不住结果」：人工按 inspect 报告裁决时会整批漏掉 parse 侧疑点
+        #   （实测：单元号无轴可承载 4 项只存在于 parsed.json，C7 里一条都没有）。
+        #   现两路合并带出，逐条标来源，人工一次看全。
+        _ppend = []
+        for it in (P.get("需人工裁决") or []):
+            if _c7_key(it) in _seen_pend:
+                continue          # coverage 已从 parse 透传了同一条 —— 不重复计、不重复报
+            _seen_pend.add(_c7_key(it))
+            _ppend.append(it)
+        #   现两路合并、**一次循环**带出，逐条标来源（parse 来源加 [parse] 前缀），
+        #   人工一次看全。注意：不可先循环 _ppend 再循环合并后的 pend —— 那会把 parse
+        #   侧每条报两遍（一次带前缀、一次不带），人工清单虚增一倍（实测踩中）。
+        _all = [(it, "") for it in pend] + [(it, "[parse] ") for it in _ppend]
+        if _all:
+            R.emit("  需人工裁决 %d 项（coverage %d / parse %d）："
+                   % (len(_all), len(pend), len(_ppend)))
+            for it, _src in _all:
+                _full = _src + _c7_one_line(it)
                 # 展示层可截（防刷屏，放宽到 300）；机读层（warns → inspect.json）不截断
                 R.emit("    ! %s" % _full[:300])
                 R.warn("C7", "需人工裁决：%s" % _full)
             R.check("C7", "覆盖自检透传", "WARN",
-                    "需人工裁决 %d 项（明细见 warns，全量未截断）" % len(pend))
+                    "需人工裁决 %d 项（明细见 warns，全量未截断）" % len(_all))
         else:
             R.check("C7", "覆盖自检透传", "PASS", "无需人工裁决项")
 
@@ -739,115 +1192,13 @@ def main():
     # 依据 operations_discipline.md §5.6 底线 3「未裁决的值不得进入成品」：
     #     result_confirmation == "pending"  或  result_origin == "unresolved"  ⇒ FAIL
     # 向后兼容：产物未携带本字段时判 SKIP —— 老产物不得因缺字段被误拦成 FAIL。
-
-    def _walk_result_status(node, path=""):
-        """递归收集产物中携带结果状态契约字段的条目，返回 [(路径, origin, confirmation)]。"""
-        out = []
-        if isinstance(node, dict):
-            if "result_origin" in node or "result_confirmation" in node:
-                out.append((path or "（根）",
-                            node.get("result_origin"),
-                            node.get("result_confirmation")))
-            for k, v in node.items():
-                out.extend(_walk_result_status(v, ("%s.%s" % (path, k)) if path else str(k)))
-        elif isinstance(node, list):
-            for i, v in enumerate(node):
-                out.extend(_walk_result_status(v, "%s[%d]" % (path, i)))
-        return out
-
-    R.emit()
-    R.emit("--- C9 结果状态闭合（result_origin / result_confirmation） ---")
-    # 覆盖申报（2026-09-18 补）：只报「扫到多少项」而不说「扫了哪些来源」，
-    # 会在某个来源一个字段都没写时仍然判 PASS —— 闸门看着是绿的，实际有一半产物没核。
-    # 已提供但零字段的来源必须单独点名（WARN），不得静默当作已核。
-    _rs_items = []
-    _rs_src_ok, _rs_src_empty = [], []
-    for _src_name, _src_obj in (("parse", P), ("coverage", C)):
-        if _src_obj is None:
-            continue
-        _n0 = len(_rs_items)
-        for _p, _o, _c in _walk_result_status(_src_obj):
-            _rs_items.append(("%s:%s" % (_src_name, _p), _o, _c))
-        (_rs_src_ok if len(_rs_items) > _n0 else _rs_src_empty).append(_src_name)
-    _rs_scope = "已提供来源：%s；其中有字段：%s" % (
-        "、".join(_rs_src_ok + _rs_src_empty) or "无",
-        "、".join(_rs_src_ok) or "无")
-    # 2026-09-26（一百零三，问题 9）：明细行与 warn 分支逻辑对齐 ——
-    #   此处旧文案「零字段、未被闸门覆盖」是问题 3 修复漏改残留；coverage「零对象」
-    #   形态（箱级 0 条，无对象可挂字段）须与下文 warn 同语义输出，不得暗示漏写。
-    _cov_box_n = 0
-    if C is not None:
-        for _cblk, _cbv in (C.get("楼栋") or {}).items():
-            for _cun, _cuv in ((_cbv or {}).get("单元") or {}).items():
-                _cov_box_n += len((_cuv or {}).get("分纤箱") or [])
-    _zero_obj = [s for s in _rs_src_empty
-                 if s == "coverage" and boxes and _cov_box_n == 0]
-    _zero_fld = [s for s in _rs_src_empty if s not in _zero_obj]
-    if _zero_obj:
-        R.emit("  ! 来源 coverage 已提供但箱级记录为 0 —— 无对象可挂结果状态字段"
-               "（非字段漏写；覆盖零产出见 C6 FAIL）")
-    if _zero_fld:
-        R.emit("  ! 来源 %s 已提供但零字段 —— 未被结果状态闸门覆盖，不得视为已核"
-               % "、".join(_zero_fld))
-    if not _rs_items:
-        R.check("C9", "结果状态闭合", "SKIP",
-                "产物未携带 result_origin / result_confirmation 字段"
-                "（老产物按缺字段处理，不因此判 FAIL）；" + _rs_scope)
-    else:
-        # 2026-09-18 补（P0）：**枚举校验**。原实现只判存在性（c=='pending' or o=='unresolved'），
-        #   任何字符串都能过 —— 实测在 coverage 产物里加一段「取值含义说明」（键名恰好叫
-        #   result_origin/result_confirmation）后，说明文字被当成一条结果项、C9 计数从 34 变 35,
-        #   且因为说明文字以 'settled' 开头而**判 PASS**。这正是本闸门自己要防的
-        #   「看着绿、实则没核」。故改为：字段值必须落在契约枚举内，否则按未定案拦下。
-        _V_ORIGIN = ("measured", "derived", "unresolved")
-        _V_CONFIRM = ("settled", "pending")
-        _rs_bad = []
-        for _p, _o, _c in _rs_items:
-            if _c == "pending" or _o == "unresolved":
-                _rs_bad.append((_p, _o, _c, "结果未定案（origin=%s / confirmation=%s）—— 不得进入成品"
-                                % (_o, _c)))
-            elif _o not in _V_ORIGIN or _c not in _V_CONFIRM:
-                _rs_bad.append((_p, _o, _c,
-                                "字段值不在契约枚举内（origin∈%s；confirmation∈%s）—— "
-                                "疑似说明性文字被当成结果项，或产出方写入了非法值，"
-                                "一律按未定案拦下（判定依据见 L1-C8）"
-                                % ("/".join(_V_ORIGIN), "/".join(_V_CONFIRM))))
-        for _p, _o, _c, _why in _rs_bad[:20]:
-            R.emit("  x %s  origin=%s  confirmation=%s" % (_p, _o, _c))
-            R.fail("C9", "%s %s" % (_p, _why))
-        if len(_rs_bad) > 20:
-            R.emit("  ... 另有 %d 项未列出" % (len(_rs_bad) - 20))
-        if _rs_bad:
-            R.check("C9", "结果状态闭合", "FAIL",
-                    "%d/%d 项结果未定案或字段值非法；%s"
-                    % (len(_rs_bad), len(_rs_items), _rs_scope))
-        elif _rs_src_empty:
-            # 2026-09-25（一百零一，问题 3）：区分「产物没有对象」与「产物没写字段」——
-            #   两者处置完全不同：前者（coverage 箱级记录为 0，无对象可挂字段，非字段漏写；
-            #   V 型法窗口内无箱号锚形态）是覆盖零产出，已由 C6 判 FAIL 拦下，此处只解释、
-            #   不重复拦下（避免双闸矛盾）；后者（有箱级对象却无字段）才是产出方未落
-            #   L1-C8 字段，仍按原口径 WARN 点名。C6/C9 联动见 C6 一百零一注释。
-            #   2026-09-26（一百零三，问题 9）：_cov_box_n/_zero_obj/_zero_fld 已在上文
-            #   明细行处一次算出，此处复用（单源，与明细行恒一致），不再重复计算。
-            if _zero_obj:
-                R.warn("C9", "来源 coverage 已提供但箱级记录为 0 —— 无对象可挂结果状态字段"
-                       "（非字段漏写）；覆盖零产出已由 C6 判 FAIL 拦下（L1-C8），此处不重复拦下")
-            if _zero_fld:
-                R.warn("C9", "来源 %s 已提供但零字段 —— 未被结果状态闸门覆盖，不得视为已核"
-                       % "、".join(_zero_fld))
-            _miss_parts = []
-            if _zero_obj:
-                _miss_parts.append("来源 coverage 箱级记录为 0（无对象可挂字段，非字段漏写；"
-                                   "覆盖零产出见 C6 FAIL）")
-            if _zero_fld:
-                _miss_parts.append("**未覆盖**来源 %s（有对象无字段，产出方未落 L1-C8 字段）"
-                                   % "、".join(_zero_fld))
-            R.check("C9", "结果状态闭合", "WARN",
-                    "%d 项结果均已定案（settled），但%s —— %s"
-                    % (len(_rs_items), "；".join(_miss_parts), _rs_scope))
-        else:
-            R.check("C9", "结果状态闭合", "PASS",
-                    "%d 项结果均已定案（settled）；%s" % (len(_rs_items), _rs_scope))
+    # 2026-09-30（一百三十一）：逻辑已搬入 conflict_engine.run_c9，此处只调用；
+    #   判据/文案逐字节不变，FAIL 项议题入机读出口（rc 仍以 R.fails 为准）。
+    _track_issues(run_c9(P, C, K, boxes, R))
+    # C9 追加项（2026-10-04 R1 缺陷 D1）：共享窗源节点证据副本必须已降级，否则
+    #   同一物理箱跨节点状态互斥。放在 run_c9 之后同属 C9 域 —— 主闸判「结果项是否定案」，
+    #   本项判「同一个箱有没有被记两次且状态打架」。无共享窗时不产检查行。
+    _track_issues(shared_copy_check(C, R))
 
     # ---------- C10 图签第二来源逐栋比对（2026-09-18 实跑新增，P1） ----------
     # 为什么需要它（实测依据，非设计偏好）：
@@ -924,7 +1275,18 @@ def main():
                 if _best_alt is None or _alt > _best_alt:
                     _best_alt = _alt
             if _best is not None:
-                _p_b[_k] = {"楼": _bn, "单元数": len(_u), "层数": len(_best),
+                # 2026-10-04（R2 缺陷 D3）：层数取 max(有户数的层数, 地上刻度行数)。
+                #   病灶：本项原为「有户数则用『有户数的层数』、**无**户数才回退刻度行数」的
+                #   **全有全无**判据。实测柳辛庄 band1：4#楼/5#楼 楼层表 19 行
+                #   （1F~18F + B1F），但**只有 12F 一行带户数**（其余 null）⇒ _best 长度 1
+                #   ⇒ 层数=1，与图签 18 直接矛盾 → C10 假 FAIL，把已定案的整图拦在出表前
+                #   （实测 2 处不一致 / 共同楼栋 5）。「有 1 行户数」≠「只有 1 层」——
+                #   回退通道不该被**单点**污染关闭。
+                #   取 max 对既有已验证图无影响：凤鸣朝阳 / 云峰 逐栋实测 vals==alt 恒成立
+                #   （R2 报告），仅在两者背离时采信图纸的实际刻度行数。
+                #   户数口径本身不动（仍是契约三口径之一），此处只修「层数」这个派生计数。
+                _p_b[_k] = {"楼": _bn, "单元数": len(_u),
+                            "层数": max(len(_best), _best_alt),
                             "每层户数": max(set(_best), key=_best.count),
                             "各单元层数": sorted(set(_fc))}
             elif _best_alt:
@@ -989,9 +1351,44 @@ def main():
                         "未形成有效比对（空集合不得判 PASS）" % (len(_tb_b), len(_p_b)))
             else:
                 _notes = "；另有 %d 个单元层数不一致的楼（" % len(_nonuni) if _nonuni else ""
+                # 2026-10-01（优化④）：若图签含多栋合并楼名（未参与解析），
+                #   在 PASS 信息后追加说明，消除「须人工裁决」与「PASS」的矛盾感。
+                #   退役条件：当图签解析支持多栋合并楼名自动拆分后，此提示自然消失。
+                _multi_note = ""
+                if TB is not None:
+                    _qr = TB.get("质量报告") or {}
+                    _mb = _qr.get("图签多栋合并楼名(待人工裁决)") or []
+                    if _mb:
+                        _multi_note = "（注：图签含 %d 条多栋合并楼名未参与解析，见 read_titleblock 提示；不影响本次比对）" % len(_mb)
+                # 2026-10-04（P2-A3）：C10 PASS 加注「标准层口径」+ C8 偏离交叉引用。
+                #   病灶：C10 PASS 与 C8 WARN 并存时，PASS 可被误读为「图签确认了所有层户数」，
+                #   实际 C10 用标准层口径（多数层户数），C8 抓的层间偏离正是 C10 不覆盖的维度。
+                #   让矛盾自动浮出，不依赖 Agent 敏锐度去拼。
+                _c8_note = ""
+                if c8_bad:
+                    _c8_detail = "、".join("%s/%s" % (b, u) for b, u, _ in c8_bad)
+                    _c8_note = "（注：C10 用标准层口径逐栋比对；C8 检出 %d 个单元层间户数偏离 → %s，须人工确认是否图纸事实，不因 C10 PASS 而豁免）" % (len(c8_bad), _c8_detail)
                 R.check("C10", "图签第二来源逐栋比对", "PASS",
-                        "%d 栋的 (单元数 / 层数 / 每层户数) 与系统图逐栋一致%s%s"
-                        % (_both, _notes, "）" if _nonuni else ""))
+                        "%d 栋的 (单元数 / 层数 / 每层户数) 与系统图逐栋一致（标准层口径）%s%s%s"
+                        % (_both, _notes, "）" if _nonuni else "", _multi_note + _c8_note))
+
+    # ---------- 冲突议题汇总（2026-09-30 一百三十一，V3 Conflict 机读出口） ----------
+    # 只展示、不参与 rc（rc 仍以各门禁 R.fails 为准）。议题恒为 pending，
+    # 定案只能由 human ruling 在外部闭环，本文件无任何 settled 分支。
+    R.emit()
+    R.emit("--- 冲突议题汇总（Conflict Engine，只展示） ---")
+    _cfsum = summarize_issues(conflict_issues)
+    R.emit("  待裁决议题 %d 项；按类型：%s" % (
+        _cfsum.get("总数", 0),
+        "、".join("%s=%d" % kv for kv in sorted((_cfsum.get("按类型") or {}).items()))
+        or "无"))
+    R.emit("  按域：%s（address=地址对象未定；relation=地址已定、与FX关联未定）" % (
+        "、".join("%s=%d" % kv for kv in sorted((_cfsum.get("按域") or {}).items()))
+        or "无"))
+    for _it in conflict_issues[:20]:
+        R.emit("  ? [%s] %s｜%s" % (_it.get("类型"), _it.get("对象"), _it.get("说明")))
+    if len(conflict_issues) > 20:
+        R.emit("  ... 另有 %d 项未列出" % (len(conflict_issues) - 20))
 
     # ---------- 汇总 ----------
     R.emit()
@@ -1006,18 +1403,25 @@ def main():
     R.emit("=" * 72)
 
     if args.json_out:
+        # 输入指纹（2026-09-29 一百二十七·P0）：记录本次检查过的各输入文件 SHA256，
+        # gen 出表前核对“当前输入 == 被检查过的输入”，堵住“inspect 查 A、gen 用 B”
+        # 的陈旧验证旁路。文件缺席/不可读记 null（显式区分“没检查”与“检查过”）。
+        _fp = {}
+        for _k, _p in (("parse", args.parse_json), ("coverage", args.coverage_json),
+                       ("geom", args.geom_json), ("count_box", args.count_box_json),
+                       ("titleblock", args.titleblock_json)):
+            _fp[_k] = sha256_file(_p) if _p else None
         payload = {"parse": args.parse_json, "coverage": args.coverage_json, "geom": args.geom_json,
                    "count_box": args.count_box_json, "titleblock": args.titleblock_json,
-                   "checks": R.checks, "fails": R.fails, "warns": R.warns, "rc": rc}
+                   "inputs_sha256": _fp,
+                   "checks": R.checks, "fails": R.fails, "warns": R.warns, "rc": rc,
+                   "conflict_issues": conflict_issues}
         # 2026-09-18：写产物前先建父目录。此前未建 —— 目标目录不存在时 open() 直接
         #   Traceback（实测 rc=1、不落任何产物，且报错点远离调用处，排查成本高）。
         #   工具链内其余 16 个写产物的脚本均已做（os.makedirs / ensure_parent），
         #   本脚本是唯一漏网的（全量扫描得出，非只修报出来的那一个）。
-        _parent = os.path.dirname(os.path.abspath(args.json_out))
-        if _parent:
-            os.makedirs(_parent, exist_ok=True)
-        with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        #   2026-09-26 起改走 write_json（内建 ensure_parent + 非有限浮点清洗）。
+        write_json(args.json_out, payload)
         print("机读结果 ->", args.json_out)
     return rc
 

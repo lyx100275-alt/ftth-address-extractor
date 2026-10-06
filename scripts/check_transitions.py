@@ -18,6 +18,19 @@ USER VALIDATION 原地，不算违规；一旦成品落盘，同样的 pending �
   #3 用脚本默认值 / 历史档案消除 pending  裁决台账标「已裁决」但 裁决人 缺失或为脚本/自动标记
   #4 `INSPECT` hard gate FAIL → `ASSEMBLE`  闭包检查结果 rc≠0（有 FAIL）且 成品已生成
   #5 `USER VALIDATION` 尚有 pending → `OUTPUT`  任一台账存在「待裁决」条目 且 成品已生成
+  #6 申报态与证据不符（2026-10-02 新增，见下）  状态.json 的 `当前状态` 落在某节点，
+     但台账/成品/闭包证据不支持该节点 —— 如申报 `LOCKED BASELINE` 而仍有 pending、
+     申报 `OUTPUT`/`READ-BACK VALIDATION` 而成品不存在。
+
+判据 #6 为什么需要（这是本脚本此前唯一的结构性缺口）
+---------------------------------------------------
+#1~#5 全部是「**禁止**的迁移有没有发生」，即**否定式**检查。否定式检查有个
+固有盲区：**状态机没有正向锚点** —— 「我在哪个节点」全靠推断，于是：
+  · 申报走到 `OUTPUT` 而成品根本没生成，没有任何判据会响（#2/#4/#5 都需要成品存在）；
+  · 三本台账齐 + inspect rc=0 就被当成「已过 USER VALIDATION」，而实际上可能仍 pending。
+`ledger_state.py state-set` 提供正向锚点（`状态.json`，`ftth.session_state/v1`），
+本判据把它与实际证据对拍。**未申报不是违规**（老项目无此文件）→ 只判 WARN，
+这样新增观测点不会把存量项目打成 rc=2。
 
 **本脚本只做「有客观判据」的核对**：不推理、不替 Agent 判断某条 pending 该不该存在、
 不自动择一。命中即停（rc=2），把处置交回 Agent 与人。
@@ -52,6 +65,7 @@ for _s in (sys.stdout, sys.stderr):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ledger_state as LS  # noqa: E402  （同目录模块，复用其 schema 常量与读取函数）
+from ftth_common import write_json  # noqa: E402  （产物写盘走统一入口，inf清洗+建父目录）
 
 # 脚本默认值 / 自动标记：命中即视为「不是人的裁决」，用于判据 #1 与 #3。
 # 这些是**形态匹配**（机械可判），不是对裁决内容的判断。
@@ -60,12 +74,24 @@ AUTO_MARKERS = ("默认值", "default", "auto", "自动", "脚本推定", "历�
 # 冲突类条目的形态匹配（判据 #2）。只做词面匹配，不判断冲突是否真实存在。
 CONFLICT_MARKERS = ("冲突", "矛盾", "不一致", "conflict", "contradiction")
 
+# 禁止迁移的条数（判据 #1~#6）。**唯一权威**，SKILL.md 禁止迁移表的行数由
+# check_docs.py D12 对拍 —— 此前「5 条」在 docstring、通过语、SKILL.md 三处各写一遍，
+# 加判据时必漏（本次加 #6 即命中：漏了通过语，机器查不出来）。
+N_FORBIDDEN = 6
+
 
 def _load_json(path):
+    """读 JSON：缺席返 None（调用方按"未初始化/合法缺席"处置）；损坏/不可读
+    同样返 None（保持既有容忍语义），但 stderr 留痕——损坏与缺席严格区分，
+    否则坏文件被当成"没建台账"，永远定位不到（2026-09-26）。
+    """
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        sys.stderr.write("[check_transitions] 读 %s 失败（视作缺席，请人工核对是否文件损坏）: %s\n" % (path, e))
         return None
 
 
@@ -125,6 +151,53 @@ def _product_candidates(project_dir):
 def _has_auto_marker(s):
     s = (s or "").lower()
     return any(m.lower() in s for m in AUTO_MARKERS)
+
+
+def _check_declared_state(led, product, closure, pend, viol, warns, facts):
+    """判据 #6：申报态（状态.json）与实际证据对拍。
+
+    设计取舍三条：
+      1. **只对拍有客观证据的节点**。`PARSE`/`INSPECT` 这类节点的证据是"跑过某命令"，
+         无产物可查 —— 机器判不了就不判（否则就成了假阳性来源）。
+         可判的只有三类：① 申报 ≥ USER VALIDATION 却仍有 pending；
+         ② 申报 ≥ ASSEMBLE 而闭包有 FAIL；③ 申报 ≥ OUTPUT 而成品不存在。
+      2. **未申报只 WARN 不 FAIL**。存量项目没有状态.json，若据此 rc=2 就把
+         「新增观测点」变成「破坏性变更」。
+      3. **不判倒退**。回退（回 REPROBE / USER）是正常作业路径，不是违规。
+    """
+    p = LS._paths(led["dir"])
+    st = _load_json(p["state"])
+    if st is None:
+        warns.append("状态.json 不存在 —— 当前态只能靠推断（三本台账齐 + inspect rc=0 ≈ "
+                     "USER VALIDATION 之后），无机器证据。"
+                     "申报入口：ledger_state.py state-set --state <节点名>")
+        return
+    cur = st.get("当前状态")
+    rank = LS.state_rank(cur) if cur else -1
+    if rank < 0:
+        viol.append("#6 状态.json 的「当前状态」=%r 不在状态机枚举内 —— 申报态不可信，"
+                    "先按 ledger_state.py 的枚举改正。" % (cur,))
+        return
+    facts.append("申报状态：%s（上一态 %s / %s）"
+                 % (cur, st.get("上一状态") or "（首次）", st.get("方向") or "?"))
+
+    # ① 申报已过 USER VALIDATION 却仍有 pending
+    uv = LS.state_rank("USER VALIDATION")
+    if rank >= uv and pend:
+        viol.append("#6 申报状态=%s（已过 USER VALIDATION）但仍有 %d 项「%s」"
+                    "—— 锁定基准未成立即声明越过，状态申报与证据不符。"
+                    % (cur, len(pend), LS.ST_PENDING))
+    # ② 申报已过 ASSEMBLE 而闭包有 FAIL
+    asm = LS.state_rank("ASSEMBLE")
+    if rank >= asm and closure is not None and closure.get("rc"):
+        viol.append("#6 申报状态=%s（已过 ASSEMBLE）但闭包检查 rc=%s（FAIL %d 项）"
+                    "—— hard gate 未过即声明进入组装。"
+                    % (cur, closure.get("rc"), len(closure.get("fails") or [])))
+    # ③ 申报已出表而成品不存在
+    outp = LS.state_rank("OUTPUT")
+    if rank >= outp and not product:
+        viol.append("#6 申报状态=%s 但目录内未发现成品（标准地址表*.xlsx）"
+                    "—— 声称已交付而无交付物。" % cur)
 
 
 def check(project_dir, project, product, closure_path):
@@ -217,6 +290,8 @@ def check(project_dir, project, product, closure_path):
     if closure and product and closure.get("rc"):
         viol.append("#4 闭包检查 rc=%s（FAIL %d 项）而成品已生成 —— hard gate FAIL 不得 ASSEMBLE。"
                     % (closure.get("rc"), len(closure.get("fails") or [])))
+    # ---- 判据 #6：申报态与证据对拍（正向锚点，补 #1~#5 的否定式盲区）----
+    _check_declared_state(led, product, closure, pend, viol, warns, facts)
     return viol, warns, facts, product, (len(missing) == 3)
 
 
@@ -256,18 +331,13 @@ def main(argv=None):
               "（避免把「没核」误读成「核过了」）。")
         rc = 3
     else:
-        print("  [通过] 5 条禁止迁移均未发生。")
+        print("  [通过] %d 条禁止迁移均未发生。" % N_FORBIDDEN)
         rc = 0
 
     if a.json_out:
-        parent = os.path.dirname(os.path.abspath(a.json_out))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(a.json_out, "w", encoding="utf-8") as f:
-            json.dump({"project_dir": os.path.abspath(a.project_dir),
-                       "product": product, "closure": a.closure,
-                       "violations": viol, "warns": warns, "rc": rc},
-                      f, ensure_ascii=False, indent=2)
+        write_json(a.json_out, {"project_dir": os.path.abspath(a.project_dir),
+                                "product": product, "closure": a.closure,
+                                "violations": viol, "warns": warns, "rc": rc})
         print("机读结果 ->", a.json_out)
     return rc
 

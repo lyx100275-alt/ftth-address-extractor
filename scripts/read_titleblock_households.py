@@ -55,7 +55,7 @@ from ftth_common import (ToleranceEstimateError, assign_cells_to_buildings,
                          collect_multi_bldg_labels, collect_titleblock_unit_cells,
                          ensure_console_utf8,
                          estimate_titleblock_tolerances, filter_titleblock_units,
-                         load_geom, UNIT_RE_SRC)
+                         load_geom, UNIT_RE_SRC, write_json)
 
 ensure_console_utf8()
 
@@ -160,7 +160,8 @@ def rename_sites(data, evidence, spec):
         tgt = m.get(bd, bd)
         for bn, v in blds.items():
             if bn in nd[tgt] and nd[tgt][bn] != v:
-                raise SystemExit(f'[错误] 归并 {bd}→{tgt} 时楼号 {bn} 冲突，需人工处理后再运行')
+                sys.stderr.write(f'[错误] 归并 {bd}→{tgt} 时楼号 {bn} 冲突，需人工处理后再运行\n')
+            raise SystemExit(2)  # C2 rc=2：归并冲突须人工（原字符串参数隐式rc=1）
             nd[tgt][bn] = v
             ne[tgt][bn] = evidence.get(bd, {}).get(bn, {})
             if tgt != bd:
@@ -188,7 +189,9 @@ def read_titleblock(dxf, layer, bldg_re, lev_re, unit_re,
                  '、'.join('%s@[%.1f,%.1f]' % (s, x, y) for x, y, s in multi_bldg[:8])))
         print('    └ 这**不是**本脚本可解析的楼名（正则要求整条=单个楼名）——「格内单元 ↔ 各栋」'
               '的对应关系取决于格内单元画序，图上并未逐栋标注 ⇒ 交人工裁决；'
-              '此类图的图签第二来源须说明「本次未参与/仅部分参与」')
+              '此类图的图签第二来源须说明「本次未参与/仅部分参与」'
+              '（注：C10 逐栋比对**不受此影响**——C10 用的是图签逐栋读数 titleblock.json，'
+              '非多栋合并行；若 C10 PASS 则图签交叉校验已通过，此提示仅说明多栋合并行未参与图签解析）')
     if not bl or not lvf:
         # 2026-09-15 效率优化：分离标注 variant fallback
         # 当主正则（如 (\d+)层/(\d+)户 合并写法）匹配不到时，尝试分离写法：
@@ -719,7 +722,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description='读取标注（图签形态）：读出楼栋级 单元数/层数/每层户数')
     ap.add_argument('--dxf', required=True)
     ap.add_argument('--floor-layer', required=True,
-                    help='图签/标题栏所在图层名（必需，禁止默认值）')
+                    help='图签/标题栏所在图层名（必需）。传 "auto" 时从 --config 指定的'
+                         'probe.json 的 titleblock_layer_candidates.候选图层[0] 自动读取')
+    ap.add_argument('--config', default=None,
+                    help='probe.json 路径（--floor-layer auto 时必传，读取图签候选图层）')
     ap.add_argument('--bldg-re', default=r'\d+\s*[#＃号]?\s*楼',
                     help=r'楼名正则，默认匹配 1#楼 / 1号楼 / 1楼')
     ap.add_argument('--lev-re', default=r'(\d+)层/(\d+)户')
@@ -763,6 +769,24 @@ def main(argv=None):
                     help='系统图标题正则（组1=楼号），缺省内置 `(\\d+)(?:#|号楼)`（search 语义）')
     ap.add_argument('--out', required=True)
     a = ap.parse_args(argv)
+
+    # 2026-10-04（P1-E2）：--floor-layer auto 从 probe.json 读图签候选图层
+    #   动机：probe 已给出 titleblock_layer_candidates 候选，但 required=True 断链——
+    #   手动直调漏传即 usage rc=2 浪费一轮。pipeline 已透传正确图层。
+    if a.floor_layer == 'auto':
+        if not a.config or not os.path.isfile(a.config):
+            print('[ERROR] --floor-layer auto 需要 --config <probe.json> 指向探查产物',
+                  file=sys.stderr)
+            sys.exit(1)
+        with open(a.config, 'r', encoding='utf-8') as _f:
+            _probe = json.load(_f)
+        _cands = (_probe.get('titleblock_layer_candidates') or {}).get('候选图层', [])
+        if not _cands:
+            print('[ERROR] probe.json 中无图签候选图层（titleblock_layer_candidates 为空），'
+                  '请显式传 --floor-layer <图层名>', file=sys.stderr)
+            sys.exit(1)
+        a.floor_layer = _cands[0]
+        print('[param] --floor-layer auto → 从 probe.json 取图签候选图层: %s' % a.floor_layer)
 
     # ---------- 几何容差：显式传入优先 -> 缺省则按图自适应 -> 推定值打进结果 ----------
     # 为什么不设固定默认值：这 6 个值与图纸坐标尺度绑定（不同图纸可差几个数量级），
@@ -988,9 +1012,7 @@ def main(argv=None):
             print('[交叉校验] 读取系统图标题图层失败（跳过校验）: %s' % _ex,
                   file=sys.stderr)
 
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
-    with open(a.out, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    write_json(a.out, result)
     print(f'[写出] {a.out}')
     print(f"[质量报告] 楼名{report['楼名标注总数']} 层户{report['层户标注总数']} "
           f"单元{report['单元标注总数']} 出现次数分布{report['出现次数分布']}")

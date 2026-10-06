@@ -56,8 +56,10 @@ import subprocess
 import sys
 import time
 
-sys.stdout.reconfigure(encoding="utf-8")
-sys.stderr.reconfigure(encoding="utf-8")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ftth_common import ensure_console_utf8, write_json
+
+ensure_console_utf8()
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FTTH_PY = os.path.join(HERE, "ftth.py")
@@ -225,8 +227,7 @@ class Batch(object):
         detail = {"batch": batch_name, "planned": planned,
                   "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
                   "items": rows}
-        with open(ov_json, "w", encoding="utf-8") as f:
-            json.dump(detail, f, ensure_ascii=False, indent=2)
+        write_json(ov_json, detail)
         lines = ["# FTTH 批量总览：%s" % batch_name, "",
                  "- 生成时间：%s%s" % (detail["generated_at"],
                                       "（**dry-run 计划，未实际执行**）" if planned else ""),
@@ -337,6 +338,15 @@ class Batch(object):
                  % (batch_name, len(items), "/".join(steps),
                     "  [DRY-RUN]" if args.dry_run else "", args.python))
 
+        # ---- 解释器前置校验（2026-09-27三轮）：docstring默认“当前解释器即启动器确认过的那个”
+        #   仅经 ftth_launcher 启动时成立；裸调 batch 会静默用错解释器（build_vocab 跑 --help
+        #   不 import ezdxf 故零告警，之后逐图 FAIL 浪费整轮）。开工前验一次，失败即停。
+        if not os.path.isfile(args.python):
+            self.err_exit("解释器不存在: %s（--python 须为 python.exe 绝对路径）" % args.python)
+        _ez = subprocess.run([args.python, "-c", "import ezdxf"], capture_output=True, timeout=120)
+        if _ez.returncode != 0:
+            self.err_exit("解释器 %s 无 ezdxf（须经 ftth_launcher 启动，或设 FTTH_PYTHON 并用 --python 显式锁定带 ezdxf 的解释器）" % args.python,
+                          example='python "<技能目录>\\scripts\\ftth_launcher.py" ftth_batch.py --dxf 图A.dxf --out-dir batch_out')
         # ---- 参数表 + 路由（开工前完成，防整轮作废）----
         vocab = self.build_vocab(args.python)
         cli_routed = self.route_params(self.tokenize(passthrough), vocab, "命令行")

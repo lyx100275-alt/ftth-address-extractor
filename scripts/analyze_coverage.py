@@ -35,8 +35,6 @@ import os
 import re
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 from ftth_common import (
     DEFAULT_UNIT_CLUSTER, DEFAULT_VERT_DX, DEFAULT_VERT_DY, DEFAULT_FX_WINDOW,
     DEFAULT_MERGE_TOL, DEFAULT_CONN_TOL,
@@ -47,8 +45,11 @@ from ftth_common import (
     load_dxf, collect_texts, cluster_by_x, match_y_to_floor, assign_floor_by_interval,
     parse_floor_label, clean_text, is_floor_text, attrib_hit, require_params,
     cluster_values_by_gap, measure_column_step, cluster_by_y,
-    RE_DRAWING_WORD, auto_scaled,
+    RE_DRAWING_WORD, auto_scaled, ensure_console_utf8, write_json,
 )
+from coverage_engine import vertical_floor_evidence  # V3 对称：竖线法统一证据唯一入口（纯构造）
+
+ensure_console_utf8()
 
 log = setup_logger("analyze_coverage")
 
@@ -316,6 +317,8 @@ else:
     log.warning("图纸尺度锚：**未定标**（%s）→ 阈值取兜底值（%s），结果须人工复核",
                 DRAW_STEP_WHY,
                 "、".join("%s=%.6g" % (k, AUTO_FALLBACK[k]) for k in AUTO_KEYS))
+    # 退役条件：未定标图纸消亡（探查必产出尺度锚）后，未定标即硬失败，不再兜底。
+    # 注：count_box_icons.py 有同源 AUTO_FALLBACK，两处收口时合并（分支预算纪律 §十一）。
 
 # 归属作业表：[{楼栋, x_lo, x_hi, 单元:[{单元名, 箱:[{编号, 对照表安装楼层}]}]}]
 bldg_jobs = []
@@ -387,8 +390,8 @@ if FX_MAP:
                             + "（已加 --allow-low-pairing，继续执行，结果须人工复核）")
             else:
                 log.error("  [失败] 标题池形态存疑：" + _msg
-                          + " **本次未产出覆盖结果，已按失败退出（码 3）**")
-                sys.exit(3)
+                          + " **本次未产出覆盖结果，已按失败退出（码 2，参数/形态错误非缺席）**")
+                sys.exit(2)
 
     ranges = {}
     for _b in _bands:
@@ -469,13 +472,6 @@ else:
                                         "箱": [{"编号": i, "对照表安装楼层": None} for i in _ids]}]})
 
 # ---------- 3. 楼栋内楼层文字 ----------
-def _is_floor_text(s):
-    """判断一段文字是否为楼层标注（统一走 ftth_common.is_floor_text）。
-
-    支持 3F/17F/-1F/B1/B2/WF；显式传了 --floor-pattern 时额外兼容该正则。
-    """
-    return is_floor_text(s, FLOOR_RE)
-
 
 def floors_in_range(xmin, xmax):
     """楼栋 x 范围内的楼层标注。
@@ -488,7 +484,7 @@ def floors_in_range(xmin, xmax):
     """
     out = []
     for t in all_texts:
-        if not (xmin <= t["x"] <= xmax) or not _is_floor_text(t["内容"]):
+        if not (xmin <= t["x"] <= xmax) or not is_floor_text(t["内容"], FLOOR_RE):
             continue
         if FX_TEXT_XS and min(abs(t["x"] - _fx) for _fx in FX_TEXT_XS) <= args.total_pad:
             continue
@@ -510,6 +506,8 @@ ALL_LAYERS_STAT = {}     # 全图线段图层分布（不受过滤影响，用�
 seg_layer_stat = {}      # 实际参与分析的线段图层分布
 segments = []
 _skipped_symbols = 0     # 被识别为"箱图形符号"而排除的多段线数
+_symbol_err = 0          # 符号判定时 get_points 异常数（2026-09-26：异常按非符号
+                         # 计入线段，须计数汇总，禁静默吞错）
 
 
 def _wire_ok(layer):
@@ -535,6 +533,8 @@ def _is_box_symbol_entity(e):
         ys = [p[1] for p in pts]
         return (max(xs) - min(xs)) <= FX_SYM_MAX and (max(ys) - min(ys)) <= FX_SYM_MAX
     except Exception:
+        global _symbol_err
+        _symbol_err += 1
         return False
 
 
@@ -586,6 +586,8 @@ if segments:
     log.info("线段图层来源（参与分析）: " + ", ".join(f"{k}={v}" for k, v in top))
     if _skipped_symbols:
         log.info("已排除分纤箱图形符号 %d 个（闭合小多段线，非线缆）", _skipped_symbols)
+    if _symbol_err:
+        log.warning("符号判定中 get_points 异常 %d 个（已按非符号计入线段，须人工确认非符号误入）", _symbol_err)
 else:
     log.error("过滤后没有任何线段参与分析，请检查 --wire-layer 是否写错（见 JSON 的『线段图层来源统计』）")
 
@@ -611,6 +613,7 @@ def _attrib_ok(e):
             vals[a.dxf.tag] = a.dxf.text or ""
     except Exception:
         vals = {}
+        log.debug("INSERT 属性读取异常，按空属性集参与判定（无筛选条件时仍命中，有条件时交 attrib_hit 判定）")
     if args.insert_attrib_tag is None and INSERT_VAL_KEYS is None:
         return True, vals
     TAGS = [t.strip() for t in (args.insert_attrib_tag or "").split(",") if t.strip()]
@@ -737,8 +740,8 @@ if fx_symbols and bldg_jobs:
         if args.allow_low_pairing:
             log.warning("  [警告] " + _msg + "（已加 --allow-low-pairing，继续执行，结果须人工复核）")
         else:
-            log.error("  [失败] " + _msg + " **本次未产出覆盖结果，已按失败退出（码 3）**")
-            sys.exit(3)
+            log.error("  [失败] " + _msg + " **本次未产出覆盖结果，已按失败退出（码 2，参数/形态错误非缺席）**")
+            sys.exit(2)
 
 # ---------- 6. 竖干拼接 ----------
 def is_vertical_seg(seg, dx_tol, dy_tol):
@@ -958,10 +961,10 @@ for bldg_job in bldg_jobs:
         log.error(
             "  [失败] %s：对照表有 %d 个箱，但本楼栋 x 范围内找不到任何箱图形符号"
             "（--fx-symbol-layer=%s）→ 箱位将回退编号文字坐标，覆盖计算必然失真，"
-            "已按失败退出（码 3）。处置：① 核对 --fx-symbol-layer 是否为符号所在图层；"
+            "已按失败退出（码 2，数据/参数错误非缺席）。处置：① 核对 --fx-symbol-layer 是否为符号所在图层；"
             "② 确认本图确实无符号画法后加 --allow-low-pairing 强行继续（结果须人工复核）。",
             bldg_name, len(_all_boxes), args.fx_symbol_layer or "未提供")
-        sys.exit(3)
+        sys.exit(2)
 
     if _box_syms and _all_boxes:
         _cand = []
@@ -1022,10 +1025,10 @@ for bldg_job in bldg_jobs:
             log.error(
                 "  [失败] %s：箱符号可信配对率 %.0f%%（%d/%d）< 30%% —— "
                 "符号层/对照表安装层/图层参数至少一项错位，继续跑只会产出错误数据，"
-                "已按失败退出（码 3）。核对 --fx-symbol-layer 与对照表『安装楼层』口径；"
+                "已按失败退出（码 2，数据/参数错误非缺席）。核对 --fx-symbol-layer 与对照表『安装楼层』口径；"
                 "确属图面特殊情况可加 --allow-low-pairing 强行继续。",
                 bldg_name, _rate * 100, _ok_n, len(_all_boxes))
-            sys.exit(3)
+            sys.exit(2)
         _unclaimed = [_box_syms[i] for i in range(len(_box_syms)) if i not in _used_s]
         if _unclaimed:
             pairing_note["未认领箱符号"] = [
@@ -1265,7 +1268,16 @@ for bldg_job in bldg_jobs:
                 "安装楼层_区间法": f_install,
                 "安装楼层_总图直写": _tb,
                 "安装楼层一致性": _consistency,
+                # V3 对称（2026-09-30 一百三十七）：竖线法统一证据随行；
+                # 分支与上方案口径一一对应，判据/rc不动，老产物无字段时 C3 走 legacy。
+                "安装楼层统一": vertical_floor_evidence(
+                    box_id, _final, bool(_tb), "x%.1f" % bx),
                 "覆盖范围线索": coverage_clue,
+                # 2026-09-27 P0-3 补（产出方落地）：C6 校验读箱级 `判定依据`（inspect_closure cmap
+                # 第 5 元），此前只写在嵌套 `覆盖范围线索` 内导致 23/23 全量误报「不可枚举」。
+                # 判定依据/依据来源 两字段在箱级与线索内各留一份，值同源。
+                "判定依据": (coverage_clue or {}).get("判定依据") or "待确认",
+                "依据来源": (coverage_clue or {}).get("依据来源"),
                 "关联皮线": [
                     {"设备x": d["设备x"], "设备y": d["设备y"], "设备名": d["设备名"], "层": d["层"]}
                     for d in box_drops
@@ -1473,26 +1485,39 @@ if not result.get("楼栋"):
 _pend_items = pending_items_from_rulings(result.get("需人工裁决"))
 
 
-def _pend_scope(objs, unit_name, box_id, bldg_key=None):
-    """兼容层 —— 范围判定已抽到 **ftth_common.judge_pending_scope**（2026-09-18 统一）。
-
-    两个覆盖脚本（竖线法 / V 型法）此前各写一份，已发生漂移：V 型法那份落后为
-    子串包含判据（`"4#楼" in "4#配套楼/FX22#"` 失配 ⇒ 裁决项静默放行；`7#楼` 命中
-    `17#楼` ⇒ 跨号误伤），且只认斜杠式对象串。现全技能只保留共享模块一份实现，
-    此处仅作薄封装，避免调用点大改。
-    """
-    return judge_pending_scope(objs, unit_name, box_id, bldg_key)
-
-
 _st_settled = _st_pending = 0
+# 2026-10-04（R1 缺陷 D1，与 V 型法同源同修）：共享窗**证据副本**不计入结果状态。
+#   判据与来源：见 analyze_coverage_vshape.py 同名块。本脚本当前不产共享窗节点，
+#   此块为**同一口径的对称实现**（有则生效、无则零成本），避免两个覆盖脚本再次漂移。
+_expanded_copies = set()
+for _nk, _nv in (result.get("楼栋") or {}).items():
+    if not isinstance(_nv, dict):
+        continue
+    for _nuk, _nuv in ((_nv.get("单元") or {}) or {}).items():
+        _sw = (_nuv or {}).get("来源共享窗")
+        if not _sw:
+            continue
+        for _nbx in ((_nuv or {}).get("分纤箱") or []):
+            _expanded_copies.add((str(_sw), str(_nuk), str(_nbx.get("编号"))))
+_st_copy = 0
+
 for _bk, _bv in (result.get("楼栋") or {}).items():
     for _uk, _uv in ((_bv or {}).get("单元") or {}).items():
-        _unit_pend = any(_pend_scope(_objs, _uk, None, _bk)[0]
+        _src_win = (_uv or {}).get("来源共享窗")
+        _unit_pend = any(judge_pending_scope(_objs, _uk, None, _bk, _src_win)[0]
                          for _objs, _blk in _pend_items if _blk)
         for _bx in (_uv.get("分纤箱") or []):
+            if (str(_bk), str(_uk), str(_bx.get("编号"))) in _expanded_copies:
+                _bx.pop("result_origin", None)
+                _bx.pop("result_confirmation", None)
+                _bx["副本归属"] = ("共享窗证据副本：归属见成员楼栋条目"
+                                "（来源共享窗=%s）" % _bk)
+                _st_copy += 1
+                continue
             _cov = (_bx.get("覆盖范围线索") or {}).get("覆盖楼层") or []
             _bx["result_origin"] = "derived" if (_cov and _bx.get("安装楼层")) else "unresolved"
-            _box_pend = any(_pend_scope(_objs, _uk, _bx.get("编号"), _bk)[1]
+            _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get("编号"), _bk,
+                                                _src_win)[1]
                             for _objs, _blk in _pend_items if _blk)
             _bx["result_confirmation"] = ("pending"
                                           if (_unit_pend or _box_pend
@@ -1511,16 +1536,15 @@ result["结果状态说明"] = {
     "origin 取值含义": "measured=图上直读/几何测量；derived=按规则算出（竖干断口+区间法对位）；unresolved=无解",
     "confirmation 取值含义": "settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）",
     "统计": {"settled": _st_settled, "pending": _st_pending},
+    "共享窗证据副本（不计入统计）": _st_copy,
     "判 pending 的条件": ("本单元/本箱命中「需人工裁决」中**未标 阻塞=false** 的条目"
                        "（范围判定走 ftth_common.judge_pending_scope 精确口径）"),
 }
 
 try:
-    os.makedirs(os.path.dirname(os.path.abspath(OUT)) or ".", exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-except IOError as e:
+        write_json(OUT, result, log=log)
+except OSError as e:  # C2 rc=4：写盘失败（含ensure_parent；IOError过窄）
     log.error(f"无法写入输出文件: {OUT}\n{e}")
-    sys.exit(1)
+    sys.exit(4)  # C2 rc=4：写盘失败
 
 log.info(f"\n覆盖范围线索分析完成 → {OUT}")
