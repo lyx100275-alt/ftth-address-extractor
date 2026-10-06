@@ -21,3 +21,5 @@ __pycache__/
 标准地址表*.xlsx
 *_解析结果.json
 _ftth_*.json
+# 真实图纸语料永不出本机（图纸数据不出本机纪律；tests/corpus 仅版本库本地保管，禁止入 git 历史与远端）
+tests/corpus/
