@@ -14,6 +14,7 @@ python tests/run_smoke.py --with-dxf --corpus "<版本库>/ftth-address-extracto
 
 > 注意：上例目录名以本机实际 `技能版本库` 为准，换机先 `dir` 确认；
 > 三处解析顺序为 `--corpus` > `FTTH_TEST_DXF` > 技能内置路径，三者皆无则 T5 自动 SKIP（不阻断）。
+> CI 如需缺料即失败：置 `FTTH_REQUIRE_CORPUS=1` 后跑冒烟，T5/T14 的缺料 SKIP 转 FAIL；结尾另打印 SKIP 清单。
 
 
 

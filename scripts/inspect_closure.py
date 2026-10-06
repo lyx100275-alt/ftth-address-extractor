@@ -45,6 +45,7 @@ from ftth_common import floor_num  # 楼层归一统一入口（B1/B2/WF/3F/-1F�
 from ftth_common import norm_floor  # 全技能唯一实现（2026-09-27收敛双副本，含室剥离+N层回退）
 # 覆盖判定依据的机器词表唯一来源（2026-09-27 P0-3）：本模块只引用，不另抄一份。
 from ftth_common import coverage_method_of, COVERAGE_METHODS  # C6 判定依据枚举校验
+from ftth_common import is_shared_title  # 「一窗多栋」共享标题判据（全技能唯一实现，C9 追加项用）
 import json
 import os
 import re
@@ -54,7 +55,8 @@ from ftth_common import ensure_console_utf8, write_json, sha256_file
 from conflict_engine import (  # V3 Conflict 层：议题构造与纯集合运算唯一入口（只产议题、不定案）
     collect_fxmap_gap, fxmap_issues, collect_unassigned,
     floor_mismatch_issue, run_c9, summarize as summarize_issues,
-    issue as _new_issue, ISSUE_MISSING_RECORD, ISSUE_FLOOR_MISMATCH)
+    issue as _new_issue, ISSUE_MISSING_RECORD, ISSUE_FLOOR_MISMATCH,
+    ISSUE_PENDING_STATE)
 
 ensure_console_utf8()
 
@@ -108,6 +110,76 @@ def count_box_summary(K):
     if bad:
         parts.append("刻度偏移异常列 %d 个（该列归层不可信，须人工核对后重跑）" % len(bad))
     return "；".join(parts)
+
+
+def shared_copy_check(C, R):
+    """C9 追加：共享窗**源节点**的证据副本必须已降级（2026-10-04 R1 缺陷 D1）。
+
+    形态（实测某分带图）：`[共享]N-M号楼综合布线系统图` 窗节点自身产出了一份箱记录；
+    同一批箱又被「共享组逐楼栋展开」复制进成员楼栋条目（该单元带 `来源共享窗` == 窗键）。
+    两处都带 result_confirmation 时，同一物理箱被计两次，且状态可能互斥 —— 窗节点按
+    **整窗**作用域判 pending、成员楼栋按**本栋**判 settled。后果：C9 主闸以「幽灵 pending」
+    把整链拦在出表前（成员侧本已 settled），或反向经 apply_ruling 把副本重写回 settled
+    造成假绿。故：**已展开到成员楼栋**的源节点副本必须已去 result_origin /
+    result_confirmation、留 `副本归属` 指针；未降级即 FAIL 并逐箱列出。
+
+    **未展开**（成员侧无任何 `来源共享窗` == 该窗键的条目）时，窗节点是唯一载体，照旧带
+    字段 —— 降级即丢解，故不判 FAIL。本项在无共享窗时不产检查行（不适用，不冒充已核）。
+
+    不做的事：不自动降级（产出方职责），不判谁对谁错（L0-I4，只登记议题）。
+    """
+    if not isinstance(C, dict):
+        return []
+    buildings = C.get("楼栋") or {}
+    if not any(is_shared_title(_k) for _k in buildings):
+        return []
+    bad = []
+    for _bk, _bv in buildings.items():
+        if not isinstance(_bv, dict) or not is_shared_title(_bk):
+            continue
+        # 成员楼栋侧持有的箱号（按 来源共享窗 == 本窗键）
+        member_codes = set()
+        for _obk, _obv in buildings.items():
+            if _obk == _bk or not isinstance(_obv, dict):
+                continue
+            for _uk, _uv in ((_obv.get("单元") or {}) or {}).items():
+                if not isinstance(_uv, dict):
+                    continue
+                if str(_uv.get("来源共享窗") or "").strip() != str(_bk).strip():
+                    continue
+                for _bx in (_uv.get("分纤箱") or []):
+                    if isinstance(_bx, dict) and str(_bx.get("编号") or "").strip():
+                        member_codes.add(str(_bx["编号"]).strip())
+        if not member_codes:
+            continue                      # 未展开 ⇒ 源节点是唯一载体，不得降级
+        for _uk, _uv in ((_bv.get("单元") or {}) or {}).items():
+            if not isinstance(_uv, dict):
+                continue
+            for _bx in (_uv.get("分纤箱") or []):
+                if not isinstance(_bx, dict):
+                    continue
+                _code = str(_bx.get("编号") or "").strip()
+                if _code and _code in member_codes and (
+                        "result_confirmation" in _bx or "result_origin" in _bx):
+                    bad.append((_bk, _uk, _code, _bx.get("result_confirmation")))
+    if bad:
+        for _bk, _uk, _code, _st in bad[:20]:
+            R.emit("  x 共享窗源节点 %s/%s 副本 %s 未降级（confirmation=%s）"
+                   % (_bk, _uk, _code, _st))
+        if len(bad) > 20:
+            R.emit("  ... 另有 %d 项未列出" % (len(bad) - 20))
+        R.check("C9", "共享窗证据副本降级", "FAIL",
+                "%d 个源节点副本仍带结果状态字段 —— 成员侧已展开同号箱，"
+                "跨节点状态互斥（幽灵 pending 或反向假绿）" % len(bad))
+        return [_new_issue(ISSUE_PENDING_STATE, _code,
+                           candidates=["源节点=%s/%s" % (_bk, _uk),
+                                       "confirmation=%s" % _st],
+                           evidence=["共享窗证据副本未降级，与成员楼栋同号箱并存"],
+                           note="同一物理箱跨节点状态互斥；产出方须降级副本并留 `副本归属`")
+                for _bk, _uk, _code, _st in bad]
+    R.check("C9", "共享窗证据副本降级", "PASS",
+            "共享窗源节点副本已全部降级（或该窗未展开到成员楼栋）")
+    return []
 
 
 def _c7_one_line(it):
@@ -390,7 +462,12 @@ def main():
                         (blk, un, fx.get("安装楼层"),
                          (fx.get("覆盖范围线索") or {}).get("覆盖楼层"),
                          fx.get("判定依据"),
-                         fx.get("安装楼层统一") or {}))
+                         fx.get("安装楼层统一") or {},
+                         # r[6]=依据来源（2026-10-05 一百五十九新增，仅 C6 判性质用）：
+                         #   覆盖为空有两种截然不同的成因，此前一律报「缺线索」，把
+                         #   「两来源不一致、待裁决」伪装成「没找到线索」，人工据此会
+                         #   往「补提取逻辑」的错误方向排查；实为有线索但冲突、须裁决。
+                         fx.get("依据来源")))
     # 2026-09-30（一百三十，V3 Evidence）：parse 侧统一楼层上下文索引
     #   （只读展示用；comparison 判据仍是 legacy 安装楼层归一值，不动）。
     punified = {}
@@ -651,16 +728,32 @@ def main():
                     R.emit("  ✗ 对照表有、parse 无：%s" % _m)
                     R.fail("C4b", "%s 对照表有、parse 无（改派漏斗丢失）" % _m)
                 for _e in _extra[:20]:
-                    R.emit("  ✗ parse 有、对照表无：%s" % _e)
-                    R.fail("C4b", "%s parse 有、对照表无" % _e)
-                if _un_set and not _missing:
-                    for _u in sorted(_un_set)[:20]:
-                        R.emit("  ✗ 对照表有、parse 未归属：%s" % _u)
-                    R.fail("C4b", "%d 个编号未归属（%s）—— 对照表已定归属、parse 未落位，不得出表"
-                           % (len(_un_set), "、".join(sorted(_un_set)[:12])))
+                    R.emit("  ✗ parse 已归属、对照表无：%s" % _e)
+                    R.fail("C4b", "%s parse 已归属、对照表无" % _e)
+                # 2026-10-05（一百五十九）：① 去掉 `and not _missing` —— 旧写法在有
+                #   missing 时**整段不报未归属**，属漏报；② 未归属按「是否在对照表内」
+                #   分两类报（见 conflict_engine.collect_fxmap_gap 同名注释），不再与
+                #   extra 混算（旧口径会把同一批编号同时报成「parse 有对照表无」和
+                #   「对照表有 parse 未归属」两种矛盾说法）。
+                if _un_set:
+                    _uin = _gap.get("unassigned_in") or []
+                    _uout = _gap.get("unassigned_out") or []
+                    if _uin:
+                        R.emit("  ✗ 对照表已定归属、parse 未落位（%d）：%s"
+                               % (len(_uin), "、".join(_uin[:12])))
+                        R.fail("C4b", "%d 个编号未落位（%s）—— 对照表已定归属、parse 未落位，"
+                                      "不得出表" % (len(_uin), "、".join(_uin[:12])))
+                    if _uout:
+                        R.emit("  ✗ parse 收录、对照表无此编号，且未落位（%d）：%s"
+                               % (len(_uout), "、".join(_uout[:12])))
+                        R.fail("C4b", "%d 个编号对照表外且未落位（%s）—— 需人工确认是否属本图"
+                               % (len(_uout), "、".join(_uout[:12])))
                 R.check("C4b", "对照表对账", "FAIL",
-                        "对照表 %d / parse已归属 %d / 未归属 %d；缺失 %d、多余 %d"
+                        "对照表 %d / parse已归属 %d / 未归属 %d（表内 %d、表外 %d）；"
+                        "缺失 %d、已归属多余 %d"
                         % (int(_gap.get("expected") or 0), _n_asg, len(_un_set),
+                           len(_gap.get("unassigned_in") or []),
+                           len(_gap.get("unassigned_out") or []),
                            len(_missing), len(_extra)))
             else:
                 R.check("C4b", "对照表对账", "PASS",
@@ -699,13 +792,32 @@ def main():
     #   「图上确实没有户数」与「我没读到户数」必须可区分。
     #   本项只**登记事实**、不下结论（地下车库/设备层/储藏层都是合法图面事实）。
     blank_rows = []             # (楼栋, 单元, 层名)
+    # 2026-10-05（P1）：**整单元 100% 空**需与「个别层无标注」分开登记。
+    #   背景：多单元/多栋共享同一系统图时，户数列常只有**一条**，而文字按 x 轴
+    #   划归单元时该列只落进其中一个单元 —— 其余单元整张楼层表全空。此时若只报
+    #   「N 个层行有刻度无户数」，会被读成「地下车库/设备层等合法图面事实」，
+    #   而真量级是**少计了整栋的一半**（实测某图 2 单元楼：图签 60 户 / 直读 30 户）。
+    #   「个别层空」与「整单元空」是两回事，混报即把未核呈现成已核。此处只**登记**，
+    #   不代判归属（共用列归谁只能由人裁）。
+    # 索引：0 总层行 / 1 两列皆空行 / 2 户数合计 / 3 **户数缺失行**（含"有布线但无户数"）
+    _unit_stat = {}
     for blk, un, fltab in units:
         rows = []
+        _st = _unit_stat.setdefault((blk, un), [0, 0, 0, 0])
         for fname, fv in fltab.items():
             hu, bx = fv.get("户数"), fv.get("布线")
+            _st[0] += 1
+            if hu is None:
+                _st[3] += 1          # 户数缺失（布线是否存在不影响，见下）
+            else:
+                try:
+                    _st[2] += int(hu)
+                except (TypeError, ValueError):
+                    _st[3] += 1
             if hu is not None or bx is not None:
                 rows.append((fv.get("fl_num", norm_floor(fname)), fname, hu, bx))
             else:
+                _st[1] += 1
                 blank_rows.append((blk, un, fname))
         rows.sort(key=lambda r: (r[0] is None, r[0]))
         subtotal = sum(r[2] for r in rows if isinstance(r[2], int))
@@ -735,16 +847,54 @@ def main():
     else:
         _c5_note = ("整图户数合计 %d（来源：楼层表户数列，非空户数行 %d/%d）"
                     % (grand, n_hu_total, n_rows_total))
+        # ---- 整单元户数缺失检测：**独立于 blank_rows**（否则「全图每层都有布线值」时
+        #   blank_rows 为空，本检测会被整段跳过，而那恰恰是最需要报警的形态）。
+        #   口径必须是**户数缺失**（v[3]），不能是「两列皆空」（v[1]）：实测存在
+        #   「布线读到了（32m*2）、户数却是 None」的层 —— 它们不是 blank_rows，
+        #   于是在 C5 里既不进明细也不告警，户数凭空少一半却全无提示。
+        _all_blank = [(k, v) for k, v in _unit_stat.items()
+                      if v[0] > 0 and v[3] == v[0]]
+        if _all_blank:
+            _sib = {}
+            for (b, u), v in _unit_stat.items():
+                if v[2] > 0:
+                    _sib.setdefault(b, []).append((u, v[2]))
+            _susp = [(k, v) for k, v in _all_blank if k[0] in _sib]
+            if _susp:
+                # 注意：文案里的 100%% 是 %-格式化的转义（`100% ` 会被当成占位符）
+                R.emit("  ↓ ⚠ **整单元「户数」列 100%% 缺失**（%d 个）—— 同楼栋另有单元"
+                       "读到了户数，高度疑似「多单元共用同一条户数列、文字按 x 轴只归了"
+                       "其中一个单元」；此类单元的户号**不会生成**，出表将少计："
+                       % len(_susp))
+                for (b, u), v in _susp[:20]:
+                    _bro = "、".join("%s(%d户)" % (bu, bh) for bu, bh in _sib.get(b, []))
+                    R.emit("      %s/%s：%d 层户数全缺；同楼有户数的单元：%s"
+                           % (b, u, v[0], _bro or "(无)"))
+                if len(_susp) > 20:
+                    R.emit("      ... 另有 %d 个未列出" % (len(_susp) - 20))
+        _n_hu_missing_partial = (sum(v[3] for v in _unit_stat.values())
+                                 - sum(v[0] for k, v in _all_blank))
+        if _n_hu_missing_partial > 0:
+            R.emit("  ↓ 另有 %d 个层行「布线」有值而「户数」缺失（不构成整单元缺失，"
+                   "同样不生成户号）" % _n_hu_missing_partial)
         if blank_rows:
             R.emit("  ↓ 有楼层刻度、但「户数/布线」两列皆空的层（%d 行）：" % len(blank_rows))
             for _b, _u, _f in blank_rows[:40]:
                 R.emit("      %s/%s/%s" % (_b, _u, _f))
             if len(blank_rows) > 40:
                 R.emit("      ... 另有 %d 行未列出" % (len(blank_rows) - 40))
-            R.check("C5", "楼层表直读清单", "WARN",
-                    _c5_note + ("；另有 %d 个层行**有楼层刻度但无户数/布线标注** —— "
-                                "按 Step 1c 这些层不生成户号，须人工确认是否图纸事实"
-                                "（地下车库/设备层/储藏层等），明细见上" % len(blank_rows)))
+            _c5_extra = ("；另有 %d 个层行**有楼层刻度但无户数/布线标注** —— "
+                         "按 Step 1c 这些层不生成户号，须人工确认是否图纸事实"
+                         "（地下车库/设备层/储藏层等），明细见上" % len(blank_rows))
+        else:
+            _c5_extra = ""
+        if _all_blank:
+            _c5_extra += ("；**%d 个单元「户数」列整单元缺失**（见上 ⚠ 段）—— 与"
+                          "「个别层无标注」性质不同，实测多为多单元共用户数列而 x 轴只归了"
+                          "一个单元；不得按地下车库层等图面事实处理，确认前不得出表"
+                          % len(_all_blank))
+        if _c5_extra:
+            R.check("C5", "楼层表直读清单", "WARN", _c5_note + _c5_extra)
         else:
             R.check("C5", "楼层表直读清单", "INFO", _c5_note)
 
@@ -896,6 +1046,7 @@ def main():
             R.check("C6", "覆盖闭合", "SKIP", "未提供 coverage JSON")
     else:
         n_ok = n_noclue = n_outof = 0
+        n_cluepend = 0   # 2026-10-05（一百五十九）：覆盖为空但属「两来源不一致待裁决」的箱数
         n_badbasis = 0   # 2026-09-27（P0-3）：判定依据不在覆盖方法枚举内的箱数
         # 2026-09-19 修复（与 C3 同一条件、同一处置）：coverage 提供了 JSON，但**箱级
         #   记录为 0** 时，上面那个 `for blk, un, fid, ... in boxes` 循环里每个箱都会
@@ -948,9 +1099,23 @@ def main():
                         R.fail("C6", "%s 判定依据不在覆盖方法枚举内" % fid)
                         n_badbasis += 1
                 if not any(clue_sets):
-                    R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
-                    R.fail("C6", "%s 缺覆盖范围线索" % fid)
-                    n_noclue += 1
+                    # 2026-10-05（一百五十九）：覆盖为空须**分因**呈现，不得一律说「缺线索」。
+                    #   实测柳辛庄某带 24 箱记录中 8 箱覆盖为空，其依据来源逐字写着
+                    #   「…（两来源不一致，待裁决）」、性质写着「…待确认」—— 是**有线索
+                    #   但两来源冲突、须人工裁决**，与「压根没找到线索」是两回事。混报会
+                    #   把「待裁决」呈现成「已尽力但无线索」，方向相反。两类均不得出表，
+                    #   故都计 FAIL，仅分类与报文不同。
+                    _src_txt = " ".join(str(r[6]) for r in recs if len(r) > 6 and r[6])
+                    if any(_k in _src_txt for _k in ("待裁决", "待确认", "不一致")):
+                        R.emit("  ✗ %s（%s/%s）覆盖**两来源不一致、待裁决**（非「无线索」）"
+                               " —— 明细见 C7 需人工裁决清单；不得按「补提取」方向排查"
+                               % (fid, blk, un))
+                        R.fail("C6", "%s 覆盖两来源不一致待裁决（非缺线索，见 C7）" % fid)
+                        n_cluepend += 1
+                    else:
+                        R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
+                        R.fail("C6", "%s 缺覆盖范围线索" % fid)
+                        n_noclue += 1
                     continue
                 fln = norm_floor(fl)
                 covered = any(fln in {norm_floor(x) for x in cs} for cs in clue_sets if cs)
@@ -966,10 +1131,14 @@ def main():
                 R.check("C6", "覆盖闭合", "FAIL",
                         "parse 侧 0 箱，覆盖闭合无对象可核（空集合不得判 PASS）")
             else:
-                st = "PASS" if (n_noclue == 0 and n_outof == 0 and n_badbasis == 0) else "FAIL"
+                st = ("PASS" if (n_noclue == 0 and n_outof == 0 and n_badbasis == 0
+                                 and n_cluepend == 0) else "FAIL")
+                # 2026-10-05（一百五十九）：`覆盖待裁决` 单独计数并写进状态串 —— 与
+                #   「缺线索」分列，人工据此知道该去裁决还是去补提取（两者处置相反）。
                 R.check("C6", "覆盖闭合", st,
-                        "闭合 %d / 缺线索 %d / 安装层越界 %d / 判定依据不可枚举 %d"
-                        % (n_ok, n_noclue, n_outof, n_badbasis))
+                        "闭合 %d / 缺线索 %d / 覆盖待裁决 %d / 安装层越界 %d / "
+                        "判定依据不可枚举 %d"
+                        % (n_ok, n_noclue, n_cluepend, n_outof, n_badbasis))
 
     # ---------- C7 覆盖自检透传 ----------
     R.emit()
@@ -1026,6 +1195,10 @@ def main():
     # 2026-09-30（一百三十一）：逻辑已搬入 conflict_engine.run_c9，此处只调用；
     #   判据/文案逐字节不变，FAIL 项议题入机读出口（rc 仍以 R.fails 为准）。
     _track_issues(run_c9(P, C, K, boxes, R))
+    # C9 追加项（2026-10-04 R1 缺陷 D1）：共享窗源节点证据副本必须已降级，否则
+    #   同一物理箱跨节点状态互斥。放在 run_c9 之后同属 C9 域 —— 主闸判「结果项是否定案」，
+    #   本项判「同一个箱有没有被记两次且状态打架」。无共享窗时不产检查行。
+    _track_issues(shared_copy_check(C, R))
 
     # ---------- C10 图签第二来源逐栋比对（2026-09-18 实跑新增，P1） ----------
     # 为什么需要它（实测依据，非设计偏好）：
@@ -1102,7 +1275,18 @@ def main():
                 if _best_alt is None or _alt > _best_alt:
                     _best_alt = _alt
             if _best is not None:
-                _p_b[_k] = {"楼": _bn, "单元数": len(_u), "层数": len(_best),
+                # 2026-10-04（R2 缺陷 D3）：层数取 max(有户数的层数, 地上刻度行数)。
+                #   病灶：本项原为「有户数则用『有户数的层数』、**无**户数才回退刻度行数」的
+                #   **全有全无**判据。实测柳辛庄 band1：4#楼/5#楼 楼层表 19 行
+                #   （1F~18F + B1F），但**只有 12F 一行带户数**（其余 null）⇒ _best 长度 1
+                #   ⇒ 层数=1，与图签 18 直接矛盾 → C10 假 FAIL，把已定案的整图拦在出表前
+                #   （实测 2 处不一致 / 共同楼栋 5）。「有 1 行户数」≠「只有 1 层」——
+                #   回退通道不该被**单点**污染关闭。
+                #   取 max 对既有已验证图无影响：凤鸣朝阳 / 云峰 逐栋实测 vals==alt 恒成立
+                #   （R2 报告），仅在两者背离时采信图纸的实际刻度行数。
+                #   户数口径本身不动（仍是契约三口径之一），此处只修「层数」这个派生计数。
+                _p_b[_k] = {"楼": _bn, "单元数": len(_u),
+                            "层数": max(len(_best), _best_alt),
                             "每层户数": max(set(_best), key=_best.count),
                             "各单元层数": sorted(set(_fc))}
             elif _best_alt:
@@ -1176,9 +1360,17 @@ def main():
                     _mb = _qr.get("图签多栋合并楼名(待人工裁决)") or []
                     if _mb:
                         _multi_note = "（注：图签含 %d 条多栋合并楼名未参与解析，见 read_titleblock 提示；不影响本次比对）" % len(_mb)
+                # 2026-10-04（P2-A3）：C10 PASS 加注「标准层口径」+ C8 偏离交叉引用。
+                #   病灶：C10 PASS 与 C8 WARN 并存时，PASS 可被误读为「图签确认了所有层户数」，
+                #   实际 C10 用标准层口径（多数层户数），C8 抓的层间偏离正是 C10 不覆盖的维度。
+                #   让矛盾自动浮出，不依赖 Agent 敏锐度去拼。
+                _c8_note = ""
+                if c8_bad:
+                    _c8_detail = "、".join("%s/%s" % (b, u) for b, u, _ in c8_bad)
+                    _c8_note = "（注：C10 用标准层口径逐栋比对；C8 检出 %d 个单元层间户数偏离 → %s，须人工确认是否图纸事实，不因 C10 PASS 而豁免）" % (len(c8_bad), _c8_detail)
                 R.check("C10", "图签第二来源逐栋比对", "PASS",
-                        "%d 栋的 (单元数 / 层数 / 每层户数) 与系统图逐栋一致%s%s%s"
-                        % (_both, _notes, "）" if _nonuni else "", _multi_note))
+                        "%d 栋的 (单元数 / 层数 / 每层户数) 与系统图逐栋一致（标准层口径）%s%s%s"
+                        % (_both, _notes, "）" if _nonuni else "", _multi_note + _c8_note))
 
     # ---------- 冲突议题汇总（2026-09-30 一百三十一，V3 Conflict 机读出口） ----------
     # 只展示、不参与 rc（rc 仍以各门禁 R.fails 为准）。议题恒为 pending，

@@ -166,9 +166,20 @@ def collect_fxmap_gap(expected_list, expected_count, assigned_ids, unassigned_id
         _un = set()
     if _exp_set:
         _missing = sorted(_exp_set - _asg - _un)
-        _extra = sorted((_asg | _un) - _exp_set)
+        # 2026-10-05（一百五十九）：extra **只算已归属里多出来的**，不再并入未归属。
+        #   旧口径 `_extra = (_asg | _un) - _exp_set` 会把「已收录但未落位」的编号
+        #   同时算进 extra，于是同一批编号在 C4b 里被以两种互相矛盾的说法各报一次：
+        #     ① "parse 有、对照表无"（暗示 parse 多找了编号）
+        #     ② "对照表有、parse 未归属"（暗示 parse 没落位）
+        #   实测柳辛庄某带：对照表 8 / 已归属 8 / 未归属 16 → 报「缺失 0、多余 16」，
+        #   而那 16 条**就是**未归属本身；读者据此会误判成「parse 误识别了 16 个箱号」。
+        #   两类未归属按「是否在对照表内」分开：表内＝真·未落位（对照表已定归属而
+        #   parse 没落上）；表外＝parse 认领了对照表没有的编号（多认领，性质更轻）。
+        _extra = sorted(_asg - _exp_set)
         return {"mode": "清单", "expected": len(_exp_set), "assigned": len(_asg),
                 "missing": _missing, "extra": _extra, "unassigned": sorted(_un),
+                "unassigned_in": sorted(_un & _exp_set),
+                "unassigned_out": sorted(_un - _exp_set),
                 "aligned": (not _missing and not _extra and not _un)}
     try:
         _exp_n = int(expected_count)

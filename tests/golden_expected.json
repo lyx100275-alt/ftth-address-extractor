@@ -1,12 +1,12 @@
 {
-  "_note": "version=2 起 baseline 由 tests/run_smoke.py --regen-golden 重生（手工改此文件不被察觉）；T14 默认不再 SKIP。",
+  "_note": "本文件由 `tests/run_smoke.py --regen-golden` 重生，请勿手工编辑；行为变更须同步更新基线并在 SKILL_CHANGELOG 记明原因。",
   "cases": {
     "fmcy": {
-      "dxf": "Desktop/凤鸣朝阳/凤鸣朝阳小区.dxf",
+      "dxf": "凤鸣朝阳/凤鸣朝阳小区.dxf",
       "expect": {
         "files_md5": {
-          "coverage.json": "b9f9e6e76c5f48b9fc2646ff036778d5",
-          "parsed.json": "5cf42d0782ee148dc3d0fc3829b940b8",
+          "coverage.json": "0a6c966614b9c268c073c68f008f2fec",
+          "parsed.json": "716b54fc67bccffeace1eb8bf4f80c3f",
           "titleblock.json": "654b8ad4c96bcc05fbca465d47a3b72f",
           "unit_box_gaps.json": "7828ab5a72037036a2bee516936b5d6e"
         },
@@ -20,7 +20,7 @@
       }
     },
     "lxz14": {
-      "dxf": "Desktop/柳辛庄/柳辛庄1-4地块布线工程施工图.dxf",
+      "dxf": "柳辛庄/柳辛庄1-4地块布线工程施工图.dxf",
       "expect": {
         "files_md5": {
           "fx_locations.json": "5687d8bad04233edd72871c3f5346d5e",
@@ -30,7 +30,7 @@
       }
     },
     "yf": {
-      "dxf": "Desktop/云峰/云峰.dxf",
+      "dxf": "云峰/云峰.dxf",
       "expect": {
         "count_box": {
           "cols": 13,
@@ -40,22 +40,22 @@
           "unassigned": 0
         },
         "files_md5": {
-          "count_box.json": "7b8dbe5ec1b2c654a5f3ea536c842ce2",
-          "coverage.json": "06b3e5e474162924acd6144f6a85a621",
+          "count_box.json": "a0e6d11c66e292d269904d2222a19273",
+          "coverage.json": "cbb3d371a5c5aa6556bedf5a47ac0784",
           "fxmap.json": "18f7a9f4294cf8d026701d0dbd43136a",
-          "parsed.json": "55d77ae7349773054a7c9433355b6d34",
+          "parsed.json": "5800bc5ea9da9d92c303c2c430445c17",
           "unit_box_gaps.json": "1329c0915708cd3ef94a024cf08cc78b"
         },
         "inspect": {
           "fails_h": "37532c67a743",
           "fails_n": 5,
           "rc": 2,
-          "warns_h": "bbf7e82e06b3",
-          "warns_n": 11
+          "warns_h": "79cd10977ea0",
+          "warns_n": 12
         }
       }
     }
   },
-  "generated_from": "skill 0.145.0 + 会审整改批（household_annotation 形态检验落地后），三图 fresh 全链重跑",
+  "generated_from": "0.159.0",
   "version": 2
 }

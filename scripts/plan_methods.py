@@ -35,6 +35,7 @@ FTTH 图纸画像（drawing_profile）生成器 —— Step 1a 探查的选法�
 """
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
@@ -547,12 +548,12 @@ def load_suggested_from_probe(paths):
 
 
 def load_texts_from_probe(path):
-    """复用 probe.json 的全量文字样例，避免二次提取。"""
+    """复用 probe.json 的文字样例（text_samples / 全量文字样例），避免二次提取。"""
     try:
         d = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         return None
-    texts = d.get("全量文字样例")
+    texts = d.get("text_samples") or d.get("全量文字样例")
     return texts if isinstance(texts, list) and texts else None
 
 
@@ -1345,7 +1346,7 @@ def judge_intake_table(project_dir):
         return True
     sheets = [f for f in p.rglob("*") if _is_intake_candidate(f)]
     if not sheets:
-        return ABSENT, f"项目目录下未发现表格文件（已扫描 {project_dir}，已排除 run_*/_diag 等产物目录）"
+        return ABSENT, f"项目目录下未发现表格文件（已扫描 {os.path.basename(project_dir)}，已排除 run_*/_diag 等产物目录）"
     # 2026-09-17：改为报**相对路径**（相对 project_dir），不再只报文件名。
     #   实测某项目根目录与 _历史产物_归档\ 各有一份同名 xlsx，只报文件名会打出
     #   两个完全相同的名字——看着像脚本重复枚举（歧义），实为两处各一份。
@@ -1499,7 +1500,7 @@ def build_steps(sig, ctx):
                      "requires": ["floor_scale"], "script": "analyze_coverage.py",
                      "params": {"fx_symbol_layer": ctx.get("fx_symbol_layer_suggest") or "探查未给出候选图层",
                                 "fx_pattern": "由探查采样后确定",
-                                "bldg_map": "本图无总图时留空，归属改用编号与楼栋/单元标注的坐标关联"}},
+                                 "bldg_map": "本图无总图时留空，归属改用编号与楼栋/单元标注的几何空间归属（x/y 双坐标分区；属合法空间证据，不用于推算安装/覆盖楼层，见 SKILL.md 铁律⑩）"}},
                 ],
                 "cross_check": "两条来源的归属 / 安装楼层不一致时不得自动择一，列入待确认项",
             },
@@ -1743,8 +1744,14 @@ def summarize_profile_name(sig, archives):
 _METHOD_POOL_RULES = (
     ("V型", "V型计算"), ("竖线", "竖线法"),
     ("区间", "区间法"), ("图标", "区间法"),
-    ("总图对照表", "读取标注（对照表查表）"), ("编号文字", "读取标注 + 坐标关联"),
+    ("总图对照表", "读取标注（对照表查表）"),
     ("读取标注", "读取标注"), ("标题", "读取标注 + 坐标分区"),
+    # 2026-10-06（一百六十）：删 ("编号文字", "读取标注 + 坐标关联") 死条目 ——
+    #   methods/*.json 无含"编号文字"且不含"区间/图标/竖线/V型/总图对照表/读取标注/标题"
+    #   的候选，本条目无真实触发者；且分类目标"读取标注 + 坐标关联"非方法池四类
+    #   之一，被触发会让 install_by 误判为"读取标注（编号旁直写）"。
+    #   "坐标关联"作为楼栋/单元**空间归属**证据合法（见 SKILL.md 铁律⑩），
+    #   但不作为安装/覆盖楼层的测量方法命名。
 )
 
 
@@ -1870,10 +1877,12 @@ def build_handoff(sig, steps, ov):
         overview["注意"] = ("无总图对照表 → 归属只能走几何/编号-符号配对，"
                             "此时 SKILL.md 硬约束②（禁用标题 x 区间硬切）无对照表可依，"
                             "必须把归属依据逐箱写出交人工复核")
-        overview["降级"] = ("本图无对照表 → 箱的楼栋/单元/安装楼层归属改用"
-                            "**编号与单元/楼栋标注的坐标关联**（逐箱写出依据），"
+        overview["降级"] = ("本图无对照表 → 箱的楼栋/单元归属改用"
+                            "**编号与单元/楼栋标注的几何空间归属**（x/y 双坐标分区、逐箱写出依据），"
                             "并与系统图自身读数交叉；成果表归属列须注明"
-                            "『依系统图坐标关联，无总图可查表』")
+                            "『依系统图几何空间归属，无总图可查表』。"
+                            "注：空间归属合法（SKILL.md 铁律⑩）；安装/覆盖楼层仍只由四法产出，"
+                            "y 最近邻关联不作为来源（2026-09-18 裁决）。")
 
     # ---- ② 系统图选法（**必备项**：三项各用什么方法统计；只申报方法，不出结果）----
     fx_pick = _pick_method(steps, sig, "分纤箱提取")
@@ -2185,6 +2194,11 @@ def main():
     if str(probe_signals.get("fx_location_annotation") or "").startswith("present"):
         log.info("箱位直读标注信号 present → 建议 extract_fx_locations.py 提取后 "
                  "给 coverage-vshape 传 --fx-locations 做安装层交叉校验")
+    elif str(probe_signals.get("fx_location_annotation") or "").startswith("absent"):
+        # 2026-10-04（P2-E3）：absent 时明确告知「跳过 extract_fx_locations.py」。
+        #   此前 absent 无任何输出 → Agent 只看到 present 的提示，不知 absent 时该跳过。
+        log.info("箱位直读标注信号 absent → 无「N号楼M单元K层」直读标注，**跳过 extract_fx_locations.py**"
+                 "（coverage-vshape 不传 --fx-locations 即可）")
     if probe_signals.get("titleblock_layer_candidates"):
         log.info("图签候选图层：%s"
                  % (probe_signals["titleblock_layer_candidates"].get("候选图层"),))
@@ -2202,8 +2216,11 @@ def main():
         "name": summarize_profile_name(sig, archives),
         "kind": "drawing_profile",
         "version": "2.0",
-        "source_dxf": str(Path(args.dxf).resolve()),
-        "source_probe": str(Path(args.probe).resolve()) if args.probe else None,
+        # 溯源字段一律记 basename：无消费方（`source_dxf`/`source_probe` 全仓零读取），
+        # 而写绝对路径会让 profile.json 的 md5 随 outdir 与调用写法漂移 ——
+        # 与技能内 5 个产出脚本的既有约定一致（parse/coverage/count/… 均写 basename）。
+        "source_dxf": os.path.basename(args.dxf),
+        "source_probe": os.path.basename(args.probe) if args.probe else None,
         "generated_by": "plan_methods.py",
         "description": ("【本图纸画像，由 Step 1a 探查产出】记录本图 13 个信号的实测状态与"
                         "选定的候选方法。方法按测量原理命名，不绑定任何项目或小区。"),
@@ -2249,7 +2266,7 @@ def main():
             "effective": {k: getattr(args, k, None)
                           for k in ("text_layer", "text_type", "title_pattern", "fx_pattern")},
             "filled_from_params_json": sorted(_filled),
-            "params_json_path": _probe_like,
+            "params_json_path": os.path.basename(_probe_like) if _probe_like else None,
         },
         "gate": gate,
         "risk_forecast": risk_fc,

@@ -14,7 +14,7 @@ T1b 委托锁：归一包装（norm_unit/norm_floor/floor_num_local）必须调�
 T2 注册面=分发面：ftth.py 每个 add_parser 的子命令在分发段有分支（差集 ∅）
 T3 纯函数语义：bldg_num / bldg_num_or_none / _txt_fields 两态出口 + floor_num 楼层归一
 T4 体量闸门：ftth.py budget rc=0
-T4b 文档一致性门：scripts/check_docs.py rc=0（D1~D7：子命令/阶段/冒烟范围/C项/指针链）
+T4b 文档一致性门：scripts/check_docs.py rc=0（D1~D13：子命令三处/阶段/冒烟范围/C项/指针链/脚本数三处/版本号三处）
 T5 语料冒烟（可选）：语料 DXF probe rc=0（语料缺失自动 SKIP）
 T0 全仓编译：scripts/*.py py_compile 全过（语法级）
 T6 出表链黄金路径（合成料，无需 DXF/ezdxf）：assemble 组装（全名单元键+中文单元+共享克隆）
@@ -35,8 +35,13 @@ T13 多栋合并楼名登记（合成料）：只登记不解析 + 反向不误�
 T14 三图 golden 回归（需 --with-dxf + 桌面三图）：fresh 全链对拍产物指纹与门禁行为，
     基线 tests/golden_expected.json（约 3 分钟，缺图自动 SKIP）。
 T15 台账确定性：FTTH_FIXED_TIME 冻结时钟后同序列写入逐位一致（生产默认系统时间不变）。
+T23 产物路径无关性：复现基准产物（golden 指纹集 + profile.json）不得内嵌绝对路径
+    （T23a 动态扫 T14 产物）+ 产出脚本路径语义字段须经 basename（T23b 静态扫
+    scripts/*.py）+ 用 os.* 者必须 import os（T23c AST 级，专杀 py_compile 与
+    静态 lint 都判不出的运行期 NameError）。
 T17 产物契约门（需 T14 本轮产物）：L1-C8 词汇封闭静态检查（check_contracts.py）。
 """
+import ast as _ast
 import io
 import os
 import re
@@ -49,6 +54,20 @@ SK = os.path.dirname(HERE)
 SC = os.path.join(SK, 'scripts')
 PY = sys.executable
 fails = []
+# SKIP 可见性（2026-10-06 审计补）：此前 T5/T14 缺料只打印一行 [SKIP] 即过，
+#   结尾 `ALL PASS` 与「全测过」不可区分（曾长期绿灯但真图从未跑）。此处包装
+#   print 收集全部 [SKIP] 行，结尾汇总打印；CI 置 FTTH_REQUIRE_CORPUS=1 可使
+#   T5/T14 缺料 SKIP 转 FAIL。
+skips = []
+_REQUIRE_CORPUS = os.environ.get('FTTH_REQUIRE_CORPUS') == '1'
+_real_print = print
+
+
+def print(*a, **k):
+    _s = ' '.join(str(x) for x in a)
+    if _s.startswith('[SKIP]'):
+        skips.append(_s)
+    _real_print(*a, **k)
 
 # 控制台 UTF-8 兜底：中文 Windows 默认 GBK，本文件含 CJK/∅ 输出，
 # 无此行则 T2 在 print 即崩（UnicodeEncodeError），后半截门禁全跳过。
@@ -174,7 +193,7 @@ check('T1c 控制台统一走ensure', _con_ok, str(_con_bad))
 # T2 注册面=分发面
 ft = read('scripts/ftth.py')
 regs = re.findall(r'sub\.add_parser\("([a-z0-9-]+)"', ft)
-check('T2 子命令数=16', len(regs) == 16, str(len(regs)))
+check('T2 子命令数=19', len(regs) == 19, str(len(regs)))
 i = ft.index('# 分发')
 missing = [c for c in regs if ('"%s"' % c) not in ft[i:]]
 check('T2 注册面=分发面(差集∅)', not missing, '缺分支: %s' % missing)
@@ -876,10 +895,17 @@ try:
 
         for _cn, _c in _cases.items():
             _od = os.path.join(_gdir, _cn)
+            # 2026-10-04（十轮迭代 R1 修复）：子进程必须显式剔除 FTTH_VIA_LAUNCHER。
+            # 本测试直调 ftth.py（不经启动器）；若父进程本身经 launcher 启动
+            # （launcher 会置 FTTH_VIA_LAUNCHER=1），子进程继承该变量后产物会多写
+            # `_via_launcher` 键，而 golden 基线（直调口径）不含该键 → T14 永久假红。
+            # 实测：经 launcher 跑 smoke 时 12 个产物全红；直跑时全绿。
+            _env14 = {k: v for k, v in os.environ.items() if k != 'FTTH_VIA_LAUNCHER'}
             _r = subprocess.run(
                 [PY, os.path.join(SC, 'ftth.py'), 'pipeline', '--dxf',
                  _resolved[_cn], '--outdir', _od, '--quiet'],
-                capture_output=True, text=True, encoding='utf-8', errors='replace')
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                env=_env14)
             # ---- 无论重生与否，都按同一套判据算实测值 ----
             _files = {}
             for _fn in _GOLDEN_KEYS:
@@ -1009,6 +1035,115 @@ else:
     check('T17b 调用链形状覆盖（无产物被判非产物）', _t17b_ok,
           '; '.join(_t17b_notes) or '真图产物全部纳入 C7 核对')
 
+# ---------------- T23 产物路径无关性（2026-10-04 新增） ----------------
+#   执行技能**既有的**设计原则（见 check_launch_path.py 开篇第 1 条：
+#   「标记是布尔真值，不是时间戳/路径。含变量的标记会让每次运行的产物 md5 都变，
+#   golden 回归（T14）将永久假红 —— 一个门禁不能毒化另一个门禁」）。
+#   此前这条原则**只写在文档里，没有任何机器执行方**，于是：coverage.json 的
+#   「来源」写 args.fx_locations 原文、profile.json 的 source_dxf / source_probe /
+#   param_source_actual.params_json_path 写绝对路径 —— 同一张图换 outdir 跑，
+#   产物指纹必变（实测：柳辛庄八带 R1↔R2 coverage.json 全部不一致，唯一差异就是
+#   这一行路径），T14 的「逐位一致」在这些产物上形同虚设。
+#
+#   两段互补：
+#     A 动态 —— 扫 T14 本轮 fresh 产物中「复现基准集」（golden 指纹集 + profile.json）
+#       内嵌的绝对路径。**刻意不含** inspect.json / pipeline_timing.json：前者是门禁
+#       报告（记录「我读了哪些产物」是本分），后者是耗时记录，二者天然含运行环境
+#       信息、属审计类，不进复现基准。
+#     B 静态 —— 扫产出脚本里「路径语义字段」被直接赋 args.* / Path(args.*) 的位置。
+#       A 只覆盖 T14 真跑到的分支（如 --fx-locations 分支 T14 不经过），B 兜住这类
+#       测试跑不到的代码路径 —— 「规则写了没人执行」的缺口按静态 lint 关。
+try:
+    _T23_PROD = tuple(_GOLDEN_KEYS) + ('profile.json',)
+    _T23_FIELDS = ('DXF文件', '输入', '来源', 'source_dxf', 'source_probe',
+                   'params_json_path')
+    _ABS_RE = re.compile(r'[A-Za-z]:[\\/]|\\\\[^\\]|/(?:home|Users|root|mnt|media|tmp|var|opt)/')
+    _FLD_RE = re.compile(r"['\"](?:%s)['\"]\s*:\s*(.+)$" % '|'.join(_T23_FIELDS))
+
+    def _t23_walk(obj, p=''):
+        out = []
+        if isinstance(obj, dict):
+            for _k, _v in obj.items():
+                out += _t23_walk(_v, '%s.%s' % (p, _k) if p else str(_k))
+        elif isinstance(obj, list):
+            for _i, _v in enumerate(obj):
+                out += _t23_walk(_v, '%s[%d]' % (p, _i))
+        elif isinstance(obj, str) and _ABS_RE.search(obj):
+            out.append((p, obj[:90]))
+        return out
+
+    _t23a_ok, _t23a_notes, _t23a_n = True, [], 0
+    if _REGEN or ('_T14_GDIR' not in dir() or not os.path.isdir(_T14_GDIR)):
+        print('[SKIP] T23a 真图产物缺失（随 T14）')
+    else:
+        for _cn in _gm['cases']:
+            _od = os.path.join(_T14_GDIR, _cn)
+            if not os.path.isdir(_od):
+                continue
+            for _fn in _T23_PROD:
+                _p = os.path.join(_od, _fn)
+                if not os.path.isfile(_p):
+                    continue
+                try:
+                    _obj = _json.load(io.open(_p, encoding='utf-8'))
+                except (OSError, ValueError):
+                    continue
+                _t23a_n += 1
+                for _fld, _val in _t23_walk(_obj):
+                    _t23a_ok = False
+                    _t23a_notes.append('%s/%s.%s=%s' % (_cn, _fn, _fld, _val))
+        check('T23a 复现基准产物无绝对路径', _t23a_ok,
+              ('; '.join(_t23a_notes[:4]) + ('…' if len(_t23a_notes) > 4 else ''))
+              if _t23a_notes else '已核 %d 个产物，无路径泄漏' % _t23a_n)
+
+    _t23b_viol = []
+    for _fn2 in sorted(os.listdir(SC)):
+        if not _fn2.endswith('.py'):
+            continue
+        for _ln, _line in enumerate(io.open(os.path.join(SC, _fn2), encoding='utf-8'), 1):
+            _m = _FLD_RE.search(_line)
+            if not _m:
+                continue
+            _rhs = _m.group(1)
+            if 'basename' in _rhs:          # 已是 basename → 合规
+                continue
+            if 'args.' in _rhs or 'Path(' in _rhs:
+                _t23b_viol.append('%s:%d' % (_fn2, _ln))
+    check('T23b 产出脚本路径字段无原文泄漏', not _t23b_viol,
+          ('; '.join(_t23b_viol[:6])) if _t23b_viol else
+          '路径语义字段 %d 种，全部经 basename 归一' % len(_T23_FIELDS))
+
+    # T23c：产出脚本「用了 os.* 却没 import os」——AST 级，零误报。
+    #   由来（2026-10-04 实测教训）：F7/F8 把写进产物的路径改成
+    #   `os.path.basename(...)`，而 plan_methods.py 顶层**没有** import os ——
+    #   `py_compile` 与 T23b 均判不出（编译不解析名字；静态 lint 只看 basename
+    #   是否出现），直到 T14 真跑 pipeline 才炸 NameError。本项补这个盲区：
+    #   「字符串/注释里的 os. 不算，真正的属性访问才算」用 AST 判，不用正则。
+    _t23c_bad = []
+    _t23c_n = 0
+    for _fn3 in sorted(os.listdir(SC)):
+        if not _fn3.endswith('.py'):
+            continue
+        try:
+            _tree = _ast.parse(io.open(os.path.join(SC, _fn3), encoding='utf-8').read())
+        except SyntaxError as _ex:
+            _t23c_bad.append('%s 语法错: %s' % (_fn3, _ex))
+            continue
+        _t23c_n += 1
+        _imported = set()
+        for _n in _ast.walk(_tree):
+            if isinstance(_n, _ast.Import):
+                for _a in _n.names:
+                    _imported.add(_a.asname or _a.name.split('.')[0])
+        _uses_os = any(isinstance(_n, _ast.Attribute) and isinstance(_n.value, _ast.Name)
+                       and _n.value.id == 'os' for _n in _ast.walk(_tree))
+        if _uses_os and 'os' not in _imported:
+            _t23c_bad.append(_fn3)
+    check('T23c 用 os.* 者必须 import os', not _t23c_bad,
+          ('; '.join(_t23c_bad[:6])) if _t23c_bad else '全仓 %d 个脚本名字解析自洽' % _t23c_n)
+except Exception as _e23:
+    check('T23 产物路径无关性', False, '异常: %s' % _e23)
+
 # ---------------- T15 台账确定性（2026-09-26 新增） ----------------
 #   专杀「ledger 每次 md5 必变」——此前 sort_keys 修了一半，_now() 时间戳仍是
 #   唯一变量字段。生产行为不变（默认系统时间）；FTTH_FIXED_TIME 冻结时钟后，
@@ -1101,5 +1236,13 @@ except Exception as _e:
     check('T18 冲突矩阵回归（覆盖来源状态机闭环）', False, '异常: %s' % _e)
 
 print()
-print('== 冒烟结果: %s（失败 %d 项）==' % ('ALL PASS' if not fails else 'FAIL', len(fails)))
+_corpus_skips = [s for s in skips if 'T14' in s or 'T5' in s]
+if _REQUIRE_CORPUS and _corpus_skips:
+    fails.append('FTTH_REQUIRE_CORPUS=1 缺料即失败')
+    _real_print('[FAIL] FTTH_REQUIRE_CORPUS=1：缺料 SKIP 视为失败：%s' % '; '.join(_corpus_skips))
+if skips:
+    _real_print('== SKIP 清单（%d 项，缺料/缺依赖跳过，非通过）==' % len(skips))
+    for _s in skips:
+        _real_print('  ' + _s)
+print('== 冒烟结果: %s（失败 %d 项，跳过 %d 项）==' % ('ALL PASS' if not fails else 'FAIL', len(fails), len(skips)))
 sys.exit(0 if not fails else 1)

@@ -322,6 +322,13 @@ def _append_ruling(p, obj, a, project, question, ruling, by, scope, key):
         "问题": question,
         "裁决原文": ruling,
         "裁决人": by,
+        # 落盘即「已裁决」：能进 ledger_state 的条目必然带裁决人（上方已强制），
+        # 且本文件是**唯一**写入点 —— 不写此字段会让 check_transitions 判据 #2
+        # （冲突类条目且未裁决 + 成品已生成 → 硬违规）与 #5 的 pending 扫描
+        # 把「已落盘的裁决」误读成「未裁决」，裁决后仍被门禁拦住出不了表。
+        # 实测 2026-10-06 凤鸣朝阳：R001~R003 全部落盘成功，因缺此字段，
+        # transitions 命中「禁止迁移 #2」rc=2。
+        "状态": ST_RULED,
         "时间": _now(),
         "适用范围": scope or "",
     })
@@ -366,12 +373,14 @@ def cmd_ruling_add(a):
             _err("[参数错误] --from-json 读取失败：%s" % e)
             return 3
         if not isinstance(items, list) or not items:
-            _err("[参数错误] --from-json 内容须为非空 JSON 数组。")
+            _err("[参数错误] --from-json 内容须为非空 JSON 数组。\n"
+                "  期望格式：[{\"question\":\"...\",\"ruling\":\"...\",\"by\":\"用户\",\"scope\":\"...\",\"key\":\"...\"}, ...]")
             return 3
         rc = 0
         for i, it in enumerate(items):
             if not isinstance(it, dict) or not it.get("question") or not it.get("ruling"):
-                _err("[参数错误] 第 %d 条缺 question/ruling（by 可用 --by 兜底）。" % (i + 1))
+                _err("[参数错误] 第 %d 条缺 question/ruling（by 可用 --by 兜底）。\n"
+                    "  期望键名（英文）：question / ruling / by / scope / key" % (i + 1))
                 rc = 3
                 continue
             if _append_ruling(p, obj, a, a.project,

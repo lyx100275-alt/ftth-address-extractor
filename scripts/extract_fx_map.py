@@ -334,13 +334,26 @@ for fx in fx_items:
         entry["安装楼层"] = "%dF" % _desc_floor
         entry["安装楼层口径"] = "口径A′:箱表描述内直写（『N号楼M单元K层』的 K 层）"
     elif best_floor:
-        entry["安装楼层"] = best_floor
         if best_floor_dist <= 5.0:
+            # 紧贴同行（|dy|≤5.0）= 编号与楼层标注并排直写 → 口径A 直读。
+            entry["安装楼层"] = best_floor
             entry["安装楼层口径"] = "口径A:图上直写"
         else:
-            entry["安装楼层口径"] = "口径B:y坐标关联"
+            # 2026-10-06（一百六十）：y 最近邻关联退役（用户裁决 2026-09-18：
+            # "编号 y 坐标关联推算"不在四种测量方法内）。best_floor 是 y 最近
+            # 的楼层标注，>5.0 说明编号与该标注非紧贴同行 —— 取它当安装楼层
+            # 属"y 最近邻推算"，禁止作为结果来源。安装楼层保持 None，下游
+            # parse 回填分支（要求"安装楼层"非空）自然不采信 → 四法外推算
+            # 无法经对照表通路进成品。证据留痕交人 / 交四法（区间法/V型/
+            # 竖线/直读）。注：空间归属（楼栋/单元）不受影响，仍按 (x,y)
+            # 几何分区定（见 SKILL.md 铁律⑩）。
+            entry["安装楼层"] = None
+            entry["安装楼层口径"] = "未定：y最近邻不作来源（2026-09-18裁决）"
+            entry["最近楼层标注_留证"] = best_floor
+            entry["最近楼层距离_留证"] = round(best_floor_dist, 2)
     # 2026-09-30（一百三十，V3 Evidence）：对照表条目统一楼层对象（只加不改）。
-    #   对照表坐标系恒为总图（total_map）；口径A=直写，口径B=y关联推导，无值=unresolved。
+    #   对照表坐标系恒为总图（total_map）；口径A=直写，无值=unresolved
+    #   （>5.0 的 y 最近邻自一百六十起不再赋值，退役为 None/unresolved）。
     _fx_cal = str(entry.get("安装楼层口径") or "")
     if entry.get("安装楼层") is None:
         _fx_src, _fx_ctx = SOURCE_UNRESOLVED, CTX_UNKNOWN

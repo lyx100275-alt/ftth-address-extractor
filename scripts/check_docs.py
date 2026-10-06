@@ -9,7 +9,7 @@
 数字与两类指针变成 rc≠0 的硬信号。
 
 检查（全部是「文档声称 vs 代码现实」对拍，不含主观判断）：
-  D1 子命令数：SKILL.md 声称的 N 子命令 == ftth.py add_parser 个数
+  D1 子命令数：SKILL.md / README.md / scripts_reference.md 声称的 N 子命令 == ftth.py add_parser 个数
   D2 阶段数：SKILL.md 声称的 M 阶段 == ftth.py _PIPE_STAGES 元组长度
   D3 冒烟范围：README.md 声称的 T0~K == run_smoke.py 最大的 check('T<整数>'
   D4 自检项覆盖：step2_selfcheck.md 声称 C1~C10 在 inspect_closure.py 里逐项存在，
@@ -19,9 +19,13 @@
   D6 几何缓存指针链：SKILL.md → pipeline_details.md §16 → scripts_reference.md
       geom.json schema 三段可达（2026-09-25 批次1 #11 aftermath）
   D7 SKILL.md 外链文件存在：每个 ](references/xxx.md...) 目标文件必须存在
+  D8 脚本数三处一致：SKILL.md / README.md / scripts_reference.md 声称数 == scripts/*.py 个数
+      （2026-10-06 审计补：此前只核 SKILL/README，scripts_reference 的 42/43 漂移无门禁可报）
   D9 全仓相对链接存在：全部 md（除 CHANGELOG）的相对链接按**所在文件目录**可解析
-      （2026-09-27 新增：D7 只核 SKILL 外链，references/ 内文件误写成
+      （2026-09-27 新增：D7 只核 SKILL.md 的外链，references/ 内文件误写成
        `references/xxx.md` 前缀的 8 条断链长期无门禁可报）
+  D13 版本号三处一致：version.json 的 skill_version 须同时出现在 README.md 与
+      SKILL_CHANGELOG.md（2026-10-06 审计补：README 曾落后 13 个修订而全绿）
 
 退出码（沿用 L1-C2 语义）：0 = 全过；2 = 任一不一致（停，先对齐再改别的）。
 
@@ -63,11 +67,18 @@ def check(name, cond, detail=''):
 SKILL = read('SKILL.md')
 FT = read('scripts/ftth.py')
 
-# D1 子命令数
+# D1 子命令数（三处文档 == 代码；2026-10-06 审计补：此前只核 SKILL.md，
+#   README 与 scripts_reference 的 16/19 漂移无门禁可报）
 m1 = re.search(r'(\d+)\s*子命令', SKILL)
 regs = re.findall(r'sub\.add_parser\("([a-z0-9-]+)"', FT)
 check('D1 子命令数文档==代码', bool(m1) and int(m1.group(1)) == len(regs),
-      '文档=%s 代码=%d' % (m1.group(1) if m1 else '?', len(regs)))
+      'SKILL=%s 代码=%d' % (m1.group(1) if m1 else '?', len(regs)))
+_m1r = re.search(r'(\d+)\s*子命令', read('README.md'))
+check('D1b README子命令数==代码', bool(_m1r) and int(_m1r.group(1)) == len(regs),
+      'README=%s 代码=%d' % (_m1r.group(1) if _m1r else '?', len(regs)))
+_m1s = re.search(r'支持\s*(\d+)\s*个子命令', read('references/scripts_reference.md'))
+check('D1c scripts_reference子命令数==代码', bool(_m1s) and int(_m1s.group(1)) == len(regs),
+      'SR=%s 代码=%d' % (_m1s.group(1) if _m1s else '?', len(regs)))
 
 # D2 阶段数
 m2 = re.search(r'(\d+)\s*阶段', SKILL)
@@ -120,8 +131,8 @@ for t in set(re.findall(r'\]\((references/[A-Za-z0-9_.-]+\.md)[^)]*\)', SKILL)):
 check('D7 SKILL外链文件存在', not miss, '缺失=%s' % miss)
 
 # D8 脚本数文档==代码（2026-09-26 P1-2 新增）：新增 .py 必须同步三处计数，
-# 否则下次审计又要人肉对账。SKILL 与 README 各一处明数。
-#   NPY_EXPECTED 是**第三处**计数（另两处在 SKILL.md / README.md 的正文里）。
+# 否则下次审计又要人肉对账。SKILL 与 README 各一处明数，scripts_reference 一处明数。
+#   NPY_EXPECTED 是**第四处**计数（另三处在 SKILL.md / README.md / scripts_reference.md 的正文里）。
 #   此前本项把 41 写死在表达式里，新增脚本时它是唯一不会被 grep 找到的暗数 ——
 #   改了 SKILL/README 也会 FAIL，症状与「忘了改文档」完全一样，误导排查方向。
 NPY_EXPECTED = 43
@@ -129,10 +140,13 @@ import glob as _glob
 npy = len(_glob.glob(os.path.join(skill_root(), 'scripts', '*.py')))
 m8a = re.search(r'（(\d+) 个文件）', SKILL)
 m8b = re.search(r'(\d+) 个 `\.py`', README)
+m8c = re.search(r'\*\*(\d+) 个脚本\*\*', read('references/scripts_reference.md'))
 check('D8 脚本数文档==代码', npy == NPY_EXPECTED and bool(m8a) and int(m8a.group(1)) == npy
-      and bool(m8b) and int(m8b.group(1)) == npy,
-      '代码=%d SKILL=%s README=%s' % (npy, m8a.group(1) if m8a else '?',
-                                      m8b.group(1) if m8b else '?'))
+      and bool(m8b) and int(m8b.group(1)) == npy
+      and bool(m8c) and int(m8c.group(1)) == npy,
+      '代码=%d SKILL=%s README=%s SR=%s' % (npy, m8a.group(1) if m8a else '?',
+                                            m8b.group(1) if m8b else '?',
+                                            m8c.group(1) if m8c else '?'))
 
 # D9 全仓相对链接存在（2026-09-27 新增）：D7 只核 SKILL.md 的外链，
 # references/ 内的 md 互相引用时若照「技能根视角」写 `references/xxx.md`，
@@ -219,6 +233,16 @@ _doc_nf = max((int(x) for x in _m12b), default=0)
 check('D12 禁止迁移条数代码==文档',
       bool(_nf) and int(_nf.group(1)) == _doc_nf and ('N_FORBIDDEN' in CT),
       '代码 N_FORBIDDEN=%s / 文档表最大编号=%s' % (_nf.group(1) if _nf else '?', _doc_nf))
+
+# D13 版本号三处一致（2026-10-06 审计补）：version.json 的 skill_version 须同时
+#   出现在 README.md 与 SKILL_CHANGELOG.md。治的病是「README 版本号落后 13 个修订
+#   而全绿」——此前没有任何门禁核版本号。
+_vj_ver = (_vj.get('skill_version') or '').strip()
+_cl = read('SKILL_CHANGELOG.md')
+check('D13 版本号三处一致', bool(_vj_ver) and _vj_ver in README and _vj_ver in _cl,
+      'version.json=%s README含=%s CHANGELOG含=%s'
+      % (_vj_ver or '?', bool(_vj_ver and _vj_ver in README),
+         bool(_vj_ver and _vj_ver in _cl)))
 
 print()
 print('== 文档一致性: %s（失败 %d 项）==' % ('ALL PASS' if not fails else 'FAIL', len(fails)))

@@ -189,6 +189,13 @@ def main():
         bands, info, err, warns = auto_bands(args.dxf, tl, tp)
         _print_plan(bands, info, warns)
         if err:
+            if ("无需分带" in err or "未提取到任何分带锚点" in err):
+                # 单地块图无分带依据 → 不适用（L1-C2 rc=3），非错误。
+                # 此前报 [ERROR] + rc=2，而 pipeline 按单地块原路径继续——
+                # rc=2 按契约应停，继续走即违反门禁语义。改 rc=3 后调用方
+                # 按“跳过+降级”处理，行为不变、语义合规。
+                print("[INFO] 单地块图无需分带：%s" % err)
+                sys.exit(3)
             print("[ERROR] 无法自动分带：%s" % err)
             sys.exit(2)
         if not args.yes:
@@ -214,6 +221,19 @@ def main():
 
     total = len(bands)
     empty_bands = []
+    # 2026-10-04（一百五十四）：分带子 DXF 跨轮不可复现的根因修复。
+    #   实测（同一输入连跑两次，四个 band 全部逐位不同，差异簇 6 处）：
+    #   `ezdxf.new()` + `saveas()` 把「当前时间」写进产物 —— ① `$TDCREATE` / `$TDUPDATE`
+    #   （HEADER，juliandate(now)）；② `$FINGERPRINTGUID` / `$VERSIONGUID`（随机 GUID）；
+    #   ③ `CREATED_BY_EZDXF` / `WRITTEN_BY_EZDXF` 两个 DICTIONARYVAR 里的
+    #   `1.4.4 @ <UTC now>` 标记串（这正是原差异簇被就近误判成 $SHADOWPLANELOCATION 的真相）。
+    #   子图是中间产物、每轮重生成 ⇒ 时间戳必变 ⇒ 下游 `geom.json` 的源 mtime/size 与
+    #   inspect 的 geom 指纹随之漂移，多地块图纸就无法做「复跑逐位对拍」（违反复现基准）。
+    #   处置：置 ezdxf 自带开关固定上述元数据（`_update_metadata()` 只在 `ezdxf.new()` 时
+    #   调用，故必须在建 doc 之前置位）；子图本就是只读派生物，标 2000-01-01/零 GUID 无害。
+    #   另注：DXF 文件 mtime 仍会随重生成而变（无法也不应冻结），故指纹集不应纳入子图 mtime。
+    _prev_fixed_meta = ezdxf.options.write_fixed_meta_data_for_testing
+    ezdxf.options.write_fixed_meta_data_for_testing = True
     for name, ymin, ymax in bands:
         doc2 = ezdxf.new(dxfversion=doc.dxfversion)
         msp2 = doc2.modelspace()
@@ -240,9 +260,22 @@ def main():
         safe = str(name).replace("/", "_").replace("\\", "_").replace(":", "_")
         out = os.path.join(args.out_dir, "band%s.dxf" % safe)
         doc2.saveas(out)
+        # 2026-10-04（一百五十四）：子图 mtime 定为**源图 mtime**（派生物语义）。
+        #   否则每轮重生成都得到新 mtime → 下游 `<子图>.geom.json` 的 mtime 字段变
+        #   → inspect 的 `inputs_sha256.geom` 变 → 多地块图纸永远做不到跨轮逐位对拍。
+        #   继承源图 mtime 还有第二重正确性：源图更新则子图 mtime 随之更新，
+        #   `load_dxf` 的 pkl 缓存与 `--reuse-geom` 的失效判定依然准确。
+        try:
+            _smt = os.path.getmtime(args.dxf)
+            os.utime(out, (_smt, _smt))
+        except OSError as ex:
+            print("  [warn] 无法固定子图 mtime（不阻塞，但复现基准会受影响）: %s" % ex)
         if kept == 0:
             empty_bands.append(name)
         print("band%s: kept=%d dropped=%d -> %s" % (name, kept, dropped, out))
+
+    # 还原全局开关（本脚本内除分带建 doc 外无其他消费者；显式还原免污染同进程后续调用）
+    ezdxf.options.write_fixed_meta_data_for_testing = _prev_fixed_meta
 
     if empty_bands:
         # 空带 = 分带边界错（该带里没有任何实体）——早失败，不产出空子图

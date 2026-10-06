@@ -276,24 +276,42 @@ def _settle_boxes(objs):
     而裁决对象串里的单元段是**裸式**（`1单元`）——直接字符串比较**恒不相等**，
     会静默同步 0 处、pending 消不掉。故一律走 ``unit_num`` 归一比较（两边都归一），
     与 assemble_households.norm_unit 同则。
+
+    坑（2026-10-04 R1 缺陷 D1，实测踩）：共享窗**源节点**（键形如
+    `[共享]1-3号楼综合布线系统图`）的箱是「已展开到成员楼栋」的**证据副本**，
+    其状态由成员楼栋条目承载（见 analyze_coverage*：副本已去 result_origin/
+    result_confirmation、留 `副本归属` 指针）。旧口径按 `bldg_num` 近似匹配时，
+    `bldg_num('[共享]1-3号楼…')==1==bldg_num('1#楼')` ⇒ 裁决 `1#楼` 会连带改写
+    源节点副本、把已降级副本**重新写回 settled**，状态再次分裂（成员侧 pending /
+    源节点侧 settled）。故两条处置：① **共享标题楼栋整体跳过**（其一窗多栋、非单一
+    落盘主体）；② 已降级副本（带 `副本归属` 且无 `result_confirmation`）不回写。
+    楼栋段匹配改走共享入口 :func:`ruling_bldg_matches`（同键 / 同源窗 / 同楼号）。
     """
-    from ftth_common import parse_ruling_scope, bldg_num
+    from ftth_common import parse_ruling_scope, is_shared_title, ruling_bldg_matches
     n = 0
     for o in objs:
         b, u, bx = parse_ruling_scope(o)
         u_n = unit_num(u) if u else None
         for bkey, bd in (data.get("楼栋") or {}).items():
-            # 楼栋段比对：字符串相同或楼号相同（同 judge_pending_scope 口径）
-            if b and b != bkey:
-                if not (bldg_num(b) and bldg_num(b) == bldg_num(bkey)):
-                    continue
+            # ① 共享窗源节点不做落盘：其箱为成员楼栋条目的证据副本，状态由成员侧承载。
+            #    即便裁决对象正是该窗名，也应落到带 `来源共享窗` 的成员条目上
+            #    （靠 ruling_bldg_matches 的第 ② 级「同源窗」命中），而非源节点本身。
+            if is_shared_title(bkey):
+                continue
             for uk, ud in (bd.get("单元") or {}).items():
+                _src_win = (ud or {}).get("来源共享窗")
+                # 楼栋段比对走共享入口（同键 / 同源窗 / 同楼号；同楼号仅在非共享作用域下成立）
+                if b and not ruling_bldg_matches(b, bkey, _src_win):
+                    continue
                 if u:
                     # 裸式单元段 vs 楼栋前缀式单元键 —— 走 unit_num 归一
                     if unit_num(uk) != u_n:
                         continue
                 for box in (ud.get("分纤箱") or []):
                     if not isinstance(box, dict):
+                        continue
+                    # ② 已降级的证据副本不回写状态（否则把副本重新点亮，状态再分裂）
+                    if "副本归属" in box and "result_confirmation" not in box:
                         continue
                     if bx and str(box.get("编号", "")).strip() != bx:
                         continue

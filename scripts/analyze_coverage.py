@@ -1486,14 +1486,38 @@ _pend_items = pending_items_from_rulings(result.get("需人工裁决"))
 
 
 _st_settled = _st_pending = 0
+# 2026-10-04（R1 缺陷 D1，与 V 型法同源同修）：共享窗**证据副本**不计入结果状态。
+#   判据与来源：见 analyze_coverage_vshape.py 同名块。本脚本当前不产共享窗节点，
+#   此块为**同一口径的对称实现**（有则生效、无则零成本），避免两个覆盖脚本再次漂移。
+_expanded_copies = set()
+for _nk, _nv in (result.get("楼栋") or {}).items():
+    if not isinstance(_nv, dict):
+        continue
+    for _nuk, _nuv in ((_nv.get("单元") or {}) or {}).items():
+        _sw = (_nuv or {}).get("来源共享窗")
+        if not _sw:
+            continue
+        for _nbx in ((_nuv or {}).get("分纤箱") or []):
+            _expanded_copies.add((str(_sw), str(_nuk), str(_nbx.get("编号"))))
+_st_copy = 0
+
 for _bk, _bv in (result.get("楼栋") or {}).items():
     for _uk, _uv in ((_bv or {}).get("单元") or {}).items():
-        _unit_pend = any(judge_pending_scope(_objs, _uk, None, _bk)[0]
+        _src_win = (_uv or {}).get("来源共享窗")
+        _unit_pend = any(judge_pending_scope(_objs, _uk, None, _bk, _src_win)[0]
                          for _objs, _blk in _pend_items if _blk)
         for _bx in (_uv.get("分纤箱") or []):
+            if (str(_bk), str(_uk), str(_bx.get("编号"))) in _expanded_copies:
+                _bx.pop("result_origin", None)
+                _bx.pop("result_confirmation", None)
+                _bx["副本归属"] = ("共享窗证据副本：归属见成员楼栋条目"
+                                "（来源共享窗=%s）" % _bk)
+                _st_copy += 1
+                continue
             _cov = (_bx.get("覆盖范围线索") or {}).get("覆盖楼层") or []
             _bx["result_origin"] = "derived" if (_cov and _bx.get("安装楼层")) else "unresolved"
-            _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get("编号"), _bk)[1]
+            _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get("编号"), _bk,
+                                                _src_win)[1]
                             for _objs, _blk in _pend_items if _blk)
             _bx["result_confirmation"] = ("pending"
                                           if (_unit_pend or _box_pend
@@ -1512,6 +1536,7 @@ result["结果状态说明"] = {
     "origin 取值含义": "measured=图上直读/几何测量；derived=按规则算出（竖干断口+区间法对位）；unresolved=无解",
     "confirmation 取值含义": "settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）",
     "统计": {"settled": _st_settled, "pending": _st_pending},
+    "共享窗证据副本（不计入统计）": _st_copy,
     "判 pending 的条件": ("本单元/本箱命中「需人工裁决」中**未标 阻塞=false** 的条目"
                        "（范围判定走 ftth_common.judge_pending_scope 精确口径）"),
 }

@@ -46,6 +46,7 @@ USAGE（与原 ftth.cmd 完全等价）
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -70,19 +71,45 @@ def _ezdxf_ok(exe, *extra_args):
 
 # 解释器缓存：本机验证过的解释器直接信任，exe/ezdxf 路径任一消失才重探。
 # 实测探测一次 25~120s（import ezdxf 慢且不稳定），缓存把 N 次调用降为 1 次。
-CACHE_FILE = os.path.join(HERE, ".interpreter_cache.json")
+# 位置（2026-10-06 审计修复 P2）：此前写在技能目录 `scripts/.interpreter_cache.json`，
+#   违反 L0-I6「技能目录只放运行文件」（跑一轮冒烟即再生，删了又来）。现改写系统
+#   临时目录（`FTTH_CACHE_DIR` 可改），技能目录零写入；旧路径残留者自动迁移沿用一次。
+_LEGACY_CACHE_FILE = os.path.join(HERE, ".interpreter_cache.json")
+
+
+def _cache_file():
+    d = os.environ.get("FTTH_CACHE_DIR")
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, "ftth_interpreter_cache.json")
+        except OSError:
+            pass
+    try:
+        t = os.path.join(tempfile.gettempdir(), "ftth")
+        os.makedirs(t, exist_ok=True)
+        return os.path.join(t, "ftth_interpreter_cache.json")
+    except OSError:
+        return _LEGACY_CACHE_FILE
+
+
+CACHE_FILE = _cache_file()
 
 
 def _cache_load():
     try:
         import json
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        exe = d.get("exe") or ""
-        ez = d.get("ezdxf_path") or ""
-        extra = d.get("extra_args") or ()
-        if exe and os.path.isfile(exe) and ez and os.path.isfile(ez):
-            return exe, tuple(extra)
+        for _p in (CACHE_FILE, _LEGACY_CACHE_FILE):
+            try:
+                with open(_p, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                continue
+            exe = d.get("exe") or ""
+            ez = d.get("ezdxf_path") or ""
+            extra = d.get("extra_args") or ()
+            if exe and os.path.isfile(exe) and ez and os.path.isfile(ez):
+                return exe, tuple(extra)
     except (OSError, ValueError):
         pass
     return None, None
@@ -163,6 +190,14 @@ def main():
             if norm.lower().startswith("scripts/"):
                 norm = norm[len("scripts/"):]
             cand = os.path.normpath(os.path.join(HERE, norm))
+            # 2026-10-04（十轮迭代 R1 修复）：HERE 即 scripts/ 目录，对**技能根**
+            # 下的相对路径（如文档写的 `tests/run_smoke.py`）会拼成
+            # scripts/tests/run_smoke.py 而误判不存在（rc=2「找不到脚本」）。
+            # 回退：再按技能根拼一次，存在即采用。绝对路径行为不变。
+            if not os.path.exists(cand):
+                _alt = os.path.normpath(os.path.join(os.path.dirname(HERE), norm))
+                if os.path.exists(_alt):
+                    cand = _alt
         if not os.path.exists(cand):
             sys.stderr.write("[launch] 找不到脚本: %s\n" % cand)
             return 2
@@ -188,6 +223,20 @@ def main():
     #   检查方 = scripts/check_launch_path.py。
     env = dict(os.environ)
     env["FTTH_VIA_LAUNCHER"] = "1"
+    # ---- 技能目录零写入（2026-10-06 审计修复 P2）----
+    #   经本启动器派生的子进程一律不写 __pycache__（L0-I6「技能目录只放运行文件」；
+    #  此前跑一轮冒烟即再生一堆 .pyc，删了又来）。.pyc 只是启动加速，无行为影响。
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    # ---- 复现性第二道根因：固定子进程哈希种子（2026-10-04，一百五十四）----
+    #   实测：`split-band` 写出的子 DXF 在同一输入下**跨轮不可逐位复现**，差异定位到
+    #   CLASSES 段两条 CLASS 的顺序互换（`LAYOUT` ↔ `ACDBPLACEHOLDER`，132 B）；
+    #   本变量置 0 后两次产物逐位一致（同一实验组，仅此一个变量不同）。
+    #   成因：ezdxf 收集「本次用到的类」经 set/dict 迭代，顺序随字符串哈希随机种子变化。
+    #   影响面：只改 set 迭代序与 hash() 序，**不改 dict 插入序**；对「已实测跨轮逐位
+    #   一致」的其余产物无影响（若有产物依赖 set 序，它本就跨轮不一致，实测并非如此）。
+    #   位置约束：哈希种子只在解释器**启动时**读取，运行期改无效 —— 启动器是唯一可行点
+    #   （业务脚本一律经本启动器派生，见 L1-C7）。已显式设置者尊重其选择。
+    env.setdefault("PYTHONHASHSEED", "0")
     return subprocess.call([py] + list(py_extra) + [target] + argv, env=env)
 
 

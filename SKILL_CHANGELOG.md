@@ -14,6 +14,319 @@ AIGC:
 > 本文件自 `SKILL.md` 外移（三十一）：SKILL.md 只保留最近两条，本文件保存全部历史。（三十九起 SKILL.md 不再保留条目正文，统一指向本文件。）
 > 追加规则：新条目加在**本文件顶部**（本说明之后、最新条目之前），编号沿用 SKILL.md 的序号体系。
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
+> 编号分叉说明（2026-10-06 一百六十一立）：**156/157/158 各有两条同名异文条目**——顶部三条（SKILL.md 精简 / 五轮迭代待裁决 / R2 缺陷）为审计修复轨，尾部五条（156 三处 P0 / 157 迭代第 4 轮 / 158 迭代第 5 轮 / 159 补登 / 160 y 坐标边界）为版本递进轨（0.155→0.160）。引用时以“标题+日期”区分，不得只报序号；新条目自**一百六十一**续排，不复用旧号。历史不再改写（改写即破坏既有引用）。
+
+### 2026-10-06（一百六十一）：外部审计修复批 —— 文档漂移三处 + 门禁补三项 + 缓存外迁 + SKIP 可见
+
+**动因**：外部深度审计指出三处已发生的文档漂移（README 子命令 16/19、scripts_reference 脚本 42/43 与子命令 16/19、README 版本号落后 13 个修订）而门禁全绿，另有 CHANGELOG 156~158 编号重名、技能目录 `__pycache__` 回潮、T14/T5 缺料 SKIP 与 PASS 不可区分。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | README：子命令数 16→19 两处、版本号 0.147.0→0.161.0、`check_docs` 门禁范围 D1~D12→D1~D13、缓存位置说明改系统临时目录、T5 缺料补 `FTTH_REQUIRE_CORPUS=1` 说明 | `README.md` |
+| ② | scripts_reference：脚本数 42→43、子命令 16→19（含 new-run/summary/verify-answer 全表）、易错点补 signals.json `\d` 示例改写 `[0-9]` 警告 | `references/scripts_reference.md` |
+| ③ | D1 扩到 README + scripts_reference 三处对拍（D1b/D1c）；D8 扩到 scripts_reference 脚本数（m8c）；新增 **D13 版本号三处一致**（version.json skill_version 须同时现身 README 与 CHANGELOG） | `scripts/check_docs.py` |
+| ④ | version_basis 补分叉说明；skill_version 0.160.0 → **0.161.0** | `version.json` |
+| ⑤ | 启动器缓存改写系统临时目录（`FTTH_CACHE_DIR` 可改；旧 `scripts/.interpreter_cache.json` 自动迁移沿用一次），派生子进程置 `PYTHONDONTWRITEBYTECODE=1` 不写 `__pycache__`，技能目录不再新增运行时写入项；删残留 `__pycache__` + 旧缓存 | `scripts/ftth_launcher.py`、技能目录 |
+| ⑥ | 冒烟 SKIP 可见性：模块级 `print` 包装计数全部 `[SKIP]` 行，结尾汇总打印 SKIP 清单；`FTTH_REQUIRE_CORPUS=1` 时 T5/T14 缺料 SKIP 转 FAIL（含 T4b 文档一致性门） | `tests/run_smoke.py` |
+| ⑦ | 本文件头加编号分叉说明；本条置顶（新号 161，不复用旧号） | `SKILL_CHANGELOG.md` |
+
+**验证**：`budget` rc=0；`check_docs` D1~D13 ALL PASS（含新增 D1b/D1c/D13）；`check_contract_coverage` rc=0；`py_compile` 全仓 0 错；`run_smoke`（无语料机）ALL PASS 且结尾打印 SKIP 清单。
+
+**遗留**：ftth.py 依赖矩阵表仍只列 15 行（new-run/summary/verify-answer/budget/transitions 未入矩阵，另立项）；Step2-C9 与 L1-C9 同名双轴维持现状（改名前缀属 breaking，待裁决）。
+
+- **版本**：`version.json` 0.160.0 → **0.161.0**。
+
+### 2026-10-05（一百五十八）：SKILL.md 精简 −2,177 B（−5.1%，零语义损失）+ 多地块扇出「未判定带」点名
+
+**动因**：用户指示「精炼提示词，语义准确，字数最少」，随后试跑三个项目。
+
+**① SKILL.md 精简（42,637 → 40,460 B，−2,177 B / −5.1%）**
+
+- 口径：**只改表达、不改规则语义**（沿用一百四十三确立的精简原则）。删除的三类内容全是**重复论述**，其权威定义在 `references/` 已存在：
+  - **正则四坑的原理段**（`\d` 被 shell 吃掉、缺组 IndexError 的来龙去脉）—— 权威副本在 `pipeline_details.md §3`，SKILL 只留四条可执行规则 + 零命中判据；
+  - **两条硬约束的实测反例铺垫** —— 权威副本在 `coverage_rules.md §0.2`，SKILL 只留约束本体 + 指针；
+  - **栋级三来源的细则枚举**（来源角色 / 几何关系 / 地块分段 / `--patch` / 键名与执行序 / 待确认项模板）—— 已逐项核实存在于 `titleblock_and_intake_table.md`（§2.2 地块分段、§六 待确认项模板、`--patch` 与执行序段），故 SKILL 只留三来源角色 + 逐栋比对 + 禁止自动择一 + rc=3 处置。
+- 同时按本技能「维护原则」修**一处自身违规**：同一规则在 SKILL.md 内重复三处（回读校验 C6/状态机/Step 4、落盘纪律 I6/状态机/Step 3、户数口径 C1/测量架构）已收敛为「一处定义 + 其余引用」。
+- **未动**：全部 L0-I1~I6、L1-C1~C9（各条正文与表格）、状态机图与 10 个节点名、禁止迁移 6 条、八项模型、方法池 4 种、户数三口径、铁律 9 条、工作流 Step 0~4 的硬门禁 —— 逐条核对无删减。
+- 门禁影响核查（**先读判据再改，防破坏机检**）：`check_docs.py` 的 D1（19 子命令）/D2（11 阶段）/D6（`pipeline_details.md`+16）/D8（`（43 个文件）`）/D10（L1 C1~C9 标题集）/D11（状态机 10 节点名逐字）/D12（迁移表最大编号 6）均为正则硬编码 token，精简时逐条原样保留；**D1~D12 ALL PASS**。
+
+**② 缺陷：多地块扇出把「未判定带」折进一个退出码（试跑柳辛庄 5-9 揪出）**
+
+- 病灶（可复现）：柳辛庄 5-9 地块 band5 的 `coverage`（竖线法）**配对率 0** → rc=2 中止 → 该带**没出 inspect.json**；而扇出汇总只打一行「多地块扇出汇总：4 个带，最严重退出码 2」。该带 parse 已出 **5 栋 / 10 单元 / 20 箱 / 4 项待裁决**（真实 FTTH 内容），即**20 箱覆盖未判定、4 项待裁决从未进入任何报告**，人必须逐个翻目录才发现。违反 L0「不静默丢数」与 Step 2「空集合不得判 PASS」—— 未判定被折进退出码，形态上等同判过。
+- 改动：`ftth.py _pipe_fanout_bands` 逐带记 `(带名, rc, inspect.json 路径)`，汇总后**逐带点名**并区分「已出 inspect」/「**未出 inspect —— 该带内容未判定**（不是通过）」，另加一行 `⚠ N 个带未判定（…）—— 整图不得出表`。退出码语义不变（仍取最严重者），**只补观测**、不改判定。
+- 验证（还原证明）：同一 5-9 地块复跑，新汇总输出 `band5块地：rc=2，**未出 inspect.json —— 该带内容未判定**` + `⚠ 1 个带未判定（band5块地）`，另三带显示「已出 inspect.json」；1-4 地块四带全部已出 inspect（无未判定）。
+- **band5 本身不是 bug**：竖线法配对率 0 属 L1-C2 `rc=2`（输入不足→停），脚本已给出既定处置（显式 `--fx-symbol-layer`，或确认图上确无箱符号后加 `--allow-low-pairing`）。按 L0-I4 交人裁决，**不自动改选法**。
+
+**三项目试跑结果（精简 + 修复后）**：凤鸣朝阳 rc=0（C6/C9/C10 全 PASS，313 户 / 17 箱）；云峰 rc=2（F=5 / W=12，与上轮逐字一致，全为 C9 pending 待人裁决）；柳辛庄 1-4 各带 rc=0/2/2/2（band1 rc=0，余为合法 pending）；柳辛庄 5-9 各带 rc=2（band8 F=5、band9-1 F=8、band9-2 F=24，均为合法 pending）+ **band5 未判定（已点名）**。
+
+**验证**：`py_compile` 全仓 0 错；`check_docs` D1~D12 ALL PASS；`check_contract_coverage` rc=0（9/9 enforced）；`budget` rc=0（SKILL.md 40,460 B，距预警线 6,540 B）；`run_smoke` **ALL PASS**（含 T14 三图 golden 对拍一致、T23b 路径字段、T18 冲突矩阵）。
+
+**版本**：`version.json` 保持 **0.155.0**（一百五十六起 minor 位落后于修订序号，待用户裁决「minor＝序号」口径后统一追平，本轮不单独 bump）。
+
+---
+
+### 2026-10-05（一百五十七）：桌面三项目五轮迭代 —— 待裁决说明陈旧变量 + 分带退出码违 C2 + yf 基线过期重生
+
+**动因**：用户指示「跑桌面三个项目（凤鸣朝阳 / 云峰 / 柳辛庄）→ 发现问题立即修复 → 迭代 5 轮」。R1 四图全链（凤鸣朝阳 rc=0；云峰 rc=2；柳辛庄 1-4/5-9 各 4 带 rc=2 —— 后三者均为合法 pending 待人裁决，非 bug），跨产物对拍揪出两项可修缺陷，R2 落地，R3 冒烟回归揪出 T14 基线过期，R4 取证定性后重生基线，R5 终验全绿。
+
+**① D1 —— 覆盖完整性待裁决「说明」两字段双空（陈旧循环变量）**
+
+- 病灶（可复现）：柳辛庄 band3 三条「覆盖范围缺失楼层」事项列对了缺失楼层，说明却写「覆盖并集 ；户数标注楼层 。」—— 双空。根因：`analyze_coverage_vshape.py` 自检段把户数期望只存局部变量 `_hu_expected`，后文循环只能见到元组内字段，说明处的户数楼层取到**外层循环最后一个单元的值**（该单元无户数标注即空集）；覆盖并集空时 `'/'.join([])` 得空串。C5 四列要求「图纸已知事实」准确 —— 空说明把正确解的证据弄丢了。
+- 改动：`_cov_missing` 元组增第 5 项户数标注楼层（随条目携带）；新增 `_fmt_floors`（空集显式写「无」，非空沿用原 12/8 截断口径）。band3 重跑验证：说明变为「覆盖并集 无；户数标注楼层 1F/2F/…/15F」。
+- 影响面：凤鸣朝阳 / 云峰零此类条目（grep 实证），golden 指纹不受影响。
+
+**② D2 —— 单地块图分带退出码违 L1-C2（rc=2 当 rc=3 用）**
+
+- 病灶：`split_bands.py --auto` 在 0 锚点 / 1 锚点（单地块、无需分带）时打 `[ERROR]` + `sys.exit(2)`；而 `ftth.py` pipeline 接到非零即按单地块原路径继续。按 L1-C2：rc=2 = 输入不足→停（禁出表），rc=3 = 不适用→跳过降级 —— 「无需分带」是典型不适用，却占着「须停」的码，继续走即违反门禁语义（凤鸣朝阳 / 云峰每轮必经此分支）。
+- 改动：`split_bands.py` 对「无需分带 / 未提取到任何分带锚点」两种 err 改 `[INFO]` + `sys.exit(3)`（坏窗口 / 空带仍 rc=2）；`ftth.py _pipe_fanout_bands` 区分处理（rc=3 报单地块继续，rc≠0 原样告警）。行为不变（均回单地块路径），语义合规。凤鸣朝阳重跑验证：新提示 + inspect 仍 rc=0（FAIL 0/WARN 3 不变）。
+
+**③ D3 —— T14 yf 基线过期（会话前已红，非本轮引入）**
+
+- 现象：R3 全量冒烟唯一 FAIL：`yf parsed.json md5 5800bc…≠d776…；yf inspect（rc=2 F=5 W=12 / 基线 rc=2 F=5 W=11）`，其余全绿。
+- 取证（逐条排除，非推断）：① 会话前系统 temp 留存三份 `ftth_golden_*`（10:54/11:10/13:28），yf parsed 三份 md5 **逐位一致**（5800bc）—— 会话前已红，本轮改动无辜；② 种子对照（PYTHONHASHSEED=0/1/unset 三跑）parsed 逐位一致 —— 非哈希序抖动；③ 业务口径对照（fresh-T14 vs 桌面 Round1）：11 栋 / 15 单元 / 23 箱 / coverage 23 条目 5 pending **全一致**，count_box 331 户与基线一致，5 条 FAIL 与基线同为 C9 pending（合法待人裁决）—— 门禁语义与业务数据无回归；④ `.backup` 全量哈希对拍：11:06 同步未改任何脚本（仅本轮 3 文件不同）—— 红在 0.155.0 基线之后、156 未同步重生基线。
+- 处置：按既定程序 `--regen-golden` 重生基线（仅 yf parsed + warns 两项变，fmcy/lxz14 逐位不动）；R5 全量冒烟 **ALL PASS**（T14 三图一致、T17/T17b/T23a 随之转绿）。
+
+**验证**：`py_compile` 全仓 0 错；`check_docs` D1~D12 ALL PASS；`check_contract_coverage` rc=0（9/9 enforced，无契约变更）；`budget` rc=0；`run_smoke` ALL PASS；`run_conflict_matrix` ALL PASS。
+
+**版本**：`version.json` 保持 **0.155.0**（与一百五十六同批原则：minor 落后待用户裁决口径后统一追平，不另 bump）。
+
+---
+
+### 2026-10-04（一百五十六）：R2 缺陷三项 —— 超阈箱锚「剔除即阻塞」过宽 + 层数回退被单点污染 + 损失登记冒充闸门
+
+**动因**：r02 全量重跑（F1/F2/F3 落地后）跨产物体检 + 逐项追成因。D1 已清零（全产物 重复=0 / 冲突=0），但柳辛庄分带图仍停在 inspect rc=2，逐条追根后揪出三项。
+
+**① D2 —— 超邻域箱锚「剔除即阻塞」在一窗多栋图上整窗误拦**
+
+- 病灶：`analyze_coverage_vshape.py` 对超出 `--box-anchor-x-factor` 的箱位锚一律「剔除归属 + 阻塞报人」。实测 band1 被剔除两锚折合字高 **40.73× / 47.14×**，正落在本技能 P0-9 注释所载「箱表区 40~59×字高」带（真锚实测 4.9~5.8×、邻楼锚 34×）⇒ 几何上不可能属本窗。但该待裁决项**对象是整窗标题**，一窗多栋时窗内全部成员楼栋一并 pending（band1 12 箱 / band9-1 16 箱 pending 同源于这一条）。
+- 改动：新增模块常量 `ANCHOR_FOREIGN_FACTOR = 30.0`（依据：距真锚实测上限 5.2 倍外、落在邻楼/箱表带同侧）。超阈锚再分两档：灰区（<30×）维持阻塞；明确外来（≥30×）判 `阻塞: False` **登记不阻塞**，说明里写明折合字高与判据。
+- 验证：band1 pending 箱 12 → **0**。
+
+**② D3 —— C10「层数」回退通道被单点户数污染**
+
+- 病灶：`inspect_closure.py` C10 系统图侧层数原为**全有全无**判据 —— 「任一层有户数 ⇒ 取『有户数的层数』；**全部**无户数才回退『地上刻度行数』」。实测柳辛庄 band1：4#/5#楼 楼层表 19 行（1F~18F+B1F），但**只有 12F 一行带户数**（其余 null）⇒ 层数=1 ⇒ 与图签 18 直接矛盾 ⇒ C10 假 FAIL，把已定案的整图拦在出表前（实测「2 处不一致 / 共同楼栋 5」）。「有 1 行户数」≠「只有 1 层」—— 回退通道不该被**单点**污染关闭。
+- 改动：层数取 `max(有户数的层数, 地上刻度行数)`。户数口径本身不动（仍是契约三口径之一），只修「层数」这个派生计数。
+- 验证：**对既有图是 no-op**（凤鸣朝阳 / 云峰 逐栋实测 `vals==alt` 恒成立），故 golden 不受影响；band1 C10 由 FAIL → 通过，整图 inspect rc=2 → **rc=0**（可出表）。
+
+**③ D4 —— 跨阶段损失登记冒充闸门（机械上拦不住任何对象）**
+
+- 病灶：`对象 = '（整图跨阶段对账）'` 这类**图级标签**经 `parse_ruling_scope` 取不到楼栋/单元/箱段 ⇒ `judge_pending_scope` 恒不命中 ⇒ 该条**机械作用为零**；而缺失的箱在 coverage 里本无条目，也没有可标 pending 的载体。照旧隐含「阻塞」即「读起来是闸门、实际不拦」。
+- 改动：显式 `阻塞: False`，并在事项/说明里写明**执法者是 inspect C3「安装楼层双源交叉」**（实测 band4：`C3 FL04FX10 coverage 无记录` → rc=2），避免双闸矛盾与误读。
+- 边界：本项**不是**把损失放行 —— 损失仍被 C3 FAIL 拦下，只是不再由 C9 侧重复声明（同 §一百零一 C6/C9 分工）。
+
+**验证**：全量冒烟 / 冲突矩阵 / 文档一致性 / 契约登记 / 预算自检全绿；三图 fresh 重跑（r03）见同轮报告。
+
+**版本**：`version.json` 保持 **0.155.0**（本条与一百五十五 同批，不另 bump）。
+
+---
+
+### 2026-10-04（一百五十五）：R1 缺陷 D1 —— 共享窗证据副本重复计状态、跨节点互斥
+
+**动因**：桌面三图（凤鸣朝阳 / 云峰 / 柳辛庄）fresh 首轮（r01）跨产物体检。柳辛庄 1-4 / 5-9 两地块**分带子图**暴露：`[共享]N-M号楼综合布线系统图` 窗节点自身产出的箱记录，与「共享组逐楼栋展开」到成员楼栋条目的**同号箱并存**，两处**都带** result_origin / result_confirmation，且状态可能互斥 —— 窗节点按**整窗**作用域判 pending、成员楼栋按**本栋**判 settled。
+
+**实测（可复现）**：`柳辛庄1-4地块` band1 的 coverage.json：箱行 24（含 12 份源窗副本）、唯一编号 12，逐编号均为「1 份源窗 + 1 份成员楼栋」；其中 8 个编号两侧状态互斥（源窗 pending vs 成员 settled）。后果两条，方向相反：
+
+- ① **幽灵 pending**：C9 主闸扫到源窗那份 pending ⇒ 整链 rc=2 不得出表，而成员楼栋侧本已 settled —— 属**判据用错范围把正确解整批拦下**；
+- ② **反向假绿**：`apply_ruling._settle_boxes` 按 `bldg_num` 近似匹配（`bldg_num('[共享]1-3号楼…')==1==bldg_num('1#楼')`），裁决 `1#楼` 会连带改写源窗副本，把已降级副本**重新写回 settled**，状态再次分裂。
+
+**根因（两处，同源）**：产物侧 —— 源窗副本不该带结果状态字段（同一物理箱被计两次）；判据侧 —— `judge_pending_scope` 楼栋段旧口径取「首个楼号」（`[共享]1-3号楼…` → 1 ⇒ 只命中 `1#楼`），同源证据被按楼号任意切分。
+
+**改动**：
+
+1. `scripts/analyze_coverage_vshape.py` / `scripts/analyze_coverage.py`（对称）：先扫出「确已展开到成员楼栋」的副本集合（成员条目带 `来源共享窗` == 窗键），对这几份**去掉** result_origin / result_confirmation、改挂 `副本归属` 指针；**未展开**的窗节点照旧带字段（此时它是唯一载体，降级即丢解）。降级数落进 `结果状态说明.共享窗证据副本（不计入统计）`，不静默。
+2. `scripts/ftth_common.py`：新增 `is_shared_title`（走 `parse_bldg_nums_ex`，>1 楼号即真）与 `ruling_bldg_matches(scope_bldg, bldg_key, src_window)` 三级判据（① 字符串相同 ② 同源共享窗 ③ 同楼号**仅当**作用域非共享标题）；`judge_pending_scope` 增 `src_window` 形参并委托给 `ruling_bldg_matches`（消除「取首个楼号」的任意口径）。
+3. `scripts/apply_ruling.py::_settle_boxes`：整体跳过共享标题楼栋、不回写已降级副本，楼栋段匹配改走 `ruling_bldg_matches`（修 ②）。
+4. `scripts/inspect_closure.py`：C9 **追加检查项**「共享窗证据副本降级」—— 源节点副本与成员侧同号箱并存且仍带状态字段即 FAIL（逐箱列出，议题入机读出口）；无共享窗时不产检查行（不冒充已核）。使该类缺陷由技能**自身**拦下，而非靠外部体检发现。
+
+**验证（还原证明）**：同一 band1 产物，C9 追加项修复前判 **FAIL 12 项**、修复后 **PASS 0 项**；无共享窗的凤鸣朝阳不产该项（不适用）。全量冒烟 / 冲突矩阵 / 文档一致性 / 契约登记 / 预算自检全绿（见同轮报告）。
+
+**边界声明**：本项只降级「确已展开到成员楼栋」的副本；**未展开**窗节点不降级、不判 FAIL。不自动裁定副本与成员谁对谁错（L0-I4）。
+
+**版本**：`version.json` 0.150.0 → **0.155.0**。说明：version.json 自带口径为「minor 位＝SKILL_CHANGELOG 修订序号」，本轮一次性追平（一百五十一～一百五十四 未 bump；本条对齐至当前序号 155）。若用户否决该口径，改回即可。
+
+---
+
+### 2026-10-04（一百五十四）：轮次实测两项 —— 从零纪律首步失效 + 分带子图跨轮不可复现
+
+**动因**：桌面三图（凤鸣朝阳 / 云峰 / 柳辛庄）fresh 全链轮次复跑 + **跨轮逐产物对拍**（口径同 一百四十九 / 一百五十 的 R1/R2/R3），实测两处缺陷。
+
+**① `new-run` 空目录不可用（「从零纪律」首步在全新项目上失效）**
+
+- 病灶（可复现）：`ftth.py new-run --project-dir <不存在目录>` 打印「项目目录不存在」并 `return 1` —— **不建目录、不落台账**；而同一目录随后由 `pipeline --outdir` 自动创建，**两条入口行为不一致**。一百五十一落地 `new-run` 时目录已存在（凤鸣朝阳靠 Agent 手工归档 40 项），故该分支未被覆盖。机械后果：空目录上 `transitions --project-dir` 判 rc=3「三本台账均不存在，无可核对象」，全链无机器证据。
+- 改动：`scripts/ftth.py` `cmd_new_run` 把「目录不存在 → `return 1`」改为 `mkdir(parents=True, exist_ok=True)` + 打印「已创建」，随后照常走 `ledger_state.py init`。空目录本无历史可归档，语义与「已存在但干净」对齐。
+- 验证（还原证明）：修复前 rc=1、目录未建、0 台账；修复后同一命令 rc=0、目录已建、三本台账落盘，且 `transitions` 由 rc=3「无可核对象」转 **rc=0「[通过] 6 条禁止迁移均未发生」**。
+
+**② 分带子 DXF 跨轮不可逐位复现（复现基准被中间产物污染）**
+
+- 病灶（可复现）：**同一输入连跑两次**，`split-band` 产出的 1-4 地块 4 个 band 与 5-9 地块 4 个 band **全部**逐位不同（8/8）。跨轮对拍（r02 vs r03）中表现为子图 `geom.json` 的源 `mtime`/`size` 与 inspect 的 `geom` 指纹漂移；文件大小在 580660 / 580662 间抖动。
+- 根因（**两个，缺一不可**，逐个实验锁定）：
+  - **a) ezdxf 存盘写「当前时间/随机值」**：`$TDCREATE` / `$TDUPDATE`（`juliandate(now)`）、`$FINGERPRINTGUID` / `$VERSIONGUID`（随机 GUID）、以及 `CREATED_BY_EZDXF` / `WRITTEN_BY_EZDXF` 两个 `DICTIONARYVAR` 里的 `1.4.4 @ <UTC now>` 标记串。（差异簇共 6 处，修 a 后由 6 簇降为 1 簇、大小抖动消失。）
+  - **b) CLASSES 段两条 CLASS 顺序互换**（`LAYOUT` ↔ `ACDBPLACEHOLDER`，132 B）：ezdxf 收集「本次用到的类」经 set/dict 迭代，顺序随 `PYTHONHASHSEED` 变化。同实验组加 `PYTHONHASHSEED=0` 后**逐位一致**。
+  - **取证教训**：a 的三处起初被「就近取 `$VAR`」的启发式误标成 `$SHADOWPLANELOCATION` —— 该字段只是最近的上游变量名，**归纳变量名不等于看内容**；打印真实字节片段后才看清是 ezdxf 标记串。定位不到真因时先看内容，别停在最近的标签上。
+- 改动：① `scripts/split_bands.py` 建 doc **之前**置 `ezdxf.options.write_fixed_meta_data_for_testing = True`（`_update_metadata()` 只在 `ezdxf.new()` 时调用，故必须前置），整轮分带跑完还原原值；② `scripts/ftth_launcher.py` 派生**子进程**前 `env.setdefault("PYTHONHASHSEED", "0")` —— 哈希种子只在解释器启动时读取，运行期改无效，启动器（L1-C7 唯一入口）是唯一可行点；用 `setdefault` 尊重用户显式设置；③ `scripts/split_bands.py` 存盘后把子图 mtime 定为**源图 mtime**（`os.utime(out, (src_mtime, src_mtime))`）—— 否则每轮重生成的 mtime 必变，经 `<子图>.geom.json` 的 `mtime` 字段传导到 inspect 的 `inputs_sha256.geom`，多地块图纸**永远**做不到跨轮逐位对拍。继承源图 mtime 另有第二重正确性：源图更新则子图 mtime 随之更新，`load_dxf` 的 pkl 缓存与 `--reuse-geom` 失效判定依然准确。失败只 WARN 不阻塞。
+- 验证：修 ① 后大小抖动消失（580626 稳定）但仍有 1 簇；修 ①+② 后 **8/8 逐位一致**（同 shell、未设外部 `PYTHONHASHSEED`）；再修 ③ 后子图 mtime == 源图 mtime，`<子图>.geom.json` 与另一轮**仅差源路径回显一行**（去目录名后逐位一致）。
+- 边界声明：`geom.json` 的 `dxf` 路径回显、`inspect.json` 的输入路径回显属**溯源必需**（一百五十 已定：`inspect.json` 刻意排除在复现基准外）；除此之外分带链已无不确定项。
+- 附带观察（**未改动**，列为可选优化）：成品 xlsx 跨轮**单元格级 0 差异**（316 行全同），字节不同只因 zip 容器各条目时间戳与 `docProps/core.xml` 的 `dcterms:created/modified`（openpyxl 写入生成时刻）；如需 xlsx 字节级可复现，可固定 `wb.properties.created/modified`，属新增需求，未经裁决不做。
+
+**版本**：`version.json` 保持 **0.150.0**。说明：一百五十一～一百五十三 三条修订均未 bump（version.json 自一百五十 起未动），本条沿用现状不单独 bump。**该口径漂移（minor 位＝修订序号，当前已落后 3 个序号）建议一并裁决**。
+
+---
+
+### 2026-10-04（一百五十三）：P2 审视落地 —— 四项防误读/防噪音/命名统一
+
+**动因**：P0+P1 完成后用户裁决「剩余的继续优化」。P2 四项为低频但防误导/防复发噪音类（审视报告 A3/E3/E9/E10）。
+
+**A3 — C10 PASS 加 C8 偏离交叉引用**
+- 病灶：C10 用标准层口径（多数层户数）逐栋比对判 PASS，C8 抓层间偏离（如 1#楼 1F=1户 vs 标准层 2户）判 WARN。两者并存时 PASS 可被误读为「图签确认了所有层户数」，实际 C10 不覆盖 C8 的偏离维度——矛盾靠 Agent 敏锐度去拼。
+- 改动：`inspect_closure.py` C10 PASS 分支加注「标准层口径」+ 若 `c8_bad` 非空追加 C8 偏离明细（栋/单元+偏离层），让矛盾自动浮出。
+
+**E3 — fx_location_annotation absent 分支提示**
+- 病灶：`fx_location_annotation` 在 probe 有值、画像只对 present 打提示（「建议跑 extract_fx_locations.py」），absent 无任何输出 → Agent 只看到 present 提示，不知 absent 时该跳过，白白跑一轮 rc=2。
+- 改动：`plan_methods.py` 新增 absent 分支 `log.info("箱位直读标注信号 absent → 跳过 extract_fx_locations.py（coverage-vshape 不传 --fx-locations 即可）")`。
+
+**E9 — probe INSERT 样例按 FTTH 相关性过滤**
+- 病灶：probe stdout 打印大量非 FTTH INSERT 块（LEB/MEB/暖通/电气设备），挤占截断窗口，FTTH 相关块被推出可见范围。
+- 改动：`parse_dxf_structured.py` INSERT 块明细（ATTDEF+ATTRIB）按 FTTH 关键词（FX/分纤箱/皮线/光缆/ONU/通信/光纤/弱电/配线/光交/接头/熔接/telecom/fiber/optic/cable）过滤；统计行仍打印全部块名+数量（探查不丢信息），只过滤明细。非 FTTH 块明细省略数汇总一行。
+
+**E10 — probe.json 字段命名统一**
+- 病灶：probe.json 字段命名中英混合——`suggested_params` 英文 / 「全量文字样例」中文。Agent 取 `text_samples` 踩空（本次实测 2 轮）。
+- 改动：`parse_dxf_structured.py` 写出时新增英文键 `text_samples`（与旧中文键「全量文字样例」并存兼容）；`plan_methods.py` 消费方 `load_texts_from_probe` 优先读 `text_samples`、回退旧键。不破坏任何现有消费方。
+
+**测试**：全量冒烟 **ALL PASS（失败 0 项）**；T14 golden 无需重建（probe.json 不在指纹集内，parsed/coverage 内容不变）。budget OK（SKILL.md 42637 B 不变，无新增 SKILL.md 内容）。
+
+**凤鸣朝阳实跑验证**：
+- A3：inspect C10 PASS 信息含「标准层口径」+「C8 检出 1 个单元层间户数偏离 → 1#楼/1单元，须人工确认不因 C10 PASS 而豁免」。
+- E3：plan 输出「箱位直读标注信号 absent → 跳过 extract_fx_locations.py」。
+- E9：INSERT 块统计打印全部块名+数量，ATTDEF 明细省略 9 个非 FTTH 块，ATTRIB 样例 0 个 FTTH 相关。
+- E10：probe.json 同时含 `text_samples`（1530 条）和 `全量文字样例`，plan 读新键成功。
+
+---
+
+### 2026-10-04（一百五十二）：P1 审视落地 —— 六项接口摩擦消除
+
+**动因**：P0 完成后用户裁决「继续修改 P1」。P1 六项均为手动分步模式下每次跑项目都会遇到的接口摩擦（审视报告 E1/E2/E4/E5/E6/E7）。
+
+**E1 — plan --project-dir 自动推断**
+- 病灶：plan 手动直调漏传 `--project-dir` → `intake_table=unknown` 阻塞（三次实测复发：云峰、凤鸣朝阳历史、本次）。pipeline 已透传，直调无默认。
+- 改动：`ftth.py` H3.5 段——plan 且 `--project-dir` 未传且 `--dxf` 有值时，从 `--dxf` 父目录自动推断，打印 `[param] --project-dir 未传，由 --dxf 路径推断 = …`。
+- 附带：`plan_methods.py` intake_table evidence 路径做 basename 归一（与一百五十同源，T23a 拦住后修）。
+
+**E2 — read_titleblock --floor-layer auto**
+- 病灶：`--floor-layer` 必传 required=True，probe 已给出 `titleblock_layer_candidates` 候选却断链——手动直调漏传即 usage rc=2 浪费一轮。
+- 改动：`read_titleblock_households.py` 新增 `--config <probe.json>` 参数；`--floor-layer auto` 时从 probe.json 的 `titleblock_layer_candidates.候选图层[0]` 自动读取，打印 `[param] --floor-layer auto → 从 probe.json 取图签候选图层: …`。
+
+**E4 — ftth.py summary 子命令**
+- 病灶：每次跑完 parse 手写汇总脚本才能看到楼栋×单元×户数×箱，浪费一轮且口径可能不一致。
+- 改动：`ftth.py` 新增 `summary --parse <parsed.json> [--coverage <coverage.json>]`，内联打印总览表（Step 3 提交材料半成品），可选合并覆盖楼层列。无子脚本依赖。
+
+**E5 — ftth.py verify-answer 子命令**
+- 病灶：跑完必核对是用户固定工作流收尾步骤，每次手写对拍脚本，口径可能不一致（口径不一致本身就是准确性风险）。
+- 改动：`ftth.py` 新增 `verify-answer --new <成品.xlsx> --answer <参考.xlsx>`，openpyxl 逐行对比 H/J/L/N/P 五列，打印差异行 + 每栋汇总，按「楼栋列非空」过滤水印行。rc=0 无差异 / rc=1 有差异。无子脚本依赖。
+
+**E6 — ledger ruling-add --from-json 报错附样例**
+- 病灶：`--from-json` 格式无文档、报错不带样例——本次试错 3 轮（中文键名→对象包装→数组才过）。
+- 改动：`ledger_state.py` 两处报错（非数组、缺 question/ruling）均附期望格式样例与键名提示。
+
+**E7 — gen_addressbook --addr-empty 开关**
+- 病灶：文档说「留空显式传空串」，PowerShell 宿主传 `--addr ""` 空串被吃 rc=2（本次一轮浪费）。
+- 改动：`gen_addressbook.py` 新增 `--addr-empty` 无值开关（store_true），为 True 时 `--addr` 视为空串。与 `--addr` 同时出现时 `--addr-empty` 优先。绕过 PowerShell 空串传参被吃的坑。
+
+**SKILL.md 登记**：子命令清单 17→19 并加 `summary`/`verify-answer`。
+
+**测试**：T2 断言 17→19；golden 基线经 `--regen-golden` 重建（三图全对拍一致）；全量冒烟 **ALL PASS（失败 0 项）**。
+
+**凤鸣朝阳实跑验证（六项逐项）**：
+- E1：plan 不传 `--project-dir` → 自动推断桌面凤鸣朝阳目录 → intake_table=absent、门禁 PASS、evidence 无路径泄漏。
+- E2：`--floor-layer auto --config probe.json` → 自动取 BZ → rc=0（汇总正确）。
+- E4：`summary --parse parsed.json --coverage coverage_vshape.json` → 直接打印 7 栋 12 单元 313 户 17 箱总览表。
+- E5：`verify-answer --new 成品.xlsx --answer 标准答案核对版.xlsx` → 313 行零差异、每栋全 OK、rc=0。
+- E6：错误格式 JSON → 报错附期望键名 `question / ruling / by / scope / key`。
+- E7：`--addr-empty` → gen rc=0、313 户、回读一致（不再依赖 PowerShell 空串）。
+
+---
+
+### 2026-10-04（一百五十一）：P0 审视落地 —— probe 建议正则自相矛盾修复 + new-run 从零跑隔离
+
+**动因**：2026-10-04 凤鸣朝阳从零跑全程复盘（14 次脚本调用 5 次浪费），审视报告识别两个 P0 准确性缺陷，用户裁决「只修 P0」。
+
+**A1 — probe 建议正则 `\d` → `[0-9]`（自相矛盾修复）**
+- 病灶：`parse_dxf_structured.py` 的建议值模板（title/fx/hu/bldg/cable 形态）输出 `\d` 形态，与自家 L1-C7 坑①「一律写 [0-9] 不写 \d」**自相矛盾**。经 `--config` 文件传递无害，但 Agent 按文档指导「显式覆盖」把建议值抄到命令行时，`\d` 在 Git Bash 被吃 → **零命中且 rc=0**（命中 0 先怀疑正则被吃 → 源头建议值本身就是雷，每次新图都可能复发）。
+- 改动（三处）：
+  1. `parse_dxf_structured.py`：11 处建议模板 `\d` → `[0-9]`（`\s` 保留、`\.` 保留——坑①仅及 \d）；`FX\d+` 提示文本同改。
+  2. `floor_engine.py` `_cable_pattern_for`：输出处 `.replace(r"\d", "[0-9]")`——检测侧 `CABLE_FORM_RES` 保持 `\d` 不动（Python 内部无此坑），仅输出解耦，语义零变化。
+  3. `parse_dxf_structured.py` 写出建议值前加自检 WARN：任何字符串建议值含 `\d` 即报（拦未来新增模板回归）。
+- 验证（还原证明）：新代码 fresh 跑凤鸣朝阳全链，把产物 JSON 文本里 `[0-9]` 字面还原为 `\\d` 后算 md5 —— `parsed.json=5cf42d0782ee`、`coverage.json=8bf8a91b47d8`，**与旧 golden 基线逐位一致** → 指纹变化 100% 来自建议值文本改写，**数据本体（楼栋/单元/楼层/户数/分纤箱/覆盖）零变化**。云峰 `parsed.json` 同理。
+
+**A2 — `ftth.py new-run` 子命令（从零跑隔离）**
+- 病灶：三本台账累计式，「从零跑」若不隔离，上一轮裁决会被误当「已确认基准」（违反从零语义，是隐性准确性风险——本次凤鸣朝阳靠 Agent 手动归档 40 项历史产物才干净）。
+- 实现：`ftth.py new-run --project-dir <项目目录>` —— 项目目录内非 `run_*` 产物全部归档进 `run_<时间戳>/`（**不删除、可追溯**），随后调 `ledger_state.py init` 重建空三本台账。旧 `run_*` 归档目录不再二次归档（避免套娃）。
+- 从零定义（写进 SKILL.md I6「从零纪律」）：DXF 同目录 `<DXF>.geom.json` 是无损投影缓存（不在本目录、不归档、可复用）；其余产物一律重生成。
+
+**SKILL.md 登记**：I6 操作纪律表加「从零纪律」行；子命令清单「16 子命令」→「17 子命令」并加 `new-run`。
+
+**测试**：`T2 子命令数=17` 断言同步更新；`T14 golden` 基线经 `--regen-golden` 重建（凤鸣朝阳/云峰/柳辛庄三图全对拍一致）；全量冒烟 **ALL PASS（失败 0 项）**。
+
+**未修的审视项**：A3（C10/C8 口径互引）、E1~E10（手动直调接口摩擦、缺 summary/verify-answer 命令等）按用户裁决留待后续批次。
+
+---
+
+### 2026-10-04（一百五十）：十轮迭代 R2/R3 —— 路径泄漏二轮清剿 + 新增 T23 执行器
+
+**动因**：一百四十九修复后复跑 R2/R3 做指纹对照，暴露**同类缺陷仍在**：柳辛庄八带的 `coverage.json` 出现 R1≠R2（全量 diff **仅 1 行**），而 R1↔R2 其余产物逐位一致 —— 说明仍有「调用方路径原文入产物」的漏网点。
+
+**根因**：两处字段把调用方路径原文写进产物，**违反的是技能已有成文原则**（`check_launch_path.py` 开篇第 1 条：「标记是布尔真值，不是时间戳/路径。含变量的标记会让每次运行的产物 md5 都变，golden 回归（T14）将永久假红」），但该原则此前**只有文字、没有任何执行方**。
+
+| # | 位置 | 原写法 | 为何 T14 抓不到 |
+|---|---|---|---|
+| 一 | `analyze_coverage_vshape.py:1500` 自检段 `来源` | `args.fx_locations` 原文 | 只在传 `--fx-locations` 时产出，T14 三图不传 |
+| 二 | `plan_methods.py:2205` profile `source_dxf` | `str(Path(args.dxf).resolve())` | profile.json **不在** T14 指纹集内 |
+| 三 | `plan_methods.py:2206` profile `source_probe` | `str(Path(args.probe).resolve())` | 同上 |
+| 四 | `plan_methods.py:2252` `param_source_actual.params_json_path` | `_probe_like` 原文 | 同上（且静态 lint 亦漏 —— RHS 无 `args.` 字面） |
+
+**改动**：
+| # | 改动 | 文件 |
+|---|---|---|
+| 一~四 | 四处一律改 `os.path.basename(...)`；**`_probe_like` 变量本身不动**（2029/2030 行用于真实读文件，改则断 I/O），仅产物字段处归一 | `scripts/analyze_coverage_vshape.py`、`scripts/plan_methods.py` |
+| 五 | **新增 T23 产物路径无关性**（`T23a` 动态 / `T23b` 静态 / `T23c` AST 三段）——把上面那条只写在文档里的原则变成 rc≠0 的硬信号 | `tests/run_smoke.py` |
+| 六 | `scripts/plan_methods.py` 补 `import os`（见下「本轮自伤」） | `scripts/plan_methods.py` |
+
+**本轮自伤（记下来，教训比结论值钱）**：改动一~四落地后首次全量冒烟**判 FAIL** —— T14 三图全部产物 `MISSING`、T17 报「无可核对象」、整轮仅 2 分 35 秒（正常十几分钟）。根因是改动四所在文件 `plan_methods.py` **顶层没有 `import os`**，`os.path.basename` 运行即 `NameError`（plan 阶段 rc=1 → 下游全断）。
+
+**为何两道现成门禁都没拦住**：`py_compile` 只查语法、不解析名字；`T23b` 静态 lint 只看「该字段有没有走 basename」——两者判不出缺导入。**是 T14 的真跑链路把它揪出来的**（与 `run_smoke.py` T6 条目早就写下的判断一致：「py_compile/import 抓不住调用时 NameError，必须有这条真跑链路」）。更深一层的原因是我自己的取证错误：早先一条 grep 把两个文件的输出混在一起，我把 `analyze_coverage_vshape.py:63` 的 `import os` 错记到 `plan_methods.py` 头上，**没有取第二来源就动手**——故本条目把该教训写进技能文档，并新增 `T23c` 把这类错变成可机器拦下的信号。
+
+**T23 三段为何必须并存**：`T23a` 只扫 T14 真跑到的分支（上表 #一 的 `--fx-locations` 分支 T14 不经过，故 A 段抓不到它）；`T23b` 静态扫产出脚本的「路径语义字段」（`DXF文件`/`输入`/`来源`/`source_dxf`/`source_probe`/`params_json_path`）是否直接赋 `args.*`/`Path(args.*)`；`T23c` 用 **AST** 判「用了 `os.*` 却没 `import os`」——只认真正的属性访问，字符串/注释里的 `os.` 不算，零误报。
+
+**判别力反向验证（三段各一）**：`T23b` 判据打到修复前备份命中 **5 处**（含 F3/F4 两处历史漏网点）、打到现行代码 **0 处**；`T23c` 判据打到合成样例（`import json` + `os.path.basename(...)`）命中 `broken.py`、打到修复前备份与现行代码均 **0 处**（该缺导入是本轮自伤引入，非历史遗留——故合成样例才是它的判别力证据）；`T23a` 依据 = 修复前 T14 fresh 产物中 `profile.json` 三字段共 **9 处**绝对路径。
+
+**边界声明（不搞一刀切）**：`inspect.json`（门禁报告，记录「我读了哪些产物」是本分）与 `pipeline_timing.json`（耗时记录）天然含运行环境信息，**刻意排除**在复现基准外；`conflict.json` 的 `来源` 按其历史决定（一百零六）仍写完整路径——八路输入同名 `parsed.json` 时溯源需要完整路径区分，属另一类需求。
+
+**验证**：`py_compile` 全仓 0 错；补导入后单点复跑 `pipeline --stop-at plan` 三阶段 rc=0（此前 plan rc=1），产物 `profile.json` 路径字段归零；全量冒烟 ALL PASS（T14 转绿 + 新增 T23a/T23b/T23c）；`budget` / `check_docs`(D1~D12) / `check_contract_coverage` 三道门禁全过（其中 check_docs D3 首轮 FAIL 是因「冒烟范围」串在 README 第 63 行命令注释里，漏改该处即 FAIL——已补）。
+
+- **版本**：`version.json` 0.149.0 → **0.150.0**
+
+### 2026-10-04（一百四十九）：十轮迭代 R1 —— T14「三图 golden 回归」假红根因修复
+
+**动因**：用户指示「跑桌面三项目 → 修问题 → 复跑，迭代 10 轮」。R1 实跑（凤鸣朝阳 / 云峰 / 柳辛庄1-4 / 柳辛庄5-9）暴露 `run_smoke` T14 判 FAIL：12 个产物指纹与基线不符，而 CHANGELOG 一百四十七明确记「T14 三图 golden 默认回归全对拍一致」——**同代码两结论，必有假红**。
+
+**根因（三重证据链，逐步排除）**：
+1. **指纹交叉**：T14 自产 fresh 产物 vs 生产式调用产物，12 项中 **10 项 md5 逐位相同**，仅 2 项（`analyze_coverage_vshape` 的 `DXF文件`、`count_box_icons` 的 `输入`）不同 —— 二者恰是唯一记录「调用方路径原文」的产物，diff 证实差异仅为分隔符（`C:\\…` vs `C:/…`）。
+2. **历史 fresh 留档**：系统 temp 中留存 5 份 `ftth_golden_*`；2026-10-02 的 4 份指纹与旧基线**完全一致**，2026-10-03 23:46 的本轮**全部不一致** → 差异发生在 10-02 23:05 与 10-03 23:46 之间。
+3. **逐字节 diff 两期产物**：唯一差异是多出一行 `"_via_launcher": true`。
+
+→ 定论：`FTTH_VIA_LAUNCHER=1` 由 `ftth_launcher.py` 置入 → 经环境继承传给 `run_smoke.py` → 被 T14 **直调** `ftth.py` 的子进程继承 → T14 产物多写 `_via_launcher` 键，而基线（直调口径生成）不含该键 → **回归门禁永久假红**。一百四十七记录「全绿」是因当时 smoke 未经 launcher 启动。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| 一 | T14 子进程显式剔除 `FTTH_VIA_LAUNCHER`（`env=` 传入过滤后的环境），使直调语义自洽、不再受父进程启动方式影响 | `tests/run_smoke.py` |
+| 二 | 相对路径解析增加**技能根回退**：`HERE/<rel>` 不存在时再试 `SKILL_ROOT/<rel>`（文档写的 `tests/run_smoke.py` 属技能根相对，原实现只容忍 `scripts/` 前缀 → rc=2「找不到脚本」） | `scripts/ftth_launcher.py` |
+| 三 | `'DXF文件': args.dxf` → `os.path.basename(args.dxf)`，与技能内其余 5 个产出脚本既有约定一致 | `scripts/analyze_coverage_vshape.py` |
+| 四 | `"输入": args.dxf` → `os.path.basename(args.dxf)`；消费方 `ftth.py::_cb_fingerprint_ok` 本就按 basename 比对，兼容 | `scripts/count_box_icons.py` |
+| 五 | 基线按修后代码重生（`--regen-golden`） | `tests/golden_expected.json` |
+
+**验证**：`py_compile` 全仓 0 错；**相对路径**调用 `run_smoke` 可正常命中脚本（修复二生效）；`--regen-golden` rc=0，冒烟 ALL PASS；重生后基线中**除两处按约定修动的产物外，其余 md5 与旧基线逐位一致** —— 反证本轮**不存在代码回归**，纯属门禁口径缺陷。另：R1↔R2 两轮全量复跑 12/12 产物 md5 逐位一致，技能确定性无恙。
+
+**未修（列为待议，不阻塞）**：① T14 以「直调 ftth.py」为口径，与生产「经 launcher」路径产物天然不同（C7 要求产物带 `_via_launcher`），基线因此无法覆盖生产路径产物；② 「图面确无分纤箱图形符号」的图纸（柳辛庄）在 coverage 侧出现两种门禁结论（rc=2 硬失败 vs rc=0+全 pending），二者应统一。
+- **版本**：`version.json` 0.148.0 → **0.149.0**
 
 ### 2026-10-02（一百四十八）：README 追补 —— 门禁现状与目录表与 0.147 对齐
 
@@ -373,3 +686,94 @@ check_transitions 判据 #6 **正反用例各 4 项**（申报 LOCKED+pending �
 
 - **版本**：`version.json` 0.125.0 → **0.126.0**。
 
+### 2026-10-04（一百五十六）：桌面三项目实跑暴露的三处 P0（new-run 误归档 / B1 崩溃 / 户数整列丢）
+
+**实测动因**：按用户要求，对本机桌面三项目（凤鸣朝阳、柳辛庄、云峰，含 4 张 DXF）**不参考历史记录**从零实跑迭代。跑批经 `ftth_launcher.py` 驱动。三处缺陷均为「自测用例覆盖不到、真机一跑即现」型，其中第三处已造成数量级错误产出。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | `new-run` 归档范围由「目录内非 run_* 全搬」改为**排除输入与基准**：新增单一实现 `_newrun_keep()`，输入图纸 `.dxf/.dwg/.pkl`、几何缓存 `*.geom.json`、验证基准（表名含「标准答案/参考答案/answer」）原地保留并**逐条打印**（不静默）。原隐含前提「project-dir 内只放产物」在桌面三项目上不成立 —— DXF/geom/答案与产物同目录，会被一并搬空，紧随的 pipeline 必然找不到输入 | `scripts/ftth.py` |
+| ② | `summary` 楼层排序 key 由手写 `int(k.replace('F',''))` 改为复用 `floor_num_or_zero`（唯一入口）。原写法遇 `B1` 抛 `ValueError` 使总览整体崩溃；而 `B1层→B101` 是文档已载的已知形态，且该函数在本文件顶部早已导入并在别处使用 —— 属「同一件事两份实现」的必然漂移。全量 grep 确认同类写法仅此一处 | `scripts/ftth.py` |
+| ③ | **层数/布线归属改由区间法定带**：不再调 `match_y_to_floor(..., tol=args.y_tol)`（语义＝「最近 + 距离闸门」）。`--y-tol` 缺省按层高/15 自适应，实测某图为 1040，而户数列与楼层刻度列存在系统性错位 dy=1059，仅超阈 19 即**整列拒配、脚本仍 rc=0**。同文件安装楼层当年因同一根因整列落空、已改纯区间法，本次补齐户数与布线这条漏网之鱼；带内多候选时按 y 距离取最近并**登记冲突交人**，落在带外的候选显式告警不采用 | `scripts/parse_dxf_structured.py` |
+| ④ | 户数/皮线正则**形态对齐**：`HU_RE`/`CABLE_RE` 两处消费由 `search` 改 `fullmatch`（与主管路 `parse_dxf_structured.py` 业务特征判定、`floor_engine.py` 一致）。原 search 会把皮线规格标注 `2Px2芯x28m` 中的 `x28` 读成 28 户（实测该类误命中 445 条），污染元素台账与 V 型窗口。两者互为镜像，故同时改 | `scripts/ledger_elements.py`、`scripts/analyze_coverage_vshape.py` |
+
+**验证**：`py_compile` 四个文件均绿。**回归三项目**：凤鸣朝阳三轮一致（313 户 / 非空层行 148/148 / FAIL 0 / WARN 3），未受改动影响；柳辛庄 1块地由 **8 户 → 468 户**、非空层行 4/4 → **180/180**，且经**三源独立印证**（图签 `N层/M户` 算得 468、逐层直读修复后 468、图上自述「共覆盖住户467户」差 1）；云峰两轮结果一致，未发现由本次改动引入的回归。
+
+**遗留（未修，已登记）**：云峰图标法 331 户中 231 户落在共用刻度列/偏移异常列（inspect 明示不得当已核消费），与 parse 直读 16 户构成两来源冲突；云峰 C9 五项未定案致 inspect rc=2；`split-band` 仍未接入 pipeline 阶段链，多地块图须手工分带。以上均需人工裁决或后续改造，本轮未擅自改动。
+
+- **版本**：`version.json` 0.155.0 → **0.156.0**。
+### 2026-10-05（一百五十七）：迭代第 4 轮 —— 柳辛庄 5-9 地块首次实跑 + 成品首次对拍答案暴露的三处缺陷
+
+**实测动因**：继续「跑 → 发现 → 修 → 回归」。本轮首次跑到**此前从未执行的路径**：柳辛庄 5-9 地块（含 `9-1/9-2` 连字符地块名的分带）、`gen` 成品出表、`verify-answer` 对标准答案。三条均为首次真机执行。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | **补上被调用方提示、入口却没有的通道**：`coverage` 早在 2026-09-18 就有 `--allow-low-pairing`（低于配对率阈值时强行继续），其失败文案原文让用户加该开关，**而 `pipeline` 一直没有这个参数** —— 用户照做只会拿到 `unrecognized arguments`（与其注释自承的「直调脚本有、统一入口没有 = 接口断层」同类缺陷重演）。本次给 pipeline 补同名开关，`cov_cmd == "coverage"` 时透传；**默认 False**，保持原硬失败语义，仅消除死路，不替人决策 | `scripts/ftth.py` |
+| ② | **消除「有答案但不可达」**：新增 `_pipe_hint_fx_symbol_cands()`（单一实现，入参为画像**路径**，与同级 `_pipe_effective_layers` 一致）。当 `_want_fx` 为空时列出 `probe_signals.fx_symbol_layer_candidates` 的层名/得分/推荐与否/判据分项（一致性·标题区重叠·闭合矩形·众数簇·众数尺寸），并给出「显式指定图层」与「确无符号画法则加 `--allow-low-pairing`」两条处置。**不自动采信未达门槛者**。此前候选只因未满足「一致性>=0.8 且 标题区重叠>=0.8 且 数量吻合」就被埋在 profile 里，而 coverage 的失败文案却把人导向「去猜图层名」—— 排错方向被带偏 | `scripts/ftth.py` |
+| ③ | **`verify-answer` 列定位改为按表头名**（当日 P1-E5 刚上线即修复）：原实现硬写 Excel 列位 `column=8/10/12/14/16`（H/J/L/N/P），那**只是 24 列定稿模板**的布局；用未传 `--template` 的内置 11 列降级表产物去对拍时五列整体错位（实测取到「单元/户号/越界空/越界空/越界空」）→ **逐行全 DIFF、每栋 `[DIFF(答案None)]`**，把「列错位」呈现成「结果全错」。改为按别名表（六级↔楼栋、七级↔单元、八级↔楼层、九级↔户号、分纤箱编号↔分纤箱）按名定位，缺列时**报人中止**而非静默取空；并把「仅楼层写型不同」的差异单独归类提示（不抹平，仍计入 diff） | `scripts/ftth.py` |
+
+**交叉验证（第二来源）**：
+- 第 1-3 轮的户数区间法修复（`parse_dxf_structured.py`）在**全新 4 个子带**上全部生效且与首次实测一致：band8 非空层行 **194/194**、band9-1 **142/142**、band9-2 **108/108**（修复前同类图为 4/4）。
+- **凤鸣朝阳端到端对拍：差异行数 0**（313 户，每栋户数 `OK`、每栋分纤箱集合 `OK`、合计 313=313）。流程：`pipeline` → `gen --floor-format chinese` → `verify-answer`（答案＝项目自带的「标准答案核对版」）。这是首次把成品表与人工答案逐行对齐。
+- 柳辛庄 5-9 的 `AXIS` 符号层候选**经客观几何证否**：12 个闭合矩形尺寸完全一致（14640×9840），但 FX 编号到最近矩形 min 距离 **132962**（≈矩形宽的 9 倍）、含 FX 的矩形 **0/12** —— 保守不推荐是正确的，未冤枉它。
+
+**验证**：`py_compile` 绿；技能自带冒烟仅 T14 FAIL（云峰 golden 漂移，上一轮已登记的待裁决项），**本轮改动零新增失败**。
+
+**遗留（未修，已登记）**：柳辛庄 5-9 四带的 inspect 均 rc=2（C9 大量未定案 / C10 图签与系统图矛盾 / C6 覆盖闭合缺线索），属需人工裁决的第④类，**未出成品**；band5 需 `--allow-low-pairing` 才能过 coverage（结果须人工复核，不得当成品）；云峰 T14 golden 漂移（`*16` 是否某层真户数待裁决）；`split-band` 仍未接入 pipeline 阶段链，多地块图仍须手工分带。
+
+- **版本**：`version.json` 0.156.0 → **0.157.0**。
+### 2026-10-05（一百五十八）：迭代第 5 轮 —— split-band 接入串跑 + 整单元户数缺失被「有布线」掩盖
+
+**实测动因**：继续「跑 → 发现 → 修 → 回归」。本轮首次把柳辛庄 1-4 剩下的 3 个分带跑完，并解决「多地块图必须人工手搓分带」这一结构性缺口。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | **`split-band` 接进 pipeline 串跑**（填补「执行环节零接线」）：新增 `_pipe_fanout_bands()`，在 `unit_gaps` 之后、`parse` 之前量分带方案；子带数 >=2 即扇出，对每个子带**递归跑一条完整 pipeline**（产物在 `<outdir>/bands/<带名>/`），汇总退出码取最严重者。位置**刻意选在 parse 之前的所有阶段之后** —— 串号风险只来自 parse 及下游（同名楼栋按楼名去重会静默串号），而 titleblock/fxmap/fx_locations/unit_gaps 是整图级、无串号风险且各有独立价值（图签第二来源、单元×箱预检）。开关 `--no-auto-split-band`（默认开启；单地块图量出 <2 带自动原路返回，零影响）。递归时强制关闭分带，防二次分带 | `scripts/ftth.py` |
+| ② | **C5「整单元户数缺失」检测**：此前只统计「户数+布线**两列皆空**」的层行（blank_rows）。实测存在「布线读到了（`32m*2`）、户数却是 None」的层 —— 它们**不是** blank_rows，于是在 C5 里既不进明细、也不告警，**户数凭空少一半却全无提示**（band4 图签 165 户 / 直读 105 户）。改为按「**户数缺失**」口径统计，整单元 100% 缺失时点名列出（含同楼有户数的兄弟单元作对照），并明确「不得按地下车库层等图面事实处理，确认前不得出表」。该检测**独立于 blank_rows 分支**执行（否则全图每层都有布线值时会被整段跳过） | `scripts/inspect_closure.py` |
+| ③ | 扇出位置回归修正：首版把扇出放在 `plan` 之后，冒烟 golden 立刻报柳辛庄 1-4 的 `titleblock/fx_locations/unit_box_gaps` 三项 **MISSING** —— 整图级阶段被连带跳过。移至 `unit_gaps` 后即恢复。记录此坑：改串跑链时，**插入点之后的既有阶段会整体消失**，须以 golden/冒烟兜底 | `scripts/ftth.py` |
+
+**交叉验证（第二来源）**：
+- 柳辛庄 1-4 与 5-9 两张多地块图，由「必须人工手搓分带 + 逐带手跑」变为**一条命令自动跑完 8 个带**。
+- 柳辛庄 1块地 `pipeline → gen --floor-format chinese` 出表 **468 户**，与图签 `N层/M户` 独立算出的 468 **吻合**。
+- 凤鸣朝阳回归不变（313 户 / 148/148 / FAIL 0 / WARN 3）；单地块图未产生 bands/ 目录，未受影响。
+- 技能自带冒烟**仅剩 T14 一项**（云峰 golden 漂移，第 1-3 轮已登记的待裁决），本轮改动零新增失败。
+
+**遗留（未修，已登记）**：**多单元共用户数列只读到一个单元** —— 客观证据：同一层同一布线 `32m*2`，1单元读到户数 2、2单元读到 None（band4 1#/2#楼 2单元各 16 层全缺）。图签逐栋对账量化：柳辛庄 1-4 的 band1/band3 差 0，band2 差 **-99**、band4 差 **-60**（合计 -159 户）。归属属第④类，**不得自动裁定**，须人工确认是否为共用刻度列；该检测已能报出，但缺失本身未修。云峰 C9 仍有 5/46 项未定案 → 不可出表。
+
+- **版本**：`version.json` 0.157.0 → **0.158.0**。
+
+### 2026-10-05（一百五十九）：补登收尾 —— clone_shared_hu 落地（P0 语法修复 + 统一入口补通道）
+
+**实测动因**：外部 AI 架构审核报告（桌面 `ftth-address-extractor审核报告.md`）实测指出 `floor_engine.py` P0 语法阻塞、全链不可运行。交叉审视复核结论：**P0 属实（已复现）**；报告另有两处口径偏差一并修正 —— ① changelog 主文件实已登记 157/158（非「最新只到 156」），`minor=修订序号` 口径未破，真正缺口仅本条（159 功能改了代码未登记版本）；② T14 无真图时判 **SKIP** 而非 FAIL（`run_smoke.py` 明示 `[SKIP] T14 真图缺失`），报告所见「三图全 MISSING」的直接死因是**跑冒烟的解释器无 ezdxf**（T14 直调 `ftth.py` 不经启动器、`PY=sys.executable`），以内置 Python 跑即全 MISSING，属环境假象；**冒烟须以带 ezdxf 的主 Python 跑**。本条补登 clone_shared_hu（上轮代码已落、带语法错、未登记版本）并收尾。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | **P0 语法修复（解阻塞）**：`split_units_by_marker` 新增 docstring 被 243 行 `"""` 提前闭合，245 行起旧注释（09-12 修正 / 09-19 共享列）成裸文本，`2026-09-12` 前导零触发 SyntaxError → `import floor_engine` 即炸，parse/coverage/inspect 全链不可运行（py_compile 43 中 1 坏、T0/T23c 连带红）。修法＝删 243 行闭合引号、旧注释收进同一 docstring；docstring 不入产物，零行为变更 | `scripts/floor_engine.py` |
+| ② | **统一入口补通道**（157① 同构缺陷第三例）：`--clone-shared-hu` 上一轮只落在直调入口，`ftth.py parse` 未注册 → 传参报 `unrecognized arguments`（「加开关必漏」坑再应验）。补 `p_parse` 注册（store_true 默认 False）；`build_cmd` 按 2026-09-15 布尔统一规则自动转发，分发段零改动 | `scripts/ftth.py` |
+| ③ | **参数表登记**：parse 主要参数列表补 `--clone-shared-hu`；高频坑区补语义与边界（含「pipeline 未透传，多带图须逐带直跑 parse」） | `references/scripts_reference.md` |
+
+**功能语义（补登，上轮已写未录）**：共用轴户数列（落在**全部单元 x 范围之外**）默认只挂最近单元 → 多单元楼其余单元整单元无户数（158 遗留「合计 -159 户」根因，C5 已能点名报出）；加开关则克隆进该栋每个单元。**属归属裁定、默认关** —— 须人工以图签第二来源（「层数×每层户数×单元数」）核对确为「每单元每层」口径后再开，否则把「整栋每层」口径翻倍；仅克隆户数，箱编号/皮线米数仍不克隆（克隆必重复计数）。
+
+**验证**：py_compile 全仓 43/43 绿；`ftth.py parse --help` 正常显示新参数；主 Python 3.13（ezdxf 1.4.4）跑 `run_smoke.py` 全套：除 T14 云峰已登记漂移外**全绿**，fmcy/lxz14 golden md5 与基线一致（①②改动零行为回归的直接证据）。T14 云峰差异与本轮改动无关：`parsed.json` md5 ≠ 基线源于 156 ③④（fullmatch / 区间法带归属）+「`*16` 是否某层真户数待裁决」；inspect F=5/W=12 与 158 遗留清单逐条对应（C9 5/46 未定案、331 户中 231 户落不可信列），不得 regen 基线。
+
+**遗留（未修，已登记）**：pipeline 未透传 `--clone-shared-hu`（扇出递归构造 argv 改动面 3~4 处，独立立项）；云峰 golden 漂移与 C9 五项 pending 仍待人工裁决；审核报告其余结构性建议（parse/analyze_coverage 加 main 守卫、fl_num/unit_no/cable 单一源收敛、拆 ftth_common、ftth.py 分发表静态校验、T0 纳入提交门禁）待用户裁决优先级。
+
+- **版本**：`version.json` 0.158.0 → **0.159.0**。
+
+### 2026-10-06（一百六十）：y 坐标用途边界成文 + 口径B:y坐标关联退役（柳辛庄会审视议落地）
+
+**实测动因**：桌面《柳辛庄项目_技能会审报告.md》提"P1-1 清理 y 坐标旧口径"，复审时外部 AI 给出"修正意见"主张"不要删 y 坐标、应降级为几何归属证据"。交叉核实代码后确认：**现行体系里被禁的只是"y 最近邻推算安装/覆盖楼层"，y 用于空间归属/楼层带包含/连续体认领/图标贴合本就合法且在用**——误会源于"口径B"一词两义（旧=`y坐标关联`推算已废弃 2026-09-18；新=`区间法`四法之一合法）。云峰产物实证：`coverage.json` 认领依据"箱的y坐标落在该连续体区间内（几何直读）"、`count_box.json` 图标按容差 6.0 贴皮线末端、`fxmap.json` 23 编号全"口径A:图上直写"——**全程零最近邻推算、全包含/贴合/对位**，是"y 该保留"的最强正例。但代码层一处真 bug：`extract_fx_map.py:341` 的"口径B:y坐标关联"分支在 present 场景下仍产出安装楼层值，parse 回填分支（`FX_MAP 非空+唯一映射`）不区分口径来源 → 四法外推算可经对照表通路静默进成品。本条成文边界 + 堵漏。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | **行为收口（核心）**：`extract_fx_map.py` 编号与楼层标注 |dy|>5.0（非紧贴同行）的"y 最近邻"分支退役——不再赋安装楼层（留 None + `最近楼层标注_留证`/`最近楼层距离_留证` 留证），标签改"未定：y最近邻不作来源（2026-09-18裁决）"。下游 parse 回填分支因"安装楼层非空"条件不满足而自然不采信 → 四法外推算无法经对照表通路进成品。|dy|≤5.0（紧贴同行=直写）保留。空间归属（楼栋/单元）不受影响 | `scripts/extract_fx_map.py` |
+| ② | **方法池死条目删除**：`_METHOD_POOL_RULES` 删 `("编号文字", "读取标注 + 坐标关联")`——methods/*.json 无真实触发者（候选描述含"编号文字"时必含"区间"，先命中"区间法"条目）；且分类目标"读取标注 + 坐标关联"非方法池四类之一，被触发会让 `install_by` 误判为"读取标注（编号旁直写）" | `scripts/plan_methods.py` |
+| ③ | **handoff 措辞精确化**（保留空间归属语义）："坐标关联"→"几何空间归属（x/y 双坐标分区）"+ 注明"不用于推算安装/覆盖楼层"；降级提示同步改"『依系统图坐标关联』"→"『依系统图几何空间归属』" | `scripts/plan_methods.py` |
+| ④ | **术语/注释清理**：`parse_dxf_structured.py:28` docstring 旧术语"口径B y坐标关联"更新为四法+禁令语境；`count_households.py` 皮线归属标注为区间法（行为就是区间法，旧标签误标）+ LEGACY 定位；`step2_selfcheck.md` 口径B检查项"y坐标关联距离合理"→"安装楼层误差在合理范围内" | `scripts/parse_dxf_structured.py`、`scripts/count_households.py`、`references/step2_selfcheck.md` |
+| ⑤ | **铁律⑩成文**：SKILL.md 浓缩版加铁律⑩"y 坐标用途边界"（合法：包含判定/容差贴合/区间对位；禁止：最近邻比较推算）；`measurement_architecture.md` 全文版+云峰正例/柳辛庄 band8 反例+边界词"包含 vs 距离比较"+落地说明 | `SKILL.md`、`references/measurement_architecture.md` |
+
+**边界一句话**：y 坐标回答"它在谁的辖区里"（包含/贴合/对位，合法——楼栋-单元空间归属、楼层带归属、竖线法连续体认领、图标贴合）；y 距离回答"它离谁最近"（最近邻比较推算安装/覆盖楼层，禁止作为结果来源）。
+
+**验证**：py_compile 全仓 43/43 绿；`run_smoke.py` 全套（含 T14 三图 golden）ALL PASS——云峰 fxmap 23 编号全口径A，收口分支不触发 → fxmap/parsed/coverage/inspect 全不变（零行为回归的直接证据）；凤鸣朝阳无 fxmap、柳辛庄1-4 全图守卫早停均不受影响。柳辛庄 5-9 分带复跑对拍 iter10 基准：band5/8/9-1/9-2 inspect rc/F/W 全一致（band3 fxmap 全口径A，收口零差异）。
+
+- **版本**：`version.json` 0.159.0 → **0.160.0**。

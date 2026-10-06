@@ -1367,7 +1367,7 @@ def main():
 
     out = {
         "口径": "家居配线箱图标法（贴皮线末端）",
-        "输入": args.dxf,
+        "输入": os.path.basename(args.dxf),
         "参数": {
             "皮线图层": data["wire_layers_used"],
             "图区y": [round(ry0, 2), round(ry1, 2)] if ry0 is not None else None,

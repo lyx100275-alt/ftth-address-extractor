@@ -453,7 +453,49 @@ def parse_ruling_scope(text):
     return ' '.join(p for p in parts if p), unit, box
 
 
-def judge_pending_scope(objs, unit_name, box_id=None, bldg_key=None):
+def is_shared_title(name):
+    """标题是否为「一窗多栋」共享系统图（如 `[共享]1-3号楼综合布线系统图`）。
+
+    判据走共享入口 :func:`parse_bldg_nums_ex` —— **本技能唯一楼号解析实现**，
+    不另写正则（`N-M号楼` / `N、M号楼` / `N/M号楼` / `[共享]…` 写法各异）。
+    返回 True 表示该标题承载**多于一个**楼号，其楼栋作用域不得按「首个楼号」判定。
+    """
+    try:
+        nums, _amb = parse_bldg_nums_ex(str(name or ""))
+    except Exception:                                            # noqa: BLE001
+        return False
+    return len(nums) > 1
+
+
+def ruling_bldg_matches(scope_bldg, bldg_key, src_window=None):
+    """裁决对象串的**楼栋段**是否作用于 ``bldg_key`` 这一栋（全技能唯一实现）。
+
+    三级判据，任一命中即算命中：
+
+    ① **字符串相同** —— 含 `[共享]…` 窗键本身（窗节点与作用域同名）；
+    ② **同源共享窗** —— 该栋条目的 ``来源共享窗`` 恰为作用域。共享窗标题作作用域时，
+       窗内各成员楼栋的箱**同出一个米数窗/竖干**，证据完全同源，必须一律命中；
+       旧口径按「首个楼号」取 ``bldg_num`` 配对（`[共享]1-3号楼…` → 1），
+       于是同窗 2#/3#楼被判 settled、仅 1#楼 pending —— 同源证据状态分裂，属任意口径。
+    ③ **楼号相同** —— 仅当作用域**不是**共享标题时启用（`N号楼` vs `N#楼` 写法差异的
+       既有约定）。共享标题一律不进本支：其首值是「取首个」的副作用，不是判据。
+
+    推广：凡裁决作用域落到「一窗多栋」标题上，先问「这栋是不是从这个窗展开的」，
+    而不是「这栋的楼号是不是等于标题里的第一个数」。
+    """
+    if not scope_bldg:
+        return True
+    if scope_bldg == bldg_key:
+        return True
+    if src_window and scope_bldg == src_window:
+        return True
+    if is_shared_title(scope_bldg):
+        return False
+    _b1, _b2 = bldg_num(scope_bldg), bldg_num(bldg_key)
+    return bool(_b1) and _b1 == _b2
+
+
+def judge_pending_scope(objs, unit_name, box_id=None, bldg_key=None, src_window=None):
     """裁决项是否作用于「本单元全部箱」（第 1 位）/「本箱」（第 2 位）。
 
     **这是覆盖类脚本判 ``result_confirmation`` 的唯一定义**（2026-09-18 统一）。
@@ -476,21 +518,22 @@ def judge_pending_scope(objs, unit_name, box_id=None, bldg_key=None):
     ``analyze_coverage.judge_object_name``）。不传时退化为「只认对象首段与本单元名
     完全相同」，即**不猜楼栋**（保守，不会误伤别栋）。
 
+    ``src_window`` 是本单元所属楼栋的**来源共享窗键**（coverage 条目的 ``来源共享窗``
+    字段，调用方应传）：共享窗标题作作用域时，靠它把「一窗多栋」的成员楼栋**全部**
+    命中（判据见 :func:`ruling_bldg_matches`），取代旧「取首个楼号」的任意口径。
+
     返回 ``(是否单元级命中, 是否箱级命中)``。
     """
     u = str(unit_name or '').strip()
     uk = str(bldg_key or '').strip()
     u_unit = _unit_seg_of(u)
-    u_bnum = bldg_num(uk or u)
     for _o in objs:
         _b, _un, _bx = parse_ruling_scope(_o)
         if not (_b or _un or _bx):
             continue
-        # ① 楼栋段校验：字符串相同，或楼号相同（后者是既有口径）
+        # ① 楼栋段校验：走共享入口 ruling_bldg_matches（同键 / 同源窗 / 同楼号三级）
         if _b:
-            _same = (_b == uk) if uk else (_b == u)
-            if not _same and u_bnum and bldg_num(_b) == u_bnum:
-                _same = True
+            _same = (ruling_bldg_matches(_b, uk, src_window) if uk else (_b == u))
             if not _same:
                 continue
         # ② 单元段：空 = 楼栋级（作用于本楼栋全部单元）；非空 = 必须命中本单元段
@@ -785,7 +828,18 @@ def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
                               % (_n, " / ".join("%.0f" % _x for _x in sorted(_xs)), len(_xs)))
             _lines.append("锚点池按楼名去重，同名楼会互相覆盖（保留先出现者，其余同名楼整栋静默丢失），"
                           "全图解析的楼栋归属不可信。")
-            _lines.append("处理：这是多地块图纸 —— 用 split-band 子命令按 y 带切出各地块子 DXF，"
+            # 2026-10-05（一百五十九）：原文案只给了「手工 split-band」一条路，而
+            #   pipeline 自本日已内置自动分带（`_pipe_fanout_bands`，默认开启）——
+            #   加了能力却没更新这道守卫的处置提示，用户撞到 rc=2 时仍会被导向
+            #   手工路线（文档层滞后于规则层）。两条路都要给，并说明本条错误出现的
+            #   前提（即分带被跳过/未生效）。
+            _lines.append("处理：这是多地块图纸 —— 须**按地块分带**后再跑下游，不要全图解析。两条路：")
+            _lines.append("  · 【推荐】走 pipeline，它已内置自动分带："
+                          "`ftth.py pipeline --dxf <全图> --project-dir <项目目录>`"
+                          "（多地块图会自动切带并对每带递归跑完整链路，产物在 "
+                          "`<outdir>/bands/<带名>/`）。若你是加了 `--no-auto-split-band` "
+                          "才撞到本错误，去掉该开关即可；")
+            _lines.append("  · 直调 parse/手工跑：先用 split-band 子命令按 y 带切出各地块子 DXF，"
                           "再对每个子图分别跑 parse / coverage 等下游子命令。")
             _lines.append("  · 图上有「N块地」类标注（已实测）时："
                           "`ftth.py split-band --auto --config <config.json> --dxf <全图> "

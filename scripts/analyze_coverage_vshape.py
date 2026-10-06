@@ -80,6 +80,16 @@ ensure_console_utf8()
 
 log = setup_logger("analyze_coverage_vshape")
 
+# 箱位锚「明确非本窗」的折合字高门限（2026-10-04，R2 缺陷 D2 立）。
+#   背景：箱编号常画在平面图区/箱表区，与系统图区在 x 上同处一个窗口却无几何关联，
+#   故 --box-anchor-x-factor 超阈者**剔除归属**。但「剔除」不等于「阻塞」——
+#   旧实现凡超阈即阻塞，在一窗多栋图上会把窗内全部成员楼栋一并拦下。
+#   实测分离带（本文件 P0-9 注释 + r02 实测）：真锚距米数列 4.9~5.8×字高；
+#   邻楼锚 34×；箱表区编号 40~59×（r02 band1 实测被剔除两锚 40.73× / 47.14×）。
+#   故取 30×字高作「明确外来」门限：距真锚实测上限 5.2 倍外，且落在邻楼/箱表带同侧。
+#   语义：折合字高 ≥ 本值 ⇒ 判非本窗锚，**登记但不阻塞**；低于本值 ⇒ 灰区，维持阻塞。
+ANCHOR_FOREIGN_FACTOR = 30.0
+
 
 class CableParseError(ValueError):
     """皮线米数标注无法按 --cable-pattern 解析出 (米数, 根数)。"""
@@ -845,7 +855,7 @@ def main():
         log.info('解析侧配对未启用：%s（锚缺席配对走兼容路径，不影响 V 谷底主计算）',
                  _parse_why or '无可用箱数据')
     result = {
-        'DXF文件': args.dxf,
+        'DXF文件': os.path.basename(args.dxf),
         '方法': 'V型计算（皮线米数 V 形规律）：米数谷底→箱安装层；相邻谷底间米数最大行→覆盖分界',
         '说明': '本结果由文字标注几何推得。已用箱号文字 y 做独立交叉验证（自检_v底vs箱符号）',
         '参数': {
@@ -996,7 +1006,10 @@ def main():
             except CableParseError as _ce:
                 _fmt_bad.append((_c[2], str(_ce)))
         _fmt_ok += len(cables)
-        hus = [(x, y, s) for x, y, s, _h in win if HURE and HURE.search(s)]
+        # 2026-10-04（P0-A5）：与 parse 主路径一致，整条文字恰好构成户数标注才算数。
+        #   原 search 会把皮线规格 `2Px2芯x28m` 里的 x28 当成 28 户混入 V 型谷底窗口。
+        hus = [(x, y, s) for x, y, s, _h in win
+               if HURE and HURE.fullmatch(str(s).strip())]
         # 箱位锚：除 --fx-pattern（编号）外，还可认 --box-mark-pattern（系统图上直写的
         #   「分纤箱／配线箱」字样）。后者是 V 谷底定层的**独立第二来源**——实测有的图
         #   系统图上只写「配线箱」、编号全在平面图区，只认 FX 编号会让自检整段为空。
@@ -1101,13 +1114,39 @@ def main():
                     '距最近米数列': round(dx, 1),
                     '折合字高': round(dx / _hmed, 2) if _hmed else None} for b, dx in _box_far]
             binfo['超邻域箱锚'] = _bf
-            result['需人工裁决'].append({
-                '对象': bkey,
-                '事项': '存在 %d 个超出米数列邻域（>%.4g×字高）的箱位锚，已剔除、不参与箱编号归属'
-                        % (len(_box_far), args.box_anchor_x_factor),
-                '说明': '箱位锚 %s。箱编号常画在平面图区/箱表区，与系统图区无几何关联；'
-                        '若这些确是本单元箱位，请核对图纸或上调 --box-anchor-x-factor 后复核。'
-                        % [(_b[2], '距%.0f' % _dx) for _b, _dx in _box_far]})
+            # 2026-10-04（R2 缺陷 D2）：超阈锚按「折合字高」**再分两档** —— 不让一道
+            #   零容差硬闸把整窗判死（对应 operations_discipline：结构判据须留降级通道）。
+            #   >--box-anchor-x-factor 者一律**剔除归属**（口径不变）；「是否**阻塞**」分级：
+            #     · 灰区（未达 ANCHOR_FOREIGN_FACTOR×）—— 可能是本窗锚被画远，维持**阻塞**；
+            #     · 明确外来（≥ ANCHOR_FOREIGN_FACTOR×）—— 已落在邻楼/箱表带量级，
+            #       **登记但不阻塞**（显式 `阻塞: False`，同「已排除」语义）。
+            #   根因：窗内自身锚全部配对成功、被剔除的是**别家的**远锚；一律阻塞时，
+            #   一窗多栋图上邻楼的远锚会把窗内全部成员楼栋一并拦下（r02 实测：
+            #   柳辛庄 band1 12 箱 / band9-1 16 箱 pending 全部源于同一条该事项）。
+            _fh = (lambda _dx: (_dx / _hmed) if _hmed else None)
+            _gray = [(b, dx) for b, dx in _box_far
+                     if not _hmed or _fh(dx) < ANCHOR_FOREIGN_FACTOR]
+            _foreign = [(b, dx) for b, dx in _box_far
+                        if _hmed and _fh(dx) >= ANCHOR_FOREIGN_FACTOR]
+            if _gray:
+                result['需人工裁决'].append({
+                    '对象': bkey,
+                    '事项': '存在 %d 个超出米数列邻域（>%.4g×字高）的箱位锚，已剔除、不参与箱编号归属'
+                            % (len(_gray), args.box_anchor_x_factor),
+                    '说明': '箱位锚 %s。箱编号常画在平面图区/箱表区，与系统图区无几何关联；'
+                            '若这些确是本单元箱位，请核对图纸或上调 --box-anchor-x-factor 后复核。'
+                            % [(_b[2], '距%.0f' % _dx) for _b, _dx in _gray]})
+            if _foreign:
+                result['需人工裁决'].append({
+                    '阻塞': False,
+                    '对象': bkey,
+                    '事项': '存在 %d 个远距箱位锚（≥%.4g×字高），已剔除、不参与箱编号归属'
+                            '（登记不阻塞）' % (len(_foreign), ANCHOR_FOREIGN_FACTOR),
+                    '说明': '箱位锚 %s（折合字高 %s）。已达「邻楼锚/箱表区」量级'
+                            '（真锚实测 4.9~5.8×字高），判为**非本窗锚**，故登记不阻塞 —— '
+                            '窗内自身锚的归属与覆盖不受影响；若确为本窗锚，请核对图纸后重跑。'
+                            % ([(_b[2], '距%.0f' % _dx) for _b, _dx in _foreign],
+                               [round(_fh(_dx), 2) for _b, _dx in _foreign])})
 
         # 2026-09-26（第5轮迭代）：本窗口共享展开收集器（仅共享窗配对成功时消费）。
         _win_expand = {}
@@ -1432,7 +1471,7 @@ def main():
     # 根因：凤鸣朝阳 8#楼曾因窗口截断漏 17F/18F（FL08-FX02 只覆盖到 16F），
     #   而既有自检只查 V 形单调性 + V底vs箱符号偏差（均 0 告警），漏层静默通过；
     #   门禁用**独立来源**（户数标注 X户）交叉校验覆盖结果，缺层必报。
-    _cov_missing = []      # (楼栋, 单元, 缺失楼层列表, 覆盖并集)
+    _cov_missing = []      # (楼栋, 单元, 缺失楼层列表, 覆盖并集, 户数标注楼层)
     for _bk, _bv in result['楼栋'].items():
         for _un, _uv in _bv['单元'].items():
             _covered = set()
@@ -1443,26 +1482,34 @@ def main():
                 continue    # 本单元无户数标注（无法建期望），跳过
             _miss = sorted(_hu_expected - _covered, key=fl_num)
             if _miss:
+                # 户数期望须随条目携带：后文循环只能见到元组内字段，
+                # 直接引用 _hu_expected 会取到外层循环最后单元的值（陈旧变量）。
                 _cov_missing.append((_bk, _un, _miss,
-                                     sorted(_covered, key=fl_num)))
+                                     sorted(_covered, key=fl_num),
+                                     sorted(_hu_expected, key=fl_num)))
+
+    def _fmt_floors(_fls, _lim):
+        if not _fls:
+            return '无'
+        if len(_fls) <= _lim:
+            return '/'.join(_fls)
+        return '%s...%s(%d层)' % (_fls[0], _fls[-1], len(_fls))
 
     if _cov_missing:
         print('\n自检 · 覆盖完整性: 发现 %d 个单元覆盖缺层！' % len(_cov_missing))
-        for _bk, _un, _miss, _covered in _cov_missing:
+        for _bk, _un, _miss, _covered, _hu in _cov_missing:
             print('   ! %s %s 缺失楼层 %s（覆盖并集 %s）'
                   % (_bk, _un,
                      '/'.join(_miss),
-                     '/'.join(_covered) if len(_covered) <= 12
-                     else '%s...%s(%d层)' % (_covered[0], _covered[-1], len(_covered))))
+                     _fmt_floors(_covered, 12)))
             result['需人工裁决'].append({
                 '对象': '%s %s' % (_bk, _un),
                 '事项': '覆盖范围缺失楼层 %s（V形法结果与户数标注不符）'
                         % '/'.join(_miss),
                 '说明': '覆盖并集 %s；户数标注楼层 %s。'
                         '请检查窗口边界/米数列是否被截断（参考凤鸣朝阳 8#楼 P0-12 修复）。'
-                        % ('/'.join(_covered) if len(_covered) <= 8
-                           else '%s...%s(%d层)' % (_covered[0], _covered[-1], len(_covered)),
-                           '/'.join(sorted(_hu_expected, key=fl_num)))})
+                        % (_fmt_floors(_covered, 8),
+                           _fmt_floors(_hu, 40))})
 
     # ---- 自检：偏差可信门禁（2026-09-16，12坑复核·坑7）----
     #   阈值 = --dev-gate-factor × 层高（尺度无关，禁用绝对坐标值）。
@@ -1497,7 +1544,10 @@ def main():
         _loc_idx = {}
         for _e in _fxl.get('唯一箱位') or []:
             _loc_idx.setdefault((_e['楼栋'], _e['单元']), set()).add(_e['安装层'])
-        _xchk = {'来源': args.fx_locations, '比对总数': 0, '一致': 0, '不一致': 0,
+        # 「来源」只记 basename：本字段是**溯源标注**，无消费方；写调用方路径原文
+        # 会让产物 md5 随 outdir 漂移（同图换目录跑 → 指纹不同），
+        # 违反「产物不得含随运行变化的路径」设计原则（见 check_launch_path.py 开篇）。
+        _xchk = {'来源': os.path.basename(args.fx_locations), '比对总数': 0, '一致': 0, '不一致': 0,
                  '无标注可校验': 0, '共享组跳过': 0,
                  '标注侧唯一箱位数': len(_fxl.get('唯一箱位') or []),
                  '键未识别未比对': [], '楼栋键区间歧义': []}
@@ -1586,12 +1636,42 @@ def main():
     #   （如『疑似跨图带连续体（已排除）』），不构成「结论待裁决」。
     _pend_items = pending_items_from_rulings(result.get('需人工裁决'))
     _st_settled = _st_pending = 0
+    # 2026-10-04（R1 缺陷 D1）：共享窗**证据副本**不计入结果状态。
+    #   窗内无箱号锚时走 parse 配对，其箱随后被上方「共享组逐楼栋展开」复制到各成员楼栋
+    #   另立条目（该单元带 `来源共享窗` = 窗键）。窗节点里那一份是**副本**：与成员楼栋
+    #   条目同带 result_origin/result_confirmation 时，同一箱被计两次，且两处状态互相矛盾
+    #   —— 成员楼栋按本栋作用域判 settled、窗节点按整窗作用域判 pending ⇒ C9 以「幽灵
+    #   pending」把整条链拦在出表之前（实测：柳辛庄 5 张分带图 74 条副本 / 34 个编号
+    #   状态互斥，全部 C9 rc=2 不得出表，而成员楼栋侧本已 settled）。
+    #   处置：**只**降级「确已展开到成员楼栋」的那几份副本（去掉两个结果状态字段、
+    #   留 `副本归属` 指针承接证据）；**未展开**的窗节点照旧带字段 —— 此时它是唯一载体，
+    #   降级即丢解。降级数落进「结果状态说明」，不静默。
+    _expanded_copies = set()
+    for _nk, _nv in (result.get('楼栋') or {}).items():
+        if not isinstance(_nv, dict):
+            continue
+        for _nuk, _nuv in ((_nv.get('单元') or {}) or {}).items():
+            _sw = (_nuv or {}).get('来源共享窗')
+            if not _sw:
+                continue
+            for _nbx in ((_nuv or {}).get('分纤箱') or []):
+                _expanded_copies.add((str(_sw), str(_nuk), str(_nbx.get('编号'))))
+    _st_copy = 0
+
     for _bk, _bv in (result.get('楼栋') or {}).items():
         for _uk, _uv in (_bv.get('单元') or {}).items():
+            _src_win = _uv.get('来源共享窗')
             _unit_pend = (not _dg_ok) or any(
-                judge_pending_scope(_objs, _uk, None, _bk)[0]
+                judge_pending_scope(_objs, _uk, None, _bk, _src_win)[0]
                 for _objs, _blk in _pend_items if _blk)
             for _bx in (_uv.get('分纤箱') or []):
+                if (str(_bk), str(_uk), str(_bx.get('编号'))) in _expanded_copies:
+                    _bx.pop('result_origin', None)
+                    _bx.pop('result_confirmation', None)
+                    _bx['副本归属'] = ('共享窗证据副本：归属见成员楼栋条目'
+                                    '（来源共享窗=%s）' % _bk)
+                    _st_copy += 1
+                    continue
                 _cov = (_bx.get('覆盖范围线索') or {}).get('覆盖楼层') or []
                 if '_parse配对' in _bx:
                     # 2026-09-26（第5轮迭代）：锚缺席配对箱 —— origin 已定 derived
@@ -1599,7 +1679,8 @@ def main():
                     # confirmation 仅在「本单元/本箱无待裁决关联且有覆盖」时 settled，
                     # 配不上（无覆盖）恒 pending。判定口径与既有块一致，走同一
                     # judge_pending_scope / _pend_items。
-                    _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk)[1]
+                    _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk,
+                                                        _src_win)[1]
                                     for _objs, _blk in _pend_items if _blk)
                     _bx['result_origin'] = 'derived'
                     _bx['result_confirmation'] = ('pending'
@@ -1611,7 +1692,8 @@ def main():
                         _st_pending += 1
                     continue
                 _bx['result_origin'] = 'derived' if (_cov and _bx.get('安装楼层')) else 'unresolved'
-                _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk)[1]
+                _box_pend = any(judge_pending_scope(_objs, _uk, _bx.get('编号'), _bk,
+                                                    _src_win)[1]
                                 for _objs, _blk in _pend_items if _blk)
                 _bx['result_confirmation'] = ('pending'
                                               if (_unit_pend or _box_pend
@@ -1631,6 +1713,7 @@ def main():
         'origin 取值含义': 'measured=图上直读/几何测量；derived=按规则算出（V型谷底+区间法对位）；unresolved=无解',
         'confirmation 取值含义': 'settled=可进成品；pending=待裁决、禁止进成品（inspect C9 拦下）',
         '统计': {'settled': _st_settled, 'pending': _st_pending},
+        '共享窗证据副本（不计入统计）': _st_copy,
         '判 pending 的条件': '本单元出现在「需人工裁决」中（**不含带 `阻塞: false` 的'
                           '已排除项**），或自检_偏差门禁结论非「可信」',
     }
@@ -1684,13 +1767,26 @@ def main():
         _miss = sorted(_parse_all_nos - _cov_nos)
         if _miss:
             result['需人工裁决'].append({
+                # 2026-10-04（R2 缺陷 D4）：显式 `阻塞: False` —— 本条是**跨阶段损失登记**，
+                #   不是「结论待裁决」。根因：其 `对象` 是「（整图跨阶段对账）」这类图级标签，
+                #   经 parse_ruling_scope 拿不到楼栋/单元/箱段 ⇒ judge_pending_scope 恒不命中
+                #   ⇒ 它**机械上拦不住任何对象**；而缺失的箱在 coverage 里根本没有条目，
+                #   也就没有可标 pending 的载体。若照旧让它隐含「阻塞」，读起来是闸门、
+                #   实际作用为零（「登记了疑点却拦不住」的典型）。
+                #   真正的拦截**由 inspect C3「安装楼层双源交叉」执行**：parse 侧每个箱
+                #   在 coverage 无记录即 FAIL（实测 band4：`C3 FL04FX10 coverage 无记录`，
+                #   rc=2）。故此处只作可见性登记并写明执法者，避免双闸矛盾与误读。
+                '阻塞': False,
                 '对象': '（整图跨阶段对账）',
                 '事项': 'parse 侧收录 %d 个箱，其中 %d 个在本轮 V 型法里**未产出任何覆盖记录**'
+                        '（登记；拦截见 inspect C3 覆盖闭合）'
                         % (len(_parse_all_nos), len(_miss)),
                 '说明': '未产出编号：%s。常见成因：该箱所在单元缺米数列或谷底数不足、'
                         '箱位锚超出米数列邻域被剔除、该栋为共享标题成员但本轮未配对。'
                         '请人工核对图纸后决定是否调参补跑（--box-anchor-x-factor / '
-                        '--min-col-rows）或按图面直读定层。' % '、'.join(_miss[:20]),
+                        '--min-col-rows）或按图面直读定层。'
+                        '**拦截不靠本条**：inspect C3 对「parse 有、coverage 无记录」的箱逐条判 FAIL。'
+                        % '、'.join(_miss[:20]),
             })
             log.warning('跨阶段对账：parse 侧 %d 个箱中有 %d 个本轮未产出覆盖记录：%s',
                         len(_parse_all_nos), len(_miss), '、'.join(_miss[:20]))

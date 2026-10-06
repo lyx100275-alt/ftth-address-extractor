@@ -102,7 +102,15 @@ ap.add_argument("--fx-floor-suffix", default="on", choices=["on", "off"],
                      "矛盾即停（L0-I4，rc=2）；均缺失＝不编造，纯编号+告警列待确认。"
                      "off=回退纯编号旧格式。")
 ap.add_argument("--allow-lossy", action="store_true", help="允许在丢弃楼层的情况下继续出表（默认关闭：一旦有楼层被丢弃即中止，防止静默少户）")
+ap.add_argument("--addr-empty", action="store_true",
+                help="前5级地址全留空（等价 --addr 加一对空引号，但不受 PowerShell 空串被吃影响）。"
+                     "2026-10-04 P1-E7：PowerShell 宿主传 --addr '' 空串会被吃掉致 rc=2，本开关无值即可留空。"
+                     "与 --addr 同时出现时 --addr-empty 优先。")
 args = ap.parse_args()
+
+# 2026-10-04（P1-E7）：--addr-empty 无值开关，绕过 PowerShell 空串传参被吃的坑
+if args.addr_empty:
+    args.addr = ""
 
 if not os.path.exists(args.dxf_json):
     log.error(f"解析JSON不存在: {args.dxf_json}")

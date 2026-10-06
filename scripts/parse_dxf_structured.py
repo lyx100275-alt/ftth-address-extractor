@@ -25,7 +25,9 @@ FTTH DXF 结构化解析脚本（通用版 v2）
 - 不硬编码项目特有参数；所有标注格式均可通过命令行覆盖。
 - 换新图纸先跑 --probe 确认实际图层与标注格式，再按需传参。
 - 同时支持 MTEXT 与 TEXT（默认都取）。
-- 户数直读、布线、安装楼层（口径B y坐标关联），均禁止猜测。
+- 户数直读、布线、安装楼层，均禁止猜测；安装/覆盖楼层只由四种测量方法
+  （直读、V型计算、区间法、竖线法）产出，"编号 y 坐标关联推算"不作为来源
+  （2026-09-18 裁决，见 SKILL.md 铁律⑩）。
 """
 # 2026-09-30（一百二十九，V3 Phase 1 冻结；一百三十二、一百三十四修订）：本文件不再新增业务规则。
 #   允许的三类修改：① fail-closed 门禁类；② 去决策类删减（V3 Phase A 起，
@@ -118,6 +120,13 @@ ap.add_argument("--cable-keywords", default=None, help="光缆识别关键词正
 ap.add_argument("--unit-cluster", type=float, default=None, help="无单元标注时fx聚类阈值（None=按 1.0 倍层高自适应，层高由楼层标注实测）")
 ap.add_argument("--unit-range", type=float, default=None, help="单元文字x归属半宽（None=按 4.0 倍层高自适应）")
 ap.add_argument("--y-tol", type=float, default=None, help="户数/皮线与楼层y坐标匹配容差（None=按 1/15 倍层高自适应）")
+ap.add_argument("--clone-shared-hu", action="store_true", default=False,
+                help="共用轴户数列落空时的处置（2026-10-05 一百五十九）：落在**全部单元 "
+                     "x 范围之外**的户数列，默认只挂最近单元（多单元楼其余单元整单元无户数，"
+                     "已登记交人复核）；加本开关则**克隆进该栋每个单元**。仅对户数生效，"
+                     "箱编号/皮线米数仍不克隆。属归属裁定，**默认关闭** —— 须先以第二来源"
+                     "（图签「层数×每层户数×单元数」）核对确为「每单元每层」口径后再开，"
+                     "否则会把「整栋每层」口径翻倍。")
 ap.add_argument("--floor-mode", default="full", choices=["full", "nofloor"],
                 help="安装楼层判定模式（2026-09-30 V3 Phase A）：full=现行（直写优先/区间法/回填照旧）；"
                      "nofloor=去决策（只定归属不定安装楼层，箱安装楼层一律null+显式标记，"
@@ -244,7 +253,17 @@ if args.probe:
         #   ② 顺手修 stale 变量：原实现用 `bname`（上一个 for 循环的遗留 = 最后一个 INSERT
         #      的块名）查块定义，而非本轮循环变量 `bn` —— N 个不同块打的全是同一个块的
         #      定义，各块自己的定义反而一次没出现。改查 `bn`（纯探查输出，不影响任何产物）。
+        # 2026-10-04（P2-E9）：ATTDEF 明细只打印 FTTH 相关块，非 FTTH 块只保留统计行。
+        #   病灶：暖通/电气设备块（LEB/MEB/配电箱/卷帘门控制器…）占用大量输出行，
+        #   挤占截断窗口，FTTH 相关块（含 FX/分纤箱/皮线/光缆/ONU/通信/光纤/弱电等关键词）
+        #   反而被推出可见范围。统计行仍打印全部块名+数量（探查不丢信息），只过滤明细。
+        _FTTH_KW = ("FX", "分纤箱", "皮线", "光缆", "ONU", "通信", "光纤", "弱电",
+                    "配线", "光交", "接头", "熔接", "telecom", "fiber", "optic", "cable")
+        def _is_ftth_block(bn, attdefs_text=""):
+            t = (bn + " " + attdefs_text).upper()
+            return any(kw.upper() in t for kw in _FTTH_KW)
         _seen_attdef = {}  # attdef内容 -> 重复折叠次数
+        _non_ftth_detail = 0
         for bn, cnt in sorted(insert_blocks_seen.items(), key=lambda x: -x[1]):
             log.info(f"  {bn}: {cnt} 个")
             # 读取块定义中的 ATTDEF 和子实体
@@ -259,20 +278,25 @@ if args.probe:
                             txt = sub.plain_text().strip() if sub.dxftype() == "MTEXT" else str(sub.dxf.text).strip()
                             if txt:
                                 attdefs.append(f"{sub.dxftype()}={txt}")
-                    if attdefs:
+                    _attdef_text = " ".join(attdefs)
+                    if attdefs and _is_ftth_block(bn, _attdef_text):
                         _key = ", ".join(attdefs)
                         if _key in _seen_attdef:
                             _seen_attdef[_key] += 1
                         else:
                             _seen_attdef[_key] = 0
                             log.info(f"    块定义: {_key}")
+                    elif attdefs:
+                        _non_ftth_detail += 1
             except Exception as _ex:
                 log.debug("读取块 %s 的块定义失败，已跳过块内明细: %s", bn, _ex)
         _folded = sum(_seen_attdef.values())
         if _folded:
             log.info(f"    （另有 {_folded} 个块的块定义与上文相同，已折叠不重复打印）")
-        # 统计 INSERT 实例的 ATTRIB 属性值
-        log.info("\n== INSERT 实例 ATTRIB 属性样例（前20个） ==")
+        if _non_ftth_detail:
+            log.info(f"    （另有 {_non_ftth_detail} 个非 FTTH 块的块定义已省略——统计行已列出块名+数量）")
+        # 统计 INSERT 实例的 ATTRIB 属性值（只打印 FTTH 相关）
+        log.info("\n== INSERT 实例 ATTRIB 属性样例（前20个，仅 FTTH 相关） ==")
         shown = 0
         for e in msp:
             if e.dxftype() != "INSERT":
@@ -283,11 +307,13 @@ if args.probe:
             attribs = []
             for attrib in e.attribs:
                 attribs.append(f"{attrib.dxf.tag}={attrib.dxf.text}")
-            if attribs:
+            if attribs and _is_ftth_block(e.dxf.name, " ".join(attribs)):
                 log.info(f"  [{e.dxf.name}] @ ({p.x:.1f},{p.y:.1f}) {', '.join(attribs)}")
                 shown += 1
                 if shown >= 20:
                     break
+        if shown == 0:
+            log.info("  （无 FTTH 相关 INSERT 属性——本图箱体可能只写编号文字、无图形符号）")
         log.info("\n  提示：若需在解析模式提取INSERT，用 --insert-blocks 指定块名，")
         log.info("  --insert-attrib-tag 指定属性tag，--insert-attrib-val 指定属性值筛选正则。")
     log.info("\n（提示：根据上面样例，用 --text-layer 指定含标注的图层；")
@@ -384,11 +410,11 @@ if args.probe:
                 _has_hash = any(re.search(r"\d+#", t) for t in title_texts)
                 _has_hao = any(re.search(r"\d+\s*号楼", t) for t in title_texts)
                 if _has_hash and _has_hao:
-                    suggested_title = r"(\d+)(?:#|号楼).*(?:系统图|布线图|示意图)"
+                    suggested_title = r"([0-9]+)(?:#|号楼).*(?:系统图|布线图|示意图)"
                 elif _has_hash:
-                    suggested_title = r"(\d+)#.*(?:系统图|布线图|示意图)"
+                    suggested_title = r"([0-9]+)#.*(?:系统图|布线图|示意图)"
                 else:
-                    suggested_title = r"(\d+)号楼.*(?:系统图|布线图|示意图)"
+                    suggested_title = r"([0-9]+)号楼.*(?:系统图|布线图|示意图)"
 
             # 标题图层**强制并入** text_layer（2026-09-15 铁律 5，双保险）：
             # 标题常在专用图层（如 `TEL_SYMB`），该图层不含楼层/芯数/单元等强特征关键词，
@@ -414,12 +440,12 @@ if args.probe:
             fx_dup_note = None
             if fx_texts:
                 if any(re.search(r"FL\d+\s*-\s*FX\d+", t) for t in fx_texts):
-                    suggested_fx = r"FL\d+-FX\d+"
+                    suggested_fx = r"FL[0-9]+-FX[0-9]+"
                 elif any(re.search(r"[A-Za-z]{1,4}\d+\s*[-_ ]?\s*FX\d+", t) for t in fx_texts):
                     # 前缀无分隔（FL01FX01）：整体取，**禁止退化为 FX 尾段**
-                    suggested_fx = r"[A-Za-z]{1,4}\d+FX\d+"
+                    suggested_fx = r"[A-Za-z]{1,4}[0-9]+FX[0-9]+"
                 elif any(re.search(r"FX\s*\d+\s*#?", t) for t in fx_texts):
-                    suggested_fx = r"FX\d+#?"
+                    suggested_fx = r"FX[0-9]+#?"
                 # 串号风险检测：同一 FX 尾号若对应多个前缀 → 必须用完整编号
                 _tails = {}
                 for t in fx_texts:
@@ -431,7 +457,7 @@ if args.probe:
                     _ex = list(_dups.items())[0]
                     fx_dup_note = (
                         "**串号风险**：检出 %d 个 FX 尾号对应多个前缀（如 FX%s → %s）。"
-                        "若 fx_pattern 只取尾段（FX\\d+），这些箱会被压成同一个编号并互相"
+                        "若 fx_pattern 只取尾段（FX[0-9]+），这些箱会被压成同一个编号并互相"
                         "覆盖归属，数量级静默丢失。本图已按完整编号给出建议 pattern。"
                         % (len(_dups), _ex[0], "/".join(sorted(_ex[1]))))
                     log.info("  [探查] " + fx_dup_note)
@@ -443,11 +469,11 @@ if args.probe:
             _has_hu = any(re.fullmatch(r"\d+\s*户", s["内容"].strip()) for s in samples)
             _has_mult = any(HU_MULT_RE.fullmatch(s["内容"].strip()) for s in samples)
             if _has_hu and _has_mult:
-                suggested_hu = r"(\d+)\s*户|[*×xX]\s*(\d+)"
+                suggested_hu = r"([0-9]+)\s*户|[*×xX]\s*([0-9]+)"
             elif _has_mult:
-                suggested_hu = r"[*×xX]\s*(\d+)"
+                suggested_hu = r"[*×xX]\s*([0-9]+)"
             elif _has_hu:
-                suggested_hu = r"(\d+)户"
+                suggested_hu = r"([0-9]+)户"
             else:
                 suggested_hu = None
             # 皮线米数：**写法谱**（2026-09-18）。旧实现只认 `\d+m*\d+` 一种字段序，
@@ -495,7 +521,7 @@ if args.probe:
             # 必须覆盖『N#配套楼』『N#商业楼』以及无『楼』字的写法
             suggested_bldg = None
             if any(re.search(r"\d+#", s["内容"]) and ("楼" in s["内容"] or "单元" in s["内容"]) for s in samples):
-                suggested_bldg = r"(\d+)#(?:配套|商业|附属)?楼|(\d+)号楼"
+                suggested_bldg = r"([0-9]+)#(?:配套|商业|附属)?楼|([0-9]+)号楼"
 
             # FX 编号 ↔ 楼栋/单元标注 的实测邻近距离（供 extract_fx_map --proximity-tol）：
             # 文档要求"必须先测量实际距离，不得盲目沿用默认值"，这里直接量出来。
@@ -681,6 +707,15 @@ if args.probe:
             log.info("  [探查] 推荐箱符号层已写入 suggested_params.fx_symbol_layer = %s"
                      % _rec_sym)
 
+        # 2026-10-04（P0-A1 自检）：建议值是给命令行/配置消费的，含 `\d` 会踩
+        #   L1-C7 坑①（Windows/Git Bash 吃反斜杠→零命中且 rc=0）。模板已统一改写
+        #   `[0-9]`；此处兜底拦截未来新增模板的回归。
+        _bad_d = [k for k, v in suggested.items()
+                  if isinstance(v, str) and re.search(r"\\d", v)]
+        if _bad_d:
+            log.warning("  [探查][自检] 建议值含 \\d（命令行直传会被吃）： %s —— 请改写为 [0-9]"
+                        % _bad_d)
+
         log.info("\n== 建议参数（由文字样例推断；推断不出的为 null，需人工确认） ==")
         for _k, _v in suggested.items():
             log.info(f"  {_k}: {_v!r}")
@@ -690,7 +725,10 @@ if args.probe:
         #   退出码 4 = 输出写盘失败，与 1（输入错误）/ 2（门禁中止）/ 3（不适用）区分。
         try:
             write_json(args.out, {"suggested_params": suggested, **_profile_signals,
-                                  "全量文字样例": all_samples}, log=log)
+                                  "全量文字样例": all_samples,
+            # 2026-10-04（P2-E10）：英文键名 text_samples 与 suggested_params 风格一致；
+            #   旧中文键保留兼容已有消费方，新消费方优先读 text_samples。
+            "text_samples": all_samples}, log=log)
             log.info(f"\n配置+全量文字样例({len(all_samples)}条)已写入: {args.out}")
         except OSError as e:
             log.error(f"无法写入探查结果 {args.out}: {e}")
@@ -1116,7 +1154,7 @@ def split_units(bldg):
         bldg, bldg_texts, bldg_ranges, texts, _split_rx(),
         unit_split_keyword=args.unit_split_keyword,
         unit_cluster=args.unit_cluster, unit_range=args.unit_range,
-        y_tol=args.y_tol)
+        y_tol=args.y_tol, clone_shared_hu=args.clone_shared_hu)
     _UNIT_SPLIT_SRC["kind"] = kind
     SYNTH_UNIT_MARKS.extend(ev["synth_records"])
     if ev["synth_marks"]:
@@ -1143,9 +1181,22 @@ def split_units(bldg):
             log.info("  [单元共享列·过滤] %d 条非业务文字未克隆：%s"
                      % (len(_flt), "、".join(_flt)))
     if ev["orphans"]:
-        _msg = ("%s：%d 条**单元专属**文字（箱编号/皮线米数/户数）落在全部单元 x 范围之外，"
-                "已按最近单元挂入并由本项登记交人复核 —— 克隆会重复计数，故不克隆"
-                % (bldg, len(ev["orphans"])))
+        # 2026-10-05（一百五十九）：开 --clone-shared-hu 时户数已克隆，文案须随之改变 ——
+        #   「挂最近单元」与「克隆进每单元」是两种相反的数值后果，混用同一句话会把
+        #   「户数已补进每个单元」呈现成「其余单元无户数」。两条路都登记，但措辞分开。
+        _cloned = (ev["shared"] or {}).get("cloned_hu") or 0
+        _nun = (ev["shared"] or {}).get("n_units") or 0
+        if _cloned:
+            _msg = ("%s：%d 条共用轴户数列落在全部单元 x 范围之外，已按 --clone-shared-hu "
+                    "**克隆进该栋 %d 个单元**（每个单元同值）—— 该处置属归属裁定，"
+                    "须以图签「层数×每层户数×单元数」核对确为「每单元每层」口径；"
+                    "若实为「整栋每层」口径则本开关会把户数翻倍，见本项登记"
+                    % (bldg, _cloned, _nun))
+        else:
+            _msg = ("%s：%d 条**单元专属**文字（箱编号/皮线米数/户数）落在全部单元 x 范围之外，"
+                    "已按最近单元挂入并由本项登记交人复核 —— 克隆会重复计数，故不克隆；"
+                    "若确为多单元共用同一条户数列，人工核对后可加 --clone-shared-hu 重跑"
+                    % (bldg, len(ev["orphans"])))
         log.warning("  [单元共享列·落空] " + _msg)
         PENDING_NOTES.append({"对象": bldg, "事项": _msg,
                               "说明": "落空内容样例：%s"
@@ -1499,23 +1550,52 @@ for bldg in sorted(bldg_ranges.keys(), key=lambda x: bldg_num(x)):
         # 准备楼层标注列表供二分查找（替代 O(N×M) 遍历）
         floor_items = [(fl, fy) for fl, fy in floor_marks.items()]
         for fl, fy in sorted(floor_marks.items(), key=lambda kv: floor_num_or_zero(kv[0], args.floor_pattern, use_fullmatch=True)):
-            # 户数匹配：y 坐标最近（排序+二分，O(log N)）
+            # 户数匹配见下方「按楼层带聚合」；此处只建骨架，保证 floor_table 键齐全。
             hu = None
-            hu_items = list(hu_count.items())  # [(y, n), ...]
-            best_hu, _ = match_y_to_floor(fy, hu_items, tol=args.y_tol, y_key=lambda it: it[0])
-            if best_hu is not None:
-                hu = best_hu[1]  # (y, n) 的 n
-            # 皮线匹配：同理
-            cable = None
-            cable_items = list(cable_info.items())  # [(y, (m, count)), ...]
-            best_cable, _ = match_y_to_floor(fy, cable_items, tol=args.y_tol, y_key=lambda it: it[0])
-            if best_cable is not None:
-                cable = best_cable[1]  # (y, (m, count)) 的 (m, count)
             floor_table[fl] = {
                 "户数": hu,
-                "布线": f"{cable[0]}m*{cable[1]}" if cable else None,
+                "布线": None,
                 "fl_num": floor_num_or_zero(fl, args.floor_pattern, use_fullmatch=True),
             }
+        # ---------- 户数 / 布线：改按**楼层带**归属（2026-10-04 P0 修复）----------
+        # 旧实现：`match_y_to_floor(fy, items, tol=args.y_tol)` —— 语义是「最近 + 距离闸门」，
+        #   而 --y-tol 缺省按层高/15 自适应（本项目实测层高 15600 → tol=1040）。户数列与
+        #   楼层刻度列常存在系统性错位（实测某栋 dy=1059，仅超阈 19），于是**整列户数被拒
+        #   配、脚本仍 rc=0**（实测该项目真值 468 户，产出仅 8 户，差两个数量级且不报错）。
+        #   这与本文件下面 1560 行旁记录的「安装楼层整列落空」是同一个根因：那次只把安装
+        #   楼层改为纯区间法，**户数与布线是漏网之鱼**，本次补齐 —— 一律先由区间法定带。
+        # 带内多候选才用 y 距离消歧（距离只在带内生效，不会越过带中点），并登记冲突交人，
+        #   不静默择一。
+        _HU_ORPHAN, _HU_CONFLICT = [], []
+        _hu_by_floor = {}
+        for hy, n in hu_count.items():
+            _fl, _dy = assign_floor_by_interval(hy, floor_items)
+            if _fl is None or _fl not in floor_table:
+                _HU_ORPHAN.append((hy, n))
+                continue
+            _hu_by_floor.setdefault(_fl, []).append((_dy if _dy is not None else float("inf"), hy, n))
+        for _fl, _cands in _hu_by_floor.items():
+            if len(set(n for _, _, n in _cands)) == 1:
+                floor_table[_fl]["户数"] = _cands[0][2]
+                continue
+            # 同一层带内多候选且户数不同：带内按 y 距离取最近（不越带），并登记交人
+            _cands.sort()
+            _old = floor_table[_fl]["户数"]
+            floor_table[_fl]["户数"] = _cands[0][2]
+            _HU_CONFLICT.append((_fl, _old, _cands))
+            log.warning("  [户数冲突·待确认] %s 层带内 %d 个不同户数值 %s，"
+                        "暂取 y 最近者 %s（不静默定案，请人工核对）"
+                        % (_fl, len(_cands), [c[2] for c in _cands], _cands[0][2]))
+        _CABLE_ORPHAN = []
+        for cy, cv in cable_info.items():
+            _fl, _dy = assign_floor_by_interval(cy, floor_items)
+            if _fl is None or _fl not in floor_table:
+                _CABLE_ORPHAN.append((cy, cv))
+                continue
+            floor_table[_fl]["布线"] = f"{cv[0]}m*{cv[1]}"
+        if _HU_ORPHAN:
+            log.warning("  [户数] %d 条户数标注落在任何楼层带之外（不予采用，避免张冠李戴）：%s"
+                        % (len(_HU_ORPHAN), _HU_ORPHAN[:5]))
         for fx in fx_list:
             # 2026-09-18：该文字实例已被本单元收录 —— 记账，供事后找出「图上确有编号
             #   文字、产物里查无此箱」的静默丢数（详见文件内「未归属分纤箱」一节）。

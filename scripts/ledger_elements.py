@@ -408,9 +408,15 @@ def main():
         if not txt:
             continue
         kind = None
-        if HU_RE and HU_RE.search(txt):
+        # 2026-10-04（P0-A5，形态一致性修复）：HU_RE / CABLE_RE 改 fullmatch，
+        #   与 parse 主路径（parse_dxf_structured.py 业务特征判定）写法对齐。
+        #   原用 search 的后果：皮线规格标注 `2Px2芯x28m` 会被 HU_RE 命中，把**米数 28
+        #   当成 28 户**计入元素台账（实测某图此类误命中 445 条），污染户数计数；
+        #   同理 CABLE_RE 用 search 会把纯户数文字误认成米数。两者互为镜像，必须同改。
+        _t = C.clean_text(txt)
+        if HU_RE and HU_RE.fullmatch(_t):
             kind = "户数"
-        elif CABLE_RE and CABLE_RE.search(txt):
+        elif CABLE_RE and CABLE_RE.fullmatch(_t):
             kind = "皮线米数"
         elif CORE_RE.search(txt):
             kind = "芯数"

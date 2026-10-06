@@ -32,7 +32,7 @@ AIGC:
 
 ## 3. 正则传参为什么一律写 `[0-9]`
 
-Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测 `--fx-pattern "FX\d+#?"` **零命中且脚本仍 rc=0**，调用方误判为"图上没有箱"。故凡传正则类参数（`--fx-pattern` / `--title-pattern` / `--hu-pattern` / `--bldg-pattern` …）**一律写字符类**：`FX[0-9]+#?`、`([0-9]+)#楼`。
+Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测 `--fx-pattern "FX\d+#?"` **零命中且脚本仍 rc=0**，调用方误判为"图上没有箱"。故凡传正则类参数（`--fx-pattern` / `--title-pattern` / `--hu-pattern` / `--bldg-pattern` / `--cable-pattern` / `--unit-pattern` …）**一律写字符类**：`\d`→`[0-9]`、`\s`→`[ ]`，如 `FX[0-9]+#?`、`([0-9]+)#楼`。probe 建议的 `cable_pattern` 里 `\d`/`\s` 常同时出现，照抄建议值即零命中且 rc=0 静默（2026-10-02 凤鸣朝阳实测：建议值含 4 处 `\d`、4 处 `\s`，全部安全化后 148 条米数全命中）。
 
 **判据**：命中数为 0 时先怀疑正则被吃，**不得据零命中改判图纸无此元素**（零命中 ≠ 无元素，与「空结果不得当成功消费」同则）。
 
@@ -48,6 +48,8 @@ Windows 命令行 / Git Bash 会把 `\d` 里的反斜杠吃掉或转义：实测
 {"裁决": [{"类型": "解除待裁决", "对象": "4#配套楼/FX22#", "裁决原文": "-1f",
           "裁决人": "用户", "适用范围": "4#配套楼/FX22# 安装楼层"}]}
 ```
+
+**裁决回灌后必须重组（2026-10-02 云峰实测）**：`解除待裁决` 产出新 coverage 产物（如 `coverage_ruled.json`）后，**此前用旧 coverage 组装的 assembly 一律作废重跑** —— assemble 的 provenance 记录的是旧 coverage 指纹，gen 出口门禁按 provenance 链比对（`--dxf-json` 须为 inspect 所核 parse 本身、或源自 inspect 所核 coverage 的组装产物），旧组装产物判「非源自被检查 coverage 的组装产物」**禁出表**。正确顺序：`coverage → apply-ruling(解除待裁决) → coverage_ruled → inspect(用 coverage_ruled 重跑) → assemble(--coverage coverage_ruled) → apply-ruling(户数类) → gen(--parse 组装产物 --coverage coverage_ruled)`。inspect 也须用裁决后 coverage 重跑，C9 才能见到 settled（实测：回灌后未重组直接 gen，出口门禁指纹不一致 rc=2；按上述顺序重走后 rc=0）。
 
 ## 5. 中间产物写保护
 

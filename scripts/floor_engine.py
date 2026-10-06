@@ -68,7 +68,10 @@ def _cable_pattern_for(forms):
     parts = [rex.pattern for name, rex in CABLE_FORM_RES if name in forms]
     if not parts:
         return None
-    return r"^(?:" + "|".join(parts) + r")$"
+    # 2026-10-04（P0-A1）：建议值会进命令行/配置，`\d` 踩 L1-C7 坑①（反斜杠被吃
+    #   → 零命中且 rc=0）。检测侧 CABLE_FORM_RES 保持 `\d` 不动（Python 内部无此坑），
+    #   仅在**输出**处统一改写为 `[0-9]`（检测与建议解耦，语义零变化）。
+    return r"^(?:" + "|".join(p.replace(r"\d", "[0-9]") for p in parts) + r")$"
 
 
 def _cable_forms_in(sample_texts):
@@ -226,8 +229,17 @@ def _is_business_text(content, rx):
     return False
 
 
-def split_units_by_marker(bldg_text_list, unit_marks, rx, bldg_name=None):
+def split_units_by_marker(bldg_text_list, unit_marks, rx, bldg_name=None,
+                          clone_shared_hu=False):
     """有单元标注时，以单元标注 x 为锚点中分。
+
+    2026-10-05（一百五十九）新增 `clone_shared_hu`（**默认 False**，行为不变）：
+      落在全部单元 x 范围之外的户数列，此前一律「挂最近单元」（见下方 orphans 处置），
+      于是多单元楼只有**一个单元**拿到户数，其余单元整单元为空 —— 实测柳辛庄某带
+      图签 165 户 / 直读 105 户，差的正好是一整个单元；云峰更达 14 个单元整单元缺失。
+      是否该克隆属**归属裁定**，本函数不代判：默认维持原行为并登记交人；人工据第二
+      来源（图签「层数×每层户数×单元数」）确认后，可用本开关让共用轴户数列进每个
+      单元。克隆只作用于**户数**，箱编号/皮线米数仍不克隆（那些克隆必重复计数）。
 
     2026-09-12 修正（P0-2）：
       1. 单元名重名时报错退出，不再静默覆盖（旧实现 dict key 覆盖导致 1#楼只剩 2 个假单元）。
@@ -331,9 +343,22 @@ def split_units_by_marker(bldg_text_list, unit_marks, rx, bldg_name=None):
                       "filtered_count": len(_filtered),
                       "filtered_samples": sorted(
                           {(t.get("内容") or "")[:14] for t in _filtered})[:8]}
+        # 2026-10-05（一百五十九）：户数落空的两条处置路（见 docstring）。
+        #   `clone_shared_hu=True` ⇒ 克隆进每个单元（人工据第二来源确认后的路径）；
+        #   默认 False ⇒ 维持「挂最近单元」并登记交人（原行为，未裁决值不进成品）。
+        _hu_orphans = [t for t in orphans
+                       if rx.get("HU_RE") and rx["HU_RE"].fullmatch(
+                           clean_text(t.get("内容")))]
         for _t in orphans:
+            if clone_shared_hu and _t in _hu_orphans:
+                for _k in result:
+                    result[_k].append(_t)
+                continue
             _best = min(units, key=lambda u: abs(u["x"] - _t["x"]))
             result[_best["名"]].append(_t)
+        if clone_shared_hu and _hu_orphans:
+            shared = dict(shared or {}, bldg=bldg_name or "?",
+                          cloned_hu=len(_hu_orphans), n_units=len(result))
     return result, shared, orphans, dup_names
 
 
@@ -427,7 +452,7 @@ def synth_unit_marks_by_split(all_texts, keyword, rx, bldg_name="", x_range=None
 
 def split_units_for_bldg(bldg, bldg_texts, bldg_ranges, texts, rx,
                          unit_split_keyword=None, unit_cluster=None, unit_range=None,
-                         y_tol=None):
+                         y_tol=None, clone_shared_hu=False):
     """单楼栋单元划分编排（原 split_units 调度逻辑；计算在此，kind 由调用方落盘）。
 
     Returns:
@@ -460,7 +485,8 @@ def split_units_for_bldg(bldg, bldg_texts, bldg_ranges, texts, rx,
             unit_marks = synth_marks
     if unit_marks:
         units, shared, orphans, dup_names = split_units_by_marker(
-            bldg_texts[bldg], unit_marks, rx, bldg_name=bldg)
+            bldg_texts[bldg], unit_marks, rx, bldg_name=bldg,
+            clone_shared_hu=clone_shared_hu)
         return units, "marker", {"shared": shared, "orphans": orphans,
                                  "dup_names": dup_names,
                                  "synth_marks": synth_marks,

@@ -13,14 +13,14 @@ AIGC:
 
 > 全部脚本均支持 `--help`；本表为主要参数速查。SKILL.md 只留脚本名+一句话职责。
 
-探查确定参数后用 ezdxf 提取 FTTH 信息。**42 个脚本**（`scripts/`：含 `ftth.py`/`ftth_common.py`/`ftth_launcher.py`/`ftth_batch.py`）——改文件后同步计数：
+探查确定参数后用 ezdxf 提取 FTTH 信息。**43 个脚本**（`scripts/`：含 `ftth.py`/`ftth_common.py`/`ftth_launcher.py`/`ftth_batch.py`）——改文件后同步计数：
 
 | 脚本 | 作用 | 主要参数 |
 |------|------|----------|
 | `plan_methods.py` | **图纸画像**：13 信号判定+选法+档案一致率+门禁 | `--dxf --out --probe --project-dir --text-layer --text-type --title-pattern --fx-pattern --wire-keywords --vert-dx` |
 | `dump_geom.py` | **全量几何转储**→`<DXF>.geom.json` | `--dxf --out` |
 | `ledger_elements.py` | **元素台账**（几何侧）：六类元素+楼栋单元边界+校验；线缆候选剔除建筑电气层 | `--dxf --out --geom --config --parse --text-layer --title-pattern --unit-pattern --fx-pattern --hu-pattern --cable-pattern --box-layer-kw --box-attr-re --wire-layer --floorline-layer --verbose` |
-| `parse_dxf_structured.py` | 结构化解析：楼栋/单元/分纤箱/楼层表；rc=4=写入失败 | `--text-layer --text-type --title-pattern --floor-pattern --hu-pattern --cable-pattern --cable-keywords --fx-pattern --unit-pattern --unit-cluster --unit-range --y-tol --insert-blocks --insert-attrib-tag --insert-attrib-val --title-band-tol --consensus-x-tol` |
+| `parse_dxf_structured.py` | 结构化解析：楼栋/单元/分纤箱/楼层表；rc=4=写入失败 | `--text-layer --text-type --title-pattern --floor-pattern --hu-pattern --cable-pattern --cable-keywords --fx-pattern --unit-pattern --unit-split-keyword --unit-cluster --unit-range --y-tol --clone-shared-hu --insert-blocks --insert-attrib-tag --insert-attrib-val --title-band-tol --consensus-x-tol` |
 | `count_households.py` | 户数统计（皮线计数法）：同坐标去重+楼层标注自洽检查+出表守门 | `--text-layer --text-type --title-pattern --floor-pattern --fiber-pattern --special-pattern --assign --match-tol --x-cluster --x-y-gap --probe --title-band-tol --max-unmatched-ratio --allow-lossy` |
 | `count_box_icons.py` | **户数统计（图标法）**：图标贴皮线末端，不依赖块名；归层失败（图标>0但总户数=0）⇒ rc=2 不写产物 | `--wire-layer --wire-keys --wire-exclude --insert-blocks --include-square --square-min --square-max --tol --search-radius --strong-keys --weak-keys --floor-layer --scale-max-dx --scale-period-tol --region-y --region-pad --col-x-tol --col-gap` |
 | `analyze_coverage.py` | 覆盖判定（竖干连续体+物理断口，输出线索非结论） | `--text-layer --text-type --title-pattern --floor-pattern --fx-pattern --unit-cluster --vert-dx --vert-dy --fx-window --merge-tol --conn-tol --wire-layer --insert-attrib-tag --insert-attrib-val --bldg-map --bldg-pad --title-band-tol --fx-symbol-layer --fx-symbol-cluster --fx-symbol-max-size --symbol-pair-tol --total-pad --break-floor-tol --max-break-span` |
@@ -83,6 +83,13 @@ AIGC:
 - `gen --addr` 留空时 PowerShell 丢弃空串致 argparse 报错，变通传 `--addr ",,,,,,"`。
 - `--floor-pattern` 至少 1 个捕获组：`[-]?[0-9]+F` 编译通过 rc=0 假象，解析期 `m.group(1)` 才 IndexError（已补入启动期自检，缺组即 rc=1）。
 - `--hu-pattern` 捕获组只包数字：`([0-9]+户)` 捕获 `2户` 整串致 `int('2户')` 崩（`floor_engine.py` 已加防御性数字提取，正确写法 `([0-9]+)户`）。
+- `methods/signals.json` 的 detect_method 示例用 `\d` 只是描述性写法，**抄到命令行一律改写 `[0-9]`**（见 L1-C1 正则四坑①）。
+- **长输出命令禁接 `Select-Object -First`**：`inspect` 等长输出经管道截断会使 `$LASTEXITCODE` 变 **-1**（假失败，2026-10-02 凤鸣朝阳实测）；正确做法：先 `> <文件> 2>&1` 落盘、再读文件判退出码与内容。
+- `extract_fx_map.py` 用**位置参数** `dxf [out]`，不认 `--dxf`（传了报 `unrecognized arguments`）；对照表区与光缆覆盖行（「覆盖N号楼」类）同图不同区时，用 `--x-min/--x-max/--y-min/--y-max` 限定搜索区域防串扰（2026-10-02 云峰实测）。
+- probe 建议 `--unit-split-keyword`（分离形态单元轴：『单元电井』+左侧数字）时 parse **必须显式传**，否则单元轴不合成、箱并回楼栋级容器产生 pending（2026-10-02 云峰实测：漏传致 4 项待裁决，补传后 13 锚点全合成）。
+- **加开关必漏统一入口（反复发生）**：子脚本新增 `--flag` 后，须同步在 `ftth.py` 对应子命令的 `add_parser` 段注册同名参数，否则 `ftth.py <子命令> --flag` 报 `unrecognized arguments`。`build_cmd` 只转发 `ftth.py` 自己 argparse 声明过的参数（`vars(args)` → `--flag`），未注册的参数对统一入口不可见。`build_cmd` docstring 说「新增开关不必再做特殊处理」指的是布尔转发机制（2026-09-15 统一后），**不等于「不须注册」**。历史已发生 ≥2 次：`--allow-low-pairing`（157①）、`--clone-shared-hu`（159）。**新增开关后自检**：① `ftth.py <子命令> --help` 能显示该参数；② `Select-String -Path ftth.py -Pattern '<flag-name>'` 有命中。
+- `--clone-shared-hu`（一百五十九）：共用轴户数列（落在**全部单元 x 范围外**）默认只挂最近单元 → 多单元楼其余单元整单元无户数（C5 点名报出）；加开关则克隆进该栋每个单元。**属归属裁定、默认关** —— 须先以图签第二来源（「层数×每层户数×单元数」）核对确为「每单元每层」口径再开，否则把「整栋每层」口径翻倍；仅克隆户数，箱编号/皮线米数不克隆。`ftth.py parse` 已透传；**pipeline 未透传**，多带图须逐带直跑 parse。
+- `plan` 单独直调时**必传 `--project-dir`**（项目目录）：不传则 `intake_table` 信号判 `unknown`（无法检测《楼宇信息采集表》），unknown 计入画像未作答 → 完备性 rc=2 阻塞下游；传后无采集表则明确判 `absent` 不阻塞（2026-10-02 凤鸣朝阳实测：首跑漏传，补传重跑后 unknown 清零、13 信号全判定）。
 
 ### 各子命令可直接抄的完整示例
 
@@ -99,8 +106,8 @@ $T  = "C:\...\.temp\<项目>"
 # 1) probe —— 探查，产出建议参数
 & $PY "$SK\scripts\ftth.py" probe --dxf $D --out "$T\probe.json"
 
-# 2) plan —— 图纸画像（选法 + 门禁）；带 --probe 回填检测类参数，别省
-& $PY "$SK\scripts\ftth.py" plan --dxf $D --probe "$T\probe.json" --out "$T\profile.json"
+# 2) plan —— 图纸画像（选法 + 门禁）；带 --probe 回填检测类参数，别省；--project-dir 必传（漏传则 intake_table=unknown 阻塞）
+& $PY "$SK\scripts\ftth.py" plan --dxf $D --probe "$T\probe.json" --project-dir "<项目目录>" --out "$T\profile.json"
 
 # 3) parse —— 结构化解析（带 --profile 走门禁）
 & $PY "$SK\scripts\ftth.py" parse --dxf $D --config "$T\probe.json" --profile "$T\profile.json" --out "$T\parse.json"
@@ -202,6 +209,10 @@ ftth.py assemble --count <count_box.json> \
 - **列→单元的归属映射是裁决项，脚本不做任何自动猜测**（count JSON 的列只有列 x + 逐层
   户数，不含楼栋归属；归属依据 = 列 x 与箱符号/楼栋边界的几何对齐，属判读结论）。
   语法错误 / 列号越界 / 同一 (楼栋,单元) 被两列声明（户数会翻倍）一律硬失败 rc=1。
+- **col-map 未定时可先用推断映射跑通组装与 inspect 收集证据**（产物只作证据、不锁值、
+  不出表），把暴露出的单元键回退 / 同配置展开告警一并列入 Step 3 裁决（2026-10-02 云峰
+  实测：推断映射暴露「9#楼2单元并入1单元」「10#楼无列需同配置展开」两条证据，随选择题
+  一次裁决后修正映射，最终与标准答案逐户一致）。
 - `--coverage`（可选）合并各单元分纤箱（嵌套/扁平两种格式自动检测）；coverage 单元键
   归一后仍对不上时回退 `1单元`——**仅当该楼栋确有 1单元**（单单元楼/配套楼的 coverage
   键常写非 N单元 形式），仍对不上则显式列出交人核对，不静默丢。
@@ -279,6 +290,8 @@ python "$SK\scripts\ftth_launcher.py" dump_geom.py --dxf $D   # -> scripts\dump_
 
 **必须用「真执行」验证**（`& $<候选> -c "import ezdxf"`），只 `Test-Path` 会选到没依赖的解释器。
 
+**冒烟测试解释器**：`tests/run_smoke.py` 的 T14（golden 回归）直调 `ftth.py`（不经启动器），`PY=sys.executable`——跑冒烟的解释器本身须带 ezdxf，否则 T14 三图产物全 MISSING（`ModuleNotFoundError: ezdxf`，假象 FAIL）。须用主 Python 3.13（`py -3.13 tests/run_smoke.py`）跑冒烟。
+
 **⚠️ 禁用 `pip install` 补依赖**：镜像不可达时报 `from versions: none`，**看起来像「包不存在」实际是「索引不可达」**，别在此费轮次。确需安装先用默认源验证：`& $PY -m pip index versions ezdxf`。
 
 ### 必须具备的软件环境
@@ -342,6 +355,8 @@ ODA 转换由用户完成。
 2. **`N户` 采样是严格全匹配** `fullmatch(\d+户)`：`N户/层`、`共覆盖住户N户`等形态天然被排除。
 3. **归层失败必须 rc≠0**：`贴末端图标>0 且归层后总户数==0` 是「没测出来」不是「0 户」。
 
+**低层/配套楼特例（2026-10-02 云峰实测）**：刻度仅 `1F/2F/B1/WF` 四档的低层楼，count-box 按「几何最近」配刻度会把**多个低层图标列都配到同一刻度列**（另一栋的刻度列不进候选），列归属自动判定失效；乘号式 `*N` 标注 count-box **不消费**（只登记坐标，属直读形态）。此类楼户数须人工组合判定：`*N` 直读（乘号后数字即该处户数）+ 图标列逐层核对，经 col-map + apply-ruling 落数 —— 实测两列若按图标总数直接分配会把两栋配套楼**看反**（8 户列实为 11#配套 B1=3+1F=5；4#配套 B1=16 户来自 `*16` 直读、1F=2 来自图标，合计 18）。
+
 ## 流水线 `pipeline`（已外移 → [pipeline_details.md §18](pipeline_details.md)，2026-09-20）
 
 > 本节原在此处（2026-09-17 立）。因本文件 48,915 B 距硬上限仅剩 85 B，串跑入口、参数表与语义边界已外移至 [pipeline_details.md §18](pipeline_details.md)；依赖矩阵/可抄示例仍在本文件。
@@ -349,7 +364,7 @@ ODA 转换由用户完成。
 
 ## 统一入口 `ftth.py` 与 `--config` 机制
 
-`ftth.py` 是统一调度入口，支持 16 个子命令（`probe/plan/parse/split-band/coverage/coverage-vshape/inspect/assemble/apply-ruling/count/count-box/gen/verify-truth/pipeline/budget/transitions`）。参数优先级：命令行显式>`--config`>脚本默认。`--config` 传入 probe 输出的 `suggested_params` JSON，自动填充未指定的参数。
+`ftth.py` 是统一调度入口，支持 19 个子命令（`probe/plan/parse/coverage/coverage-vshape/verify-truth/inspect/count/count-box/gen/assemble/apply-ruling/split-band/pipeline/budget/transitions/new-run/summary/verify-answer`）。参数优先级：命令行显式>`--config`>脚本默认。`--config` 传入 probe 输出的 `suggested_params` JSON，自动填充未指定的参数。
 
 **典型工作流**：`probe`→`plan`（选法）→`parse --config --profile`。
 
