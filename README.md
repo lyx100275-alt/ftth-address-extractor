@@ -52,7 +52,7 @@ python "$SK\scripts\ftth_launcher.py" parse --dxf $D --config "$T\probe.json" --
 python "$SK\scripts\ftth_launcher.py" pipeline --dxf $D --outdir $T --project-dir "<项目目录>"
 ```
 
-16 个子命令的参数矩阵与可抄示例见
+19 个子命令的参数矩阵与可抄示例见
 `references/scripts_reference.md`（依赖矩阵 / 各子命令示例）；批量编排见
 `references/pipeline_details.md` §19。
 
@@ -72,7 +72,7 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
   `check_contract_coverage.py`、T4d 迁移门禁判据 #6、T4e 调用链 C7 门禁
   `check_launch_path.py`）/
   T5 真语料 probe（需 ezdxf + 语料，加 `--with-dxf`；语料已外置版本库
-  `tests/corpus/`，可用 `--corpus <路径>` 或环境变量 `FTTH_TEST_DXF` 指定，缺失自动 SKIP）/
+  `tests/corpus/`，可用 `--corpus <路径>` 或环境变量 `FTTH_TEST_DXF` 指定，缺失自动 SKIP（CI 如需缺料即失败：置 `FTTH_REQUIRE_CORPUS=1`）/
   T6 出表链黄金路径（含 gen，需 openpyxl）/
   T7~T13 格组认领/多栋合并/偏置优势闸等图签格组回归（详见 `tests/run_smoke.py`）/
   T14 三图 golden 回归（**默认即跑**，不再需要 `--with-dxf`；缺图自动 SKIP；
@@ -92,7 +92,7 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
 | 路径 | 说明 |
 |---|---|
 | `SKILL.md` | 唯一权威协议（流程 / 状态机 / 硬约束），会话首屏加载 |
-| `scripts/` | 43 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`（16 子命令），公共模块 `scripts/ftth_common.py`。分层引擎：命名归一 `ftth_naming.py`（由前者 re-export，调用方零改动）、归属 `attribution_engine.py`、V 谷底统一证据 `coverage_engine.py`、写法谱/楼层/分单元 `floor_engine.py`、事实提取 `dxf_extract.py`、箱证据 `evidence_builder.py`、冲突议题 `conflict_engine.py`（inspect 只剩门禁登记与展示）。门禁三件套：`check_docs.py`（文档一致 D1~D12）/ `check_contract_coverage.py`（契约落地登记双向对拍）/ `check_transitions.py`（迁移门禁）/ `check_launch_path.py`（C7 调用链：启动器置 `FTTH_VIA_LAUNCHER`，产物带 `_via_launcher` 标记）；状态 `ledger_state.py`（`state-set`/`state-get` 落 `状态.json`，只记位置不裁决）。运行会在 `scripts/` 生成 `.interpreter_cache.json`（解释器探测缓存，由版本库 `.gitignore` 忽略，不入库；可安全删除，删除后下次启动重探一次；上架打包前建议手动清理） |
+| `scripts/` | 43 个 `.py`（含启动器 `ftth_launcher.py`）；统一入口 `scripts/ftth.py`（19 子命令），公共模块 `scripts/ftth_common.py`。分层引擎：命名归一 `ftth_naming.py`（由前者 re-export，调用方零改动）、归属 `attribution_engine.py`、V 谷底统一证据 `coverage_engine.py`、写法谱/楼层/分单元 `floor_engine.py`、事实提取 `dxf_extract.py`、箱证据 `evidence_builder.py`、冲突议题 `conflict_engine.py`（inspect 只剩门禁登记与展示）。门禁三件套：`check_docs.py`（文档一致 D1~D13）/ `check_contract_coverage.py`（契约落地登记双向对拍）/ `check_transitions.py`（迁移门禁）/ `check_launch_path.py`（C7 调用链：启动器置 `FTTH_VIA_LAUNCHER`，产物带 `_via_launcher` 标记）；状态 `ledger_state.py`（`state-set`/`state-get` 落 `状态.json`，只记位置不裁决）。运行会在系统临时目录生成解释器探测缓存（`%TEMP%/ftth/ftth_interpreter_cache.json`，`FTTH_CACHE_DIR` 可改位置；由版本库 `.gitignore` 忽略，不入库；可安全删除，删除后下次启动重探一次；技能目录内若残留旧 `.interpreter_cache.json` / `__pycache__` 属历史产物，上架打包前删除） |
 | `references/` | 细则文档（参数表 / 覆盖规则 / 选法 / 图签协议 / 流水线细则 / 操作纪律…） |
 | `methods/` | 图纸类型方法（楼-簇 / 共享混合 / 图签主导）+ 信号定义 |
 | `assets/` | 标准地址表模板 xlsx |
@@ -102,7 +102,7 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
 
 ## 版本
 
-`version.json`：`minor` = 修订序号（当前 0.147.0＝一百四十七），`major` 固定 0、
+`version.json`：`minor` = 修订序号（当前 0.163.0＝一百六十三），`major` 固定 0、
 对外发布时由人工提升；不采用未经验证的语义化版本号。GitHub tag 与 release
 只在人工确认后打。
 

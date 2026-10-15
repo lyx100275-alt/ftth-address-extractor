@@ -14,6 +14,66 @@ AIGC:
 > 本文件自 `SKILL.md` 外移（三十一）：SKILL.md 只保留最近两条，本文件保存全部历史。（三十九起 SKILL.md 不再保留条目正文，统一指向本文件。）
 > 追加规则：新条目加在**本文件顶部**（本说明之后、最新条目之前），编号沿用 SKILL.md 的序号体系。
 > 历史说明：外移前（二十五）与（二十六）顺序笔误，外移时已按编号序修正。
+> 编号分叉说明（2026-10-06 一百六十一立）：**156/157/158 各有两条同名异文条目**——顶部三条（SKILL.md 精简 / 五轮迭代待裁决 / R2 缺陷）为审计修复轨，尾部五条（156 三处 P0 / 157 迭代第 4 轮 / 158 迭代第 5 轮 / 159 补登 / 160 y 坐标边界）为版本递进轨（0.155→0.160）。引用时以“标题+日期”区分，不得只报序号；新条目自**一百六十一**续排，不复用旧号。历史不再改写（改写即破坏既有引用）。
+
+### 2026-10-07（一百六十三）：四图五轮从零复跑 —— 跨楼共用竖干撤回假覆盖 + C6 分类 + V型缺层提示分档 + 无符号层报错带候选
+
+**动因**：桌面三项目（含其中一项目的**第二张未跑过的图纸**）共 4 张 DXF，每轮先 `new-run` 清场再跑完整 pipeline，跑完修、修完再跑，共五轮。四轮修复均属**「撤回误导性结论 / 补全可达诊断」**性质 —— **不调判据阈值、不新增任何自动采信、不代替人工裁决**（红线 L0-I2-P1/P4 不变）。
+
+| # | 缺陷（实测） | 改动 | 文件 |
+|---|---|---|---|
+| ① | 共享系统图形态下，**3 栋不同楼栋的箱因共用同一图形符号坐标而认领同一根竖干连续体**，于是三栋楼各拿到一份**完全相同**的覆盖（实测：三箱同符号 (26696.5,-3855.3)、同竖干 x≈26709.3 → 各覆盖 1F~10F）。一根竖干只能服务一处，「每栋各覆盖 1F~10F」是**假象**，而门禁当时把它算作「闭合」 | 同一连续体被 ≥2 栋楼认领 ⇒ **撤回**这些箱的覆盖结论（覆盖楼层置空、`判定依据=待确认`、线索内写「跨楼共用」），并单列裁决项交人；**不按楼栋切分、不取最近者** | `scripts/analyze_coverage.py` |
+| ② | ① 撤回后被 C6 计入「缺线索」，与真「压根没线索」混为一类 —— 两者处置方向相反（缺线索→补提取；本类→人工裁定，补提取无用） | C6 新增独立计数 `跨楼共用已撤回`，判据=依据来源含「不具逐栋区分力」；状态串分列呈现 | `scripts/inspect_closure.py` |
+| ③ | V 型法某窗**一个覆盖都没产出**（箱锚全在布线图区，折合字高 65×），提示却写「请检查窗口边界/米数列是否被截断」——窗口与米数列都完好，照此调参只会越调越错 | 覆盖缺失**分因呈现**：本窗零覆盖 → 明确「非窗口截断，调 --fx-window/--min-col-rows 无效，须改由他法或人工直读补齐」，并附箱锚折合字高 | `scripts/analyze_coverage_vshape.py` |
+| ④ | coverage 因「找不到箱图形符号」rc=2 时只说「--fx-symbol-layer=未提供」，把人导向**去猜图层名**；而探查给出的候选层就躺在同目录 `profile.json` 里（未达自动下发门槛），**有答案却不可达** | 报错附候选层名+得分+推荐标记（**只列不决策**，脚本不代判）；读不到画像不改变失败判据 | `scripts/analyze_coverage.py` |
+
+**验证**（每轮均 `new-run` 从零，不参考上一轮产物）：
+
+| 图 | 结果 | 五轮一致性 |
+|---|---|---|
+| 图A（单地块·V型，1.7MB） | rc=0 / FAIL 0 / WARN 3；gen 出表 **313 户 vs 标准答案 313 户零差异**（第 3、5 轮各对拍一次） | 五轮完全一致 |
+| 图B-1（多地块 4 带） | band1 rc=0；band2/band3/band4 rc=2 → 全为待人工裁决项（图签 vs 系统图 层数 18/19、共享系统图窗零覆盖、1 箱落在楼栋级容器） | 五轮完全一致 |
+| 图B-2（**第二张图**，多地块 4 带） | band5 coverage rc=2（无符号层）→ 修复后报错点名候选层；其余 3 带 rc=2 | 新增图纸，首次跑通全链 |
+| 图C（竖线法，150MB） | rc=2 / FAIL 8 = C6 跨楼共用已撤回 3 + C9 pending 5（修复前 FAIL 5，其中 3 箱带着假覆盖 1F~10F） | 第 3~5 轮一致 |
+
+**回归**：`run_smoke` T14 golden 的 test_c 由 `fails_n=5`→`8`、`coverage.json` md5 变 —— 系 ① 的**预期行为变更**（3 条假覆盖转为显式 FAIL），已 `--regen-golden` 重生基线；其余用例全 PASS。
+
+- **版本**：`version.json` 0.162.0 → **0.163.0**。
+
+### 2026-10-06（一百六十二）：柳辛庄会审剩余四项落地 —— pending五分类 + 证据三层 + 区间证据包 + 纯函数回归
+
+**动因**：桌面《柳辛庄项目_技能会审报告.md》（0.159.0 版，91/100）列五件事，P1-1 已在 0.160 落地，本轮落地剩余四项。全部加法式（只打标/只组织证据，不改判据与 rc 语义），仍由人工裁决。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | P1-2 待裁决五分类：新增封闭枚举 + `classify_coverage_pending` 纯函数（绑定失败/来源冲突/窗口截断/真缺口/缺数据）；两覆盖脚本对 `需人工裁决` 后处理打标 `pending_category` | `scripts/coverage_engine.py`、`scripts/analyze_coverage.py`、`scripts/analyze_coverage_vshape.py`、`references/coverage_rules.md` |
+| ② | P1-3 共享证据三层：新增 `shared_geometry`/`shared_business_evidence`/`building_specific_evidence` + `evidence_tier_for`；覆盖侧窗节点/成员条目与 parse 侧共享组打标 `evidence_tier` | `scripts/coverage_engine.py`、`scripts/analyze_coverage_vshape.py`、`scripts/parse_dxf_structured.py`、`references/coverage_rules.md` |
+| ③ | P2 区间标题四点证据包：新增 `bldg_range_evidence_bundle`（中间实体/独立标题/箱位标注/区间标题原文 + 小结，须人工裁决）；`find_bldg_anchors` 展开/待裁决两分支附小结并留痕 `证据汇总` | `scripts/ftth_common.py`、`references/measurement_methods.md` |
+| ④ | P2 最小回归：S16 纯函数回归（五分类/三层/证据包，无 DXF 语料，秒级） | `tests/run_conflict_matrix.py` |
+
+**验证**：`py_compile` 全仓 0 错；`run_conflict_matrix` ALL PASS（含新增 S16）；`check_docs` D1~D13 ALL PASS；`budget` rc=0；`run_smoke` T14 需 `--regen-golden` 重生基线（coverage/parse 产物新增打标键，判据零改）。
+
+- **版本**：`version.json` 0.161.0 → **0.162.0**。
+
+### 2026-10-06（一百六十一）：外部审计修复批 —— 文档漂移三处 + 门禁补三项 + 缓存外迁 + SKIP 可见
+
+**动因**：外部深度审计指出三处已发生的文档漂移（README 子命令 16/19、scripts_reference 脚本 42/43 与子命令 16/19、README 版本号落后 13 个修订）而门禁全绿，另有 CHANGELOG 156~158 编号重名、技能目录 `__pycache__` 回潮、T14/T5 缺料 SKIP 与 PASS 不可区分。
+
+| # | 改动 | 文件 |
+|---|---|---|
+| ① | README：子命令数 16→19 两处、版本号 0.147.0→0.161.0、`check_docs` 门禁范围 D1~D12→D1~D13、缓存位置说明改系统临时目录、T5 缺料补 `FTTH_REQUIRE_CORPUS=1` 说明 | `README.md` |
+| ② | scripts_reference：脚本数 42→43、子命令 16→19（含 new-run/summary/verify-answer 全表）、易错点补 signals.json `\d` 示例改写 `[0-9]` 警告 | `references/scripts_reference.md` |
+| ③ | D1 扩到 README + scripts_reference 三处对拍（D1b/D1c）；D8 扩到 scripts_reference 脚本数（m8c）；新增 **D13 版本号三处一致**（version.json skill_version 须同时现身 README 与 CHANGELOG） | `scripts/check_docs.py` |
+| ④ | version_basis 补分叉说明；skill_version 0.160.0 → **0.161.0** | `version.json` |
+| ⑤ | 启动器缓存改写系统临时目录（`FTTH_CACHE_DIR` 可改；旧 `scripts/.interpreter_cache.json` 自动迁移沿用一次），派生子进程置 `PYTHONDONTWRITEBYTECODE=1` 不写 `__pycache__`，技能目录不再新增运行时写入项；删残留 `__pycache__` + 旧缓存 | `scripts/ftth_launcher.py`、技能目录 |
+| ⑥ | 冒烟 SKIP 可见性：模块级 `print` 包装计数全部 `[SKIP]` 行，结尾汇总打印 SKIP 清单；`FTTH_REQUIRE_CORPUS=1` 时 T5/T14 缺料 SKIP 转 FAIL（含 T4b 文档一致性门） | `tests/run_smoke.py` |
+| ⑦ | 本文件头加编号分叉说明；本条置顶（新号 161，不复用旧号） | `SKILL_CHANGELOG.md` |
+
+**验证**：`budget` rc=0；`check_docs` D1~D13 ALL PASS（含新增 D1b/D1c/D13）；`check_contract_coverage` rc=0；`py_compile` 全仓 0 错；`run_smoke`（无语料机）ALL PASS 且结尾打印 SKIP 清单。
+
+**遗留**：ftth.py 依赖矩阵表仍只列 15 行（new-run/summary/verify-answer/budget/transitions 未入矩阵，另立项）；Step2-C9 与 L1-C9 同名双轴维持现状（改名前缀属 breaking，待裁决）。
+
+- **版本**：`version.json` 0.160.0 → **0.161.0**。
 
 ### 2026-10-05（一百五十八）：SKILL.md 精简 −2,177 B（−5.1%，零语义损失）+ 多地块扇出「未判定带」点名
 

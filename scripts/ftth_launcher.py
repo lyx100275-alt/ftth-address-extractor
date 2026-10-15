@@ -46,6 +46,7 @@ USAGE（与原 ftth.cmd 完全等价）
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -70,19 +71,45 @@ def _ezdxf_ok(exe, *extra_args):
 
 # 解释器缓存：本机验证过的解释器直接信任，exe/ezdxf 路径任一消失才重探。
 # 实测探测一次 25~120s（import ezdxf 慢且不稳定），缓存把 N 次调用降为 1 次。
-CACHE_FILE = os.path.join(HERE, ".interpreter_cache.json")
+# 位置（2026-10-06 审计修复 P2）：此前写在技能目录 `scripts/.interpreter_cache.json`，
+#   违反 L0-I6「技能目录只放运行文件」（跑一轮冒烟即再生，删了又来）。现改写系统
+#   临时目录（`FTTH_CACHE_DIR` 可改），技能目录零写入；旧路径残留者自动迁移沿用一次。
+_LEGACY_CACHE_FILE = os.path.join(HERE, ".interpreter_cache.json")
+
+
+def _cache_file():
+    d = os.environ.get("FTTH_CACHE_DIR")
+    if d:
+        try:
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, "ftth_interpreter_cache.json")
+        except OSError:
+            pass
+    try:
+        t = os.path.join(tempfile.gettempdir(), "ftth")
+        os.makedirs(t, exist_ok=True)
+        return os.path.join(t, "ftth_interpreter_cache.json")
+    except OSError:
+        return _LEGACY_CACHE_FILE
+
+
+CACHE_FILE = _cache_file()
 
 
 def _cache_load():
     try:
         import json
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        exe = d.get("exe") or ""
-        ez = d.get("ezdxf_path") or ""
-        extra = d.get("extra_args") or ()
-        if exe and os.path.isfile(exe) and ez and os.path.isfile(ez):
-            return exe, tuple(extra)
+        for _p in (CACHE_FILE, _LEGACY_CACHE_FILE):
+            try:
+                with open(_p, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+            except (OSError, ValueError):
+                continue
+            exe = d.get("exe") or ""
+            ez = d.get("ezdxf_path") or ""
+            extra = d.get("extra_args") or ()
+            if exe and os.path.isfile(exe) and ez and os.path.isfile(ez):
+                return exe, tuple(extra)
     except (OSError, ValueError):
         pass
     return None, None
@@ -196,6 +223,10 @@ def main():
     #   检查方 = scripts/check_launch_path.py。
     env = dict(os.environ)
     env["FTTH_VIA_LAUNCHER"] = "1"
+    # ---- 技能目录零写入（2026-10-06 审计修复 P2）----
+    #   经本启动器派生的子进程一律不写 __pycache__（L0-I6「技能目录只放运行文件」；
+    #  此前跑一轮冒烟即再生一堆 .pyc，删了又来）。.pyc 只是启动加速，无行为影响。
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     # ---- 复现性第二道根因：固定子进程哈希种子（2026-10-04，一百五十四）----
     #   实测：`split-band` 写出的子 DXF 在同一输入下**跨轮不可逐位复现**，差异定位到
     #   CLASSES 段两条 CLASS 的顺序互换（`LAYOUT` ↔ `ACDBPLACEHOLDER`，132 B）；

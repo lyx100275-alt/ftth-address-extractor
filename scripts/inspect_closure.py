@@ -1048,6 +1048,9 @@ def main():
         n_ok = n_noclue = n_outof = 0
         n_cluepend = 0   # 2026-10-05（一百五十九）：覆盖为空但属「两来源不一致待裁决」的箱数
         n_badbasis = 0   # 2026-09-27（P0-3）：判定依据不在覆盖方法枚举内的箱数
+        # 2026-10-07：覆盖被**撤回**的箱数（跨楼共用竖干，证据不具逐栋区分力）。
+        #   与「缺线索」处置方向相反：缺线索→补提取；本类→人工裁定各楼栋覆盖，补提取无用。
+        n_crossshared = 0
         # 2026-09-19 修复（与 C3 同一条件、同一处置）：coverage 提供了 JSON，但**箱级
         #   记录为 0** 时，上面那个 `for blk, un, fid, ... in boxes` 循环里每个箱都会
         #   走到 `if not recs: continue` —— 循环体一次有效判定都没做，三个计数全 0，
@@ -1112,6 +1115,15 @@ def main():
                                % (fid, blk, un))
                         R.fail("C6", "%s 覆盖两来源不一致待裁决（非缺线索，见 C7）" % fid)
                         n_cluepend += 1
+                    elif "不具逐栋区分力" in _src_txt:
+                        # 2026-10-07：跨楼共用同一竖干 —— 证据存在但不具区分力，覆盖已被
+                        #   产出方**主动撤回**。既不是「无线索」（补提取无用），也不是
+                        #   「两来源冲突」（只有一个来源）；处置=人工裁定各楼栋覆盖。
+                        R.emit("  ✗ %s（%s/%s）覆盖已撤回：跨楼共用同一竖干（证据不具逐栋区分力）"
+                               " —— 须人工裁定各楼栋覆盖；**不得**按「缺线索」去补提取"
+                               % (fid, blk, un))
+                        R.fail("C6", "%s 跨楼共用竖干·覆盖已撤回（待人工裁定）" % fid)
+                        n_crossshared += 1
                     else:
                         R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
                         R.fail("C6", "%s 缺覆盖范围线索" % fid)
@@ -1132,13 +1144,13 @@ def main():
                         "parse 侧 0 箱，覆盖闭合无对象可核（空集合不得判 PASS）")
             else:
                 st = ("PASS" if (n_noclue == 0 and n_outof == 0 and n_badbasis == 0
-                                 and n_cluepend == 0) else "FAIL")
+                                 and n_cluepend == 0 and n_crossshared == 0) else "FAIL")
                 # 2026-10-05（一百五十九）：`覆盖待裁决` 单独计数并写进状态串 —— 与
                 #   「缺线索」分列，人工据此知道该去裁决还是去补提取（两者处置相反）。
                 R.check("C6", "覆盖闭合", st,
-                        "闭合 %d / 缺线索 %d / 覆盖待裁决 %d / 安装层越界 %d / "
-                        "判定依据不可枚举 %d"
-                        % (n_ok, n_noclue, n_cluepend, n_outof, n_badbasis))
+                        "闭合 %d / 缺线索 %d / 覆盖待裁决 %d / 跨楼共用已撤回 %d / "
+                        "安装层越界 %d / 判定依据不可枚举 %d"
+                        % (n_ok, n_noclue, n_cluepend, n_crossshared, n_outof, n_badbasis))
 
     # ---------- C7 覆盖自检透传 ----------
     R.emit()

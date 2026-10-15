@@ -347,3 +347,25 @@ python "<技能目录>\scripts\ftth_launcher.py" analyze_coverage_vshape.py <dxf
 
 - 若DXF既无干净竖干、皮线米数也无规律（如非标准层高），则完全无法提供参考线索，需明确告知用户"图纸无足够信息判断覆盖范围，需用户凭施工经验或现场确认"
 - 分界线附近楼层距两个分纤箱可能等距，即使皮线规律也无法严格区分——此情况转为待确认
+
+### 待裁决五分类（会审 P1-2，只打标不改判据）
+
+> 机器分类函数唯一实现：`coverage_engine.classify_coverage_pending`（纯函数，回归见 `run_conflict_matrix.py` S16）。
+
+| 分类 | 含义 | 典型事项关键词 |
+|---|---|---|
+| `COVERAGE_DATA_INCOMPLETE` | 窗口内无米数列/无连续体/无户数期望，建不出判定 | 无法判定、覆盖楼层为空、找不到任何 |
+| `COVERAGE_WINDOW_INCOMPLETE` | 米数列/窗口被截断，覆盖并集小于户数期望 | 截断、窗口边界、P0-12 |
+| `COVERAGE_BOX_BINDING_UNKNOWN` | V段存在但箱号锚缺失，绑不到具体箱 | 无箱号锚、V段数与箱数不一致 |
+| `COVERAGE_SOURCE_CONFLICT` | V底 vs 箱安装层/双源覆盖不一致 | 不一致、偏差、冲突、需复核 |
+| `COVERAGE_TRUE_GAP` | 数据齐但并集确有缺层，疑似真覆盖缺失 | 覆盖范围缺失楼层（无截断提示） |
+
+### 共享证据三层（会审 P1-3，只打标不改克隆行为）
+
+> 机器分类函数唯一实现：`coverage_engine.evidence_tier_for`；parse 侧共享组打标见 `parse_dxf_structured.py` 共享区间块。
+
+| 层 | 含义 | 落点 |
+|---|---|---|
+| `shared_geometry` | 同一米数窗/竖干几何，可天然克隆 | 共享窗节点（`[共享]`键）、同一标题展开多栋的共享组 |
+| `shared_business_evidence` | 须克隆+楼栋证据绑定，逐栋复核 | 带 `来源共享窗` 的成员条目 |
+| `building_specific_evidence` | 本栋私有，不得跨栋复制 | 普通条目、疑假共享组 |

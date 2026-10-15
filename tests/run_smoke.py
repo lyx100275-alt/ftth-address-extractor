@@ -14,7 +14,7 @@ T1b 委托锁：归一包装（norm_unit/norm_floor/floor_num_local）必须调�
 T2 注册面=分发面：ftth.py 每个 add_parser 的子命令在分发段有分支（差集 ∅）
 T3 纯函数语义：bldg_num / bldg_num_or_none / _txt_fields 两态出口 + floor_num 楼层归一
 T4 体量闸门：ftth.py budget rc=0
-T4b 文档一致性门：scripts/check_docs.py rc=0（D1~D7：子命令/阶段/冒烟范围/C项/指针链）
+T4b 文档一致性门：scripts/check_docs.py rc=0（D1~D13：子命令三处/阶段/冒烟范围/C项/指针链/脚本数三处/版本号三处）
 T5 语料冒烟（可选）：语料 DXF probe rc=0（语料缺失自动 SKIP）
 T0 全仓编译：scripts/*.py py_compile 全过（语法级）
 T6 出表链黄金路径（合成料，无需 DXF/ezdxf）：assemble 组装（全名单元键+中文单元+共享克隆）
@@ -54,6 +54,20 @@ SK = os.path.dirname(HERE)
 SC = os.path.join(SK, 'scripts')
 PY = sys.executable
 fails = []
+# SKIP 可见性（2026-10-06 审计补）：此前 T5/T14 缺料只打印一行 [SKIP] 即过，
+#   结尾 `ALL PASS` 与「全测过」不可区分（曾长期绿灯但真图从未跑）。此处包装
+#   print 收集全部 [SKIP] 行，结尾汇总打印；CI 置 FTTH_REQUIRE_CORPUS=1 可使
+#   T5/T14 缺料 SKIP 转 FAIL。
+skips = []
+_REQUIRE_CORPUS = os.environ.get('FTTH_REQUIRE_CORPUS') == '1'
+_real_print = print
+
+
+def print(*a, **k):
+    _s = ' '.join(str(x) for x in a)
+    if _s.startswith('[SKIP]'):
+        skips.append(_s)
+    _real_print(*a, **k)
 
 # 控制台 UTF-8 兜底：中文 Windows 默认 GBK，本文件含 CJK/∅ 输出，
 # 无此行则 T2 在 print 即崩（UnicodeEncodeError），后半截门禁全跳过。
@@ -821,7 +835,7 @@ except (ImportError, AttributeError) as _e:
 #   齐备时跑（约 3 分钟），否则 SKIP。指纹设计（防假红）：md5 只锁跨目录逐位一致
 #   的文件（parsed/coverage/titleblock/fxmap/fx_locations/unit_box_gaps/count_box）；
 #   profile/timing/inspect 内嵌路径与耗时走语义比对（rc/条数/归一化文本哈希，浮点
-#   与路径归一）。lxz14 config.json 有探查浮点抖动（已证实），不锁 md5。
+#   与路径归一）。test_b config.json 有探查浮点抖动（已证实），不锁 md5。
 #   指纹基线见 tests/golden_expected.json；行为变更须同步更新基线并记 CHANGELOG。
 #
 # 2026-10-02（会审整改 P0-1）三处改：
@@ -847,14 +861,14 @@ try:
         """基线里的 dxf 相对路径 → 绝对路径。
 
         相对基准 = **用户桌面**（语料外置的约定），但为每次运行留两个后手：
-        ① 基线里写绝对路径（异地机器复现用）；② 相对 `技能目录/../../..` 等常见
+        ① 基线里写绝对路径（异地机器复现用）；② 相对 `技能目录` 或 `技能目录/../../..` 等常见
         语料库位置。找不到则返 None → T14 SKIP 并说清缺哪张图，不静默跳过。
         """
         if os.path.isabs(rel):
             return rel if os.path.isfile(rel) else None
         for base in (os.path.join(os.path.expanduser('~'), 'Desktop'),
                      os.path.join(os.path.expanduser('~')),
-                     os.path.dirname(SK), os.path.dirname(os.path.dirname(SK))):
+                     SK, os.path.dirname(SK), os.path.dirname(os.path.dirname(SK))):
             p = os.path.normpath(os.path.join(base, rel.replace('/', os.sep)))
             if os.path.isfile(p):
                 return p
@@ -1222,5 +1236,13 @@ except Exception as _e:
     check('T18 冲突矩阵回归（覆盖来源状态机闭环）', False, '异常: %s' % _e)
 
 print()
-print('== 冒烟结果: %s（失败 %d 项）==' % ('ALL PASS' if not fails else 'FAIL', len(fails)))
+_corpus_skips = [s for s in skips if 'T14' in s or 'T5' in s]
+if _REQUIRE_CORPUS and _corpus_skips:
+    fails.append('FTTH_REQUIRE_CORPUS=1 缺料即失败')
+    _real_print('[FAIL] FTTH_REQUIRE_CORPUS=1：缺料 SKIP 视为失败：%s' % '; '.join(_corpus_skips))
+if skips:
+    _real_print('== SKIP 清单（%d 项，缺料/缺依赖跳过，非通过）==' % len(skips))
+    for _s in skips:
+        _real_print('  ' + _s)
+print('== 冒烟结果: %s（失败 %d 项，跳过 %d 项）==' % ('ALL PASS' if not fails else 'FAIL', len(fails), len(skips)))
 sys.exit(0 if not fails else 1)

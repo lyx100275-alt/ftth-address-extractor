@@ -13,7 +13,7 @@ AIGC:
 
 > 全部脚本均支持 `--help`；本表为主要参数速查。SKILL.md 只留脚本名+一句话职责。
 
-探查确定参数后用 ezdxf 提取 FTTH 信息。**42 个脚本**（`scripts/`：含 `ftth.py`/`ftth_common.py`/`ftth_launcher.py`/`ftth_batch.py`）——改文件后同步计数：
+探查确定参数后用 ezdxf 提取 FTTH 信息。**43 个脚本**（`scripts/`：含 `ftth.py`/`ftth_common.py`/`ftth_launcher.py`/`ftth_batch.py`）——改文件后同步计数：
 
 | 脚本 | 作用 | 主要参数 |
 |------|------|----------|
@@ -83,6 +83,7 @@ AIGC:
 - `gen --addr` 留空时 PowerShell 丢弃空串致 argparse 报错，变通传 `--addr ",,,,,,"`。
 - `--floor-pattern` 至少 1 个捕获组：`[-]?[0-9]+F` 编译通过 rc=0 假象，解析期 `m.group(1)` 才 IndexError（已补入启动期自检，缺组即 rc=1）。
 - `--hu-pattern` 捕获组只包数字：`([0-9]+户)` 捕获 `2户` 整串致 `int('2户')` 崩（`floor_engine.py` 已加防御性数字提取，正确写法 `([0-9]+)户`）。
+- `methods/signals.json` 的 detect_method 示例用 `\d` 只是描述性写法，**抄到命令行一律改写 `[0-9]`**（见 L1-C1 正则四坑①）。
 - **长输出命令禁接 `Select-Object -First`**：`inspect` 等长输出经管道截断会使 `$LASTEXITCODE` 变 **-1**（假失败，2026-10-02 凤鸣朝阳实测）；正确做法：先 `> <文件> 2>&1` 落盘、再读文件判退出码与内容。
 - `extract_fx_map.py` 用**位置参数** `dxf [out]`，不认 `--dxf`（传了报 `unrecognized arguments`）；对照表区与光缆覆盖行（「覆盖N号楼」类）同图不同区时，用 `--x-min/--x-max/--y-min/--y-max` 限定搜索区域防串扰（2026-10-02 云峰实测）。
 - probe 建议 `--unit-split-keyword`（分离形态单元轴：『单元电井』+左侧数字）时 parse **必须显式传**，否则单元轴不合成、箱并回楼栋级容器产生 pending（2026-10-02 云峰实测：漏传致 4 项待裁决，补传后 13 锚点全合成）。
@@ -363,7 +364,7 @@ ODA 转换由用户完成。
 
 ## 统一入口 `ftth.py` 与 `--config` 机制
 
-`ftth.py` 是统一调度入口，支持 16 个子命令（`probe/plan/parse/split-band/coverage/coverage-vshape/inspect/assemble/apply-ruling/count/count-box/gen/verify-truth/pipeline/budget/transitions`）。参数优先级：命令行显式>`--config`>脚本默认。`--config` 传入 probe 输出的 `suggested_params` JSON，自动填充未指定的参数。
+`ftth.py` 是统一调度入口，支持 19 个子命令（`probe/plan/parse/coverage/coverage-vshape/verify-truth/inspect/count/count-box/gen/assemble/apply-ruling/split-band/pipeline/budget/transitions/new-run/summary/verify-answer`）。参数优先级：命令行显式>`--config`>脚本默认。`--config` 传入 probe 输出的 `suggested_params` JSON，自动填充未指定的参数。
 
 **典型工作流**：`probe`→`plan`（选法）→`parse --config --profile`。
 
