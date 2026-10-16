@@ -1334,9 +1334,15 @@ for bldg_job in bldg_jobs:
         unclaimed = [{"x": round(t["x"], 1), "y_min": round(t["y_min"], 1), "y_max": round(t["y_max"], 1)}
                      for t in unit_trunks if id(t) not in claimed_map]
         if unclaimed:
+            # 2026-10-15（一百六十四，云峰实跑修复）：此处不再直接判「异常」——
+            #   unit_trunks 按「本单元箱位 ± fx_window」取 trunk，多单元/多栋共享同一张
+            #   系统图（x 边界重叠，见 parse 段[边界过近]告警）时，兄弟单元/邻楼栋的箱
+            #   认领的 trunk 也会落进本列表；claimed_map 是单元级局变量，于是本单元视角下
+            #   它就成了「没有任何分纤箱认领」。云峰实跑 9/9 条全假阳，而 C4/C4b 已从
+            #   geom/对照表两侧证明 23/23 箱无遗漏 —— 假告警还把人往「漏箱/图层过滤」
+            #   错方向引。真伪交由本函数末尾的全局重分类（以 _trunk_owners 全图认领登记
+            #   为准）判定，此处只落盘单元级事实。
             unit_result["未认领竖干连续体"] = unclaimed
-            log.warning(f"  [异常] {unit_name} 有 {len(unclaimed)} 个竖干连续体没有任何分纤箱认领，"
-                        f"可能是漏箱或图层过滤不当")
 
         shared = []
         for t in unit_trunks:
@@ -1579,6 +1585,56 @@ for _key in sorted(k for k, v in _trunk_owners.items() if len(v) >= 2):
     })
     log.warning("  [跨楼共用竖干] x≈%s y=[%s, %s] 被 %d 栋楼共用（%s）→ 覆盖结论已撤回，交人工裁决"
                 % (_key[0], _key[1], _key[2], len(_owners), '、'.join(_who)))
+
+# ---------- 「未认领竖干连续体」全局重分类（2026-10-15 一百六十四，云峰实跑修复） ----------
+# 病灶（详见上方 unit 循环内注释）：多单元/多栋共享系统图时，单元级 claimed_map 把
+#   「被兄弟单元/邻楼栋的箱认领的 trunk」误报成「没有任何分纤箱认领，可能是漏箱或
+#   图层过滤不当」——云峰实跑 9/9 条全假阳，而 C4/C4b 已从 geom/对照表两侧证明
+#   23/23 箱无遗漏；假告警把人往错方向引，违背告警「指向真问题」的用意。
+# 修复：以 _trunk_owners（全图认领登记，key 与未认领条目同构：x/y_min/y_max 各 round 1）
+#   为准重新分类 ——
+#   ① 全图有箱认领 → 移出「未认领」，改记「被他处认领的连续体」+ INFO（共享几何，非漏箱）；
+#   ② 全图无箱认领 → 保留「未认领」真异常，WARNING 照旧。
+# 语义边界：只改告警作用域与记录字段，**不新增/撤回任何覆盖结论**（红线 L0-I2 不动）。
+for _rk, _rv in (result.get("楼栋") or {}).items():
+    if not isinstance(_rv, dict):
+        continue
+    for _ruk, _ruv in ((_rv.get("单元") or {}) or {}).items():
+        if not isinstance(_ruv, dict):
+            continue
+        _unc = _ruv.get("未认领竖干连续体")
+        if not _unc:
+            continue
+        _real, _shared = [], []
+        for _t in _unc:
+            try:
+                _key = (round(float(_t.get("x")), 1), round(float(_t.get("y_min")), 1),
+                        round(float(_t.get("y_max")), 1))
+            except (TypeError, ValueError):
+                _real.append(_t)   # 键都取不出 ⇒ 无从核对，保守保留原告警
+                continue
+            if _key in _trunk_owners:
+                _shared.append((_t, _trunk_owners[_key]))
+            else:
+                _real.append(_t)
+        if _shared:
+            _ruv["被他处认领的连续体"] = [
+                {"x": _t.get("x"), "y_min": _t.get("y_min"), "y_max": _t.get("y_max"),
+                 "认领方": ["%s/%s/%s" % (_b, _u, _n)
+                            for _b in sorted(_o) for _u, _n in _o[_b]]}
+                for _t, _o in _shared]
+            for _t, _o in _shared:
+                log.info("  [注意] %s/%s：竖干连续体 x≈%s y=[%s, %s] 被其他单元/楼栋的箱认领"
+                         "（%s）—— 多栋共享系统图的共享几何，非本单元漏箱"
+                         % (_rk, _ruk, _t.get("x"), _t.get("y_min"), _t.get("y_max"),
+                            "、".join("%s/%s/%s" % (_b, _u, _n)
+                                      for _b in sorted(_o) for _u, _n in _o[_b])))
+        if _real:
+            _ruv["未认领竖干连续体"] = _real
+            log.warning("  [异常] %s/%s 有 %d 个竖干连续体全图没有任何分纤箱认领，"
+                        "可能是漏箱或图层过滤不当" % (_rk, _ruk, len(_real)))
+        else:
+            _ruv.pop("未认领竖干连续体", None)
 
 _expanded_copies = set()
 for _nk, _nv in (result.get("楼栋") or {}).items():

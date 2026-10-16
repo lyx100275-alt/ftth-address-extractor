@@ -860,6 +860,12 @@ def main():
                 if v[2] > 0:
                     _sib.setdefault(b, []).append((u, v[2]))
             _susp = [(k, v) for k, v in _all_blank if k[0] in _sib]
+            # 2026-10-15（一百六十四，云峰实跑修复）：_nosib = 同楼栋**没有任何单元**
+            #   读到户数的全缺单元。原实只在 _susp 非空时打 ⚠ 段，而下方 WARN 汇总恒按
+            #   _all_blank 计数并写「（见上 ⚠ 段）」—— _susp 为空（云峰 15 个单元仅 1 个
+            #   读到书写户数，无兄弟对照）时指针悬空：缺失单元名单无处可查，且汇总文案
+            #   断言的「多单元共用户数列」成因在本图根本不成立。此处补打如实文案。
+            _nosib = [(k, v) for k, v in _all_blank if k[0] not in _sib]
             if _susp:
                 # 注意：文案里的 100%% 是 %-格式化的转义（`100% ` 会被当成占位符）
                 R.emit("  ↓ ⚠ **整单元「户数」列 100%% 缺失**（%d 个）—— 同楼栋另有单元"
@@ -872,6 +878,16 @@ def main():
                            % (b, u, v[0], _bro or "(无)"))
                 if len(_susp) > 20:
                     R.emit("      ... 另有 %d 个未列出" % (len(_susp) - 20))
+            if _nosib:
+                R.emit("  ↓ ⚠ **整单元「户数」列缺失**（%d 个）—— 同楼栋**没有任何单元**"
+                       "读到户数，无法判定是「多单元共用同一条户数列、只归了一个单元」还是"
+                       "图纸事实（该处确实没有户数列）；此类单元的户号不会生成，须人工确认"
+                       "后处置：" % len(_nosib))
+                for (b, u), v in _nosib[:20]:
+                    R.emit("      %s/%s：%d 层户数全缺（同楼栋无户数对照单元）"
+                           % (b, u, v[0]))
+                if len(_nosib) > 20:
+                    R.emit("      ... 另有 %d 个未列出" % (len(_nosib) - 20))
         _n_hu_missing_partial = (sum(v[3] for v in _unit_stat.values())
                                  - sum(v[0] for k, v in _all_blank))
         if _n_hu_missing_partial > 0:
@@ -890,8 +906,9 @@ def main():
             _c5_extra = ""
         if _all_blank:
             _c5_extra += ("；**%d 个单元「户数」列整单元缺失**（见上 ⚠ 段）—— 与"
-                          "「个别层无标注」性质不同，实测多为多单元共用户数列而 x 轴只归了"
-                          "一个单元；不得按地下车库层等图面事实处理，确认前不得出表"
+                          "「个别层无标注」性质不同：有同楼栋户数对照的高度疑似共用户数列"
+                          "只归了一个单元，无对照的须人工确认是否图纸事实；不得按地下车库层"
+                          "等图面事实处理，确认前不得出表"
                           % len(_all_blank))
         if _c5_extra:
             R.check("C5", "楼层表直读清单", "WARN", _c5_note + _c5_extra)

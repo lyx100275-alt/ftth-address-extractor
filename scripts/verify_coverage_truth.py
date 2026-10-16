@@ -23,6 +23,11 @@
     --fx-prefix 前缀        定稿表分纤箱列统一前缀（可选，与 gen --fx-prefix 对称；
                               如 gen 出表时加了「绿城凤鸣朝阳」，反查须传同一前缀；
                               比对前对表列值剥前缀再全等匹配；未传时行为不变）
+    安装层后缀自动剥除：gen --fx-floor-suffix on（默认，2026-09-30 用户定稿格式）出表的
+                              分纤箱列为「编号（安装楼层）」（如 FX01#（5F）/ FX23#（B1）/
+                              FX22#（-1F），全角/半角括号均可）。比对前自动剥除该后缀再
+                              全等匹配，并在「真值」行报告剥除行数；非安装层形态的括号
+                              后缀（如 FX01#（东区））不匹配、原样保留。
 
 退出码：
     0 = 全部一致；2 = 存在不一致或无法比对；1 = 输入/解析错误。
@@ -48,6 +53,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ftth_common import cn2num, ensure_console_utf8, floor_num, norm_floor  # noqa: E402  # norm_floor全技能唯一实现，2026-09-27收敛双副本
 
 ensure_console_utf8()
+
+# 2026-10-15（一百六十四，云峰实跑修复）：真值表箱号末尾的安装层后缀。
+# gen --fx-floor-suffix on（默认；2026-09-30 用户要求的定稿格式）出表即
+#   `FX01#（5F）` / `FX23#（B1）` / `FX22#（-1F）` —— 全角/半角括号、B 前缀、负层、
+#   F 可省三种变体都要覆盖。此前只剥前缀（一百零五），后缀形态下 23/23 全失配
+#   （云峰实测：一致 0 / 不一致 23，而剥后缀后实为 20/23 一致）—— 回归验收工具
+#   对本技能自己的出表格式完全失效，且不给出任何重跑提示。
+_FX_FLOOR_SUFFIX_RE = re.compile(r"[（(]\s*[Bb]?-?[0-9]+\s*F?\s*[)）]\s*$")
+
+
+def strip_fx_floor_suffix(box):
+    """剥掉真值表箱号末尾的安装层后缀；返回 (剥后编号, 是否剥掉)。
+
+    只剥**末尾一个**括号组、且组内容必须是安装层形态（可选 B / 负号 / 数字 / 可选 F）。
+    `FX01#（东区）` 这类非安装层后缀不匹配、原样返回（宁可漏剥，不可误剥 —— 误剥会把
+    「编号不同」伪装成「编号相同」，直接毁掉回归验收的意义）。
+    """
+    m = _FX_FLOOR_SUFFIX_RE.search(box)
+    if m and m.start() > 0:
+        return box[:m.start()].rstrip(), True
+    return box, False
 
 
 def summarize(floors):
@@ -112,10 +138,14 @@ def main():
     #   （如「FL01-FX01」），须先剥前缀再全等匹配，否则 17/17 全失配。
     #   语义与 gen 侧 _with_fx_prefix 镜像：startswith 才剥、空串前缀等于未传；
     #   空值/空白/「未分配」天然不匹配前缀、不受影响。未传时行为逐字不变。
+    # 2026-10-15（一百六十四，云峰实跑修复）：再剥安装层后缀 —— gen 默认出表格式
+    #   `FX01#（5F）`（--fx-floor-suffix on）与此前只处理的前缀形态叠加时同样全失配；
+    #   后缀是 gen 的既定输出，无条件剥（不新增参数），剥除行数在「真值」行报告。
     _fx_prefix = (args.fx_prefix.strip() if isinstance(args.fx_prefix, str) else "") or ""
     truth = OrderedDict()
     n_rows = 0
     n_stripped = 0
+    n_suffix = 0
     for r in rows[1:]:
         if not r or r[ci["box"]] in (None, ""):
             continue
@@ -123,6 +153,9 @@ def main():
         if _fx_prefix and box.startswith(_fx_prefix):
             box = box[len(_fx_prefix):]
             n_stripped += 1
+        box, _had_sfx = strip_fx_floor_suffix(box)
+        if _had_sfx:
+            n_suffix += 1
         fl = norm_floor(r[ci["floor"]])
         n_rows += 1
         d = truth.setdefault(box, {"楼栋": str(r[ci["bldg"]] or ""), "单元": str(r[ci["unit"]] or ""),
@@ -130,7 +163,8 @@ def main():
         d["楼层"][fl] = d["楼层"].get(fl, 0) + 1
         d["户数"] += 1
     print(f"真值：{n_rows} 户 / {len(truth)} 个分纤箱"
-          + (f"（--fx-prefix {args.fx_prefix!r} 剥离 {n_stripped} 行）" if _fx_prefix else ""))
+          + (f"（--fx-prefix {args.fx_prefix!r} 剥离 {n_stripped} 行）" if _fx_prefix else "")
+          + (f"（安装层后缀剥除 {n_suffix} 行）" if n_suffix else ""))
 
     cov = json.load(open(args.json, encoding="utf-8"))
     got = {}   # box -> (楼栋, 单元, 覆盖集合, 来源)
@@ -193,12 +227,13 @@ def main():
         if _hit and isinstance(_pfx, str) and _pfx:
             print("\n提示：真值表分纤箱列疑似带统一前缀（%d/%d 行剥离 %r 后恰为线索裸编号），"
                   "与覆盖线索编号形态不匹配，可用 --fx-prefix %r 重跑。"
-                  "（不自动剥离：多小区合并表有误配风险。）"
+                  "（不自动剥离：多小区合并表有误配风险。安装层后缀如 （5F）/（B1） "
+                  "已在比对前自动剥除，不在此列。）"
                   % (_hit, len(truth), _pfx, _pfx))
         elif _hit:
             print("\n提示：真值表分纤箱列疑似带前缀（%d/%d 行为某线索编号加前缀形态），"
                   "与覆盖线索裸编号形态不匹配；确认前缀后用 --fx-prefix <前缀> 重跑。"
-                  "（不自动剥离：多小区合并表有误配风险。）"
+                  "（不自动剥离：多小区合并表有误配风险。安装层后缀已自动剥除。）"
                   % (_hit, len(truth)))
     print("\n合计：一致 %d / 不一致 %d / 总计 %d"
           % (len(truth) - len(bad), len(bad), len(truth)))
