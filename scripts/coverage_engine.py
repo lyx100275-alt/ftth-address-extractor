@@ -34,7 +34,91 @@ from evidence_builder import (  # 词汇唯一来源；本层只适配、不另�
 __all__ = [
     "vshape_floor_evidence",
     "vertical_floor_evidence",
+    # 会审 P1-2/P1-3（加法式，不改既有函数行为）：
+    "PENDING_COVERAGE_DATA_INCOMPLETE",
+    "PENDING_COVERAGE_WINDOW_INCOMPLETE",
+    "PENDING_COVERAGE_BOX_BINDING_UNKNOWN",
+    "PENDING_COVERAGE_SOURCE_CONFLICT",
+    "PENDING_COVERAGE_TRUE_GAP",
+    "PENDING_COVERAGE_CATEGORIES",
+    "classify_coverage_pending",
+    "TIER_SHARED_GEOMETRY",
+    "TIER_SHARED_BUSINESS",
+    "TIER_BUILDING_SPECIFIC",
+    "evidence_tier_for",
 ]
+
+# ---------- 待裁决分类（会审 P1-2，封闭枚举；只打标、不改判据） ----------
+# 动因：V型/竖线 coverage pending 此前汇聚成一句"覆盖范围缺失楼层"，
+# 人工看到时分不清是"没有数据"还是"数据有但箱不知道是谁"。
+# 五类只回答"缺的是哪一环"，判定逻辑与 rc 语义逐字不动，仍由人工裁决。
+PENDING_COVERAGE_DATA_INCOMPLETE = "COVERAGE_DATA_INCOMPLETE"  # 窗口内无米数列/无连续体/无户数期望，建不出判定
+PENDING_COVERAGE_WINDOW_INCOMPLETE = "COVERAGE_WINDOW_INCOMPLETE"  # 米数列/窗口被截断，覆盖并集小于户数期望
+PENDING_COVERAGE_BOX_BINDING_UNKNOWN = "COVERAGE_BOX_BINDING_UNKNOWN"  # V段存在但箱号锚缺失，绑不到具体箱
+PENDING_COVERAGE_SOURCE_CONFLICT = "COVERAGE_SOURCE_CONFLICT"  # V底 vs 箱安装层 / 双源覆盖不一致
+PENDING_COVERAGE_TRUE_GAP = "COVERAGE_TRUE_GAP"  # 数据齐但并集确有缺层，疑似真覆盖缺失
+
+PENDING_COVERAGE_CATEGORIES = (
+    PENDING_COVERAGE_DATA_INCOMPLETE,
+    PENDING_COVERAGE_WINDOW_INCOMPLETE,
+    PENDING_COVERAGE_BOX_BINDING_UNKNOWN,
+    PENDING_COVERAGE_SOURCE_CONFLICT,
+    PENDING_COVERAGE_TRUE_GAP,
+)
+
+
+def classify_coverage_pending(事项=None, 说明=None):
+    """待裁决条目 → 五类之一（纯分类，不定案；关键词命中，默认 DATA_INCOMPLETE）。
+
+    顺序即优先级：绑定失败 > 来源冲突 > 窗口截断 > 缺层陈述 > 无数据 > 真缺口兜底。
+    未命中任何关键词时返回 DATA_INCOMPLETE（"缺判断依据"本身即缺数据，不得伪装成真缺口）。
+    """
+    _t = "%s %s" % (事项 or "", 说明 or "")
+    if any(k in _t for k in ("无箱号锚", "V段数与箱数不一致", "无法绑定", "绑不到", "锚点缺失")):
+        return PENDING_COVERAGE_BOX_BINDING_UNKNOWN
+    if any(k in _t for k in ("两来源不一致", "不一致", "偏差", "冲突", "需复核", "交叉校验")):
+        # "覆盖范围缺失楼层"若同时含截断提示，优先判窗口截断（下分支先行）——
+        # 故此处排除已含"截断"的缺层陈述，避免把窗口问题误归为来源冲突。
+        if "缺失楼层" in str(事项 or "") and "截断" in _t:
+            return PENDING_COVERAGE_WINDOW_INCOMPLETE
+        return PENDING_COVERAGE_SOURCE_CONFLICT
+    if any(k in _t for k in ("截断", "窗口边界", "米数列是否被截", "P0-12")):
+        return PENDING_COVERAGE_WINDOW_INCOMPLETE
+    if "缺失楼层" in _t:
+        return PENDING_COVERAGE_TRUE_GAP
+    if any(k in _t for k in ("无法判定", "覆盖楼层为空", "找不到任何", "无可用米数列", "无户数")):
+        return PENDING_COVERAGE_DATA_INCOMPLETE
+    # 兜底：分不清缺哪一环 = 缺判断依据 = 缺数据，不得伪装成"真缺口"。
+    if "缺失" in _t or "缺层" in _t:
+        return PENDING_COVERAGE_TRUE_GAP
+    return PENDING_COVERAGE_DATA_INCOMPLETE
+
+
+# ---------- 共享证据三层（会审 P1-3，封闭枚举；只打标、不改克隆行为） ----------
+# 动因：共享系统图"克隆"此前不区分"复制图元=复制业务事实"。
+# 三层只回答"这份证据允不允许跨栋复制"：
+#   shared_geometry           同一米数窗/竖干几何，可天然克隆（米数表/V段/谷底/连续体）；
+#   shared_business_evidence  须克隆+楼栋证据绑定（箱编号归属、户数列落位）；
+#   building_specific_evidence 不允许跨栋复制（单栋安装层/覆盖判定结论）。
+TIER_SHARED_GEOMETRY = "shared_geometry"
+TIER_SHARED_BUSINESS = "shared_business_evidence"
+TIER_BUILDING_SPECIFIC = "building_specific_evidence"
+
+
+def evidence_tier_for(bldg_key=None, has_src_window=False, is_window_node=False):
+    """共享条目 → 证据层（纯分类，不改克隆行为）。
+
+    - 窗节点（键含[共享]）→ shared_geometry（几何本身）；
+    - 成员条目（带来源共享窗的非窗节点）→ shared_business_evidence（须按栋绑定复核）；
+    - 其余 → building_specific_evidence（本栋私有，不得跨栋复制）。
+    """
+    _k = str(bldg_key or "")
+    _is_win = bool(is_window_node) or _k.startswith("[共享]")
+    if _is_win:
+        return TIER_SHARED_GEOMETRY
+    if bool(has_src_window):
+        return TIER_SHARED_BUSINESS
+    return TIER_BUILDING_SPECIFIC
 
 
 def vshape_floor_evidence(box_no, floor_value, window_tag=""):

@@ -860,6 +860,12 @@ def main():
                 if v[2] > 0:
                     _sib.setdefault(b, []).append((u, v[2]))
             _susp = [(k, v) for k, v in _all_blank if k[0] in _sib]
+            # 2026-10-15（一百六十四，云峰实跑修复）：_nosib = 同楼栋**没有任何单元**
+            #   读到户数的全缺单元。原实只在 _susp 非空时打 ⚠ 段，而下方 WARN 汇总恒按
+            #   _all_blank 计数并写「（见上 ⚠ 段）」—— _susp 为空（云峰 15 个单元仅 1 个
+            #   读到书写户数，无兄弟对照）时指针悬空：缺失单元名单无处可查，且汇总文案
+            #   断言的「多单元共用户数列」成因在本图根本不成立。此处补打如实文案。
+            _nosib = [(k, v) for k, v in _all_blank if k[0] not in _sib]
             if _susp:
                 # 注意：文案里的 100%% 是 %-格式化的转义（`100% ` 会被当成占位符）
                 R.emit("  ↓ ⚠ **整单元「户数」列 100%% 缺失**（%d 个）—— 同楼栋另有单元"
@@ -872,6 +878,16 @@ def main():
                            % (b, u, v[0], _bro or "(无)"))
                 if len(_susp) > 20:
                     R.emit("      ... 另有 %d 个未列出" % (len(_susp) - 20))
+            if _nosib:
+                R.emit("  ↓ ⚠ **整单元「户数」列缺失**（%d 个）—— 同楼栋**没有任何单元**"
+                       "读到户数，无法判定是「多单元共用同一条户数列、只归了一个单元」还是"
+                       "图纸事实（该处确实没有户数列）；此类单元的户号不会生成，须人工确认"
+                       "后处置：" % len(_nosib))
+                for (b, u), v in _nosib[:20]:
+                    R.emit("      %s/%s：%d 层户数全缺（同楼栋无户数对照单元）"
+                           % (b, u, v[0]))
+                if len(_nosib) > 20:
+                    R.emit("      ... 另有 %d 个未列出" % (len(_nosib) - 20))
         _n_hu_missing_partial = (sum(v[3] for v in _unit_stat.values())
                                  - sum(v[0] for k, v in _all_blank))
         if _n_hu_missing_partial > 0:
@@ -890,8 +906,9 @@ def main():
             _c5_extra = ""
         if _all_blank:
             _c5_extra += ("；**%d 个单元「户数」列整单元缺失**（见上 ⚠ 段）—— 与"
-                          "「个别层无标注」性质不同，实测多为多单元共用户数列而 x 轴只归了"
-                          "一个单元；不得按地下车库层等图面事实处理，确认前不得出表"
+                          "「个别层无标注」性质不同：有同楼栋户数对照的高度疑似共用户数列"
+                          "只归了一个单元，无对照的须人工确认是否图纸事实；不得按地下车库层"
+                          "等图面事实处理，确认前不得出表"
                           % len(_all_blank))
         if _c5_extra:
             R.check("C5", "楼层表直读清单", "WARN", _c5_note + _c5_extra)
@@ -1048,6 +1065,9 @@ def main():
         n_ok = n_noclue = n_outof = 0
         n_cluepend = 0   # 2026-10-05（一百五十九）：覆盖为空但属「两来源不一致待裁决」的箱数
         n_badbasis = 0   # 2026-09-27（P0-3）：判定依据不在覆盖方法枚举内的箱数
+        # 2026-10-07：覆盖被**撤回**的箱数（跨楼共用竖干，证据不具逐栋区分力）。
+        #   与「缺线索」处置方向相反：缺线索→补提取；本类→人工裁定各楼栋覆盖，补提取无用。
+        n_crossshared = 0
         # 2026-09-19 修复（与 C3 同一条件、同一处置）：coverage 提供了 JSON，但**箱级
         #   记录为 0** 时，上面那个 `for blk, un, fid, ... in boxes` 循环里每个箱都会
         #   走到 `if not recs: continue` —— 循环体一次有效判定都没做，三个计数全 0，
@@ -1112,6 +1132,15 @@ def main():
                                % (fid, blk, un))
                         R.fail("C6", "%s 覆盖两来源不一致待裁决（非缺线索，见 C7）" % fid)
                         n_cluepend += 1
+                    elif "不具逐栋区分力" in _src_txt:
+                        # 2026-10-07：跨楼共用同一竖干 —— 证据存在但不具区分力，覆盖已被
+                        #   产出方**主动撤回**。既不是「无线索」（补提取无用），也不是
+                        #   「两来源冲突」（只有一个来源）；处置=人工裁定各楼栋覆盖。
+                        R.emit("  ✗ %s（%s/%s）覆盖已撤回：跨楼共用同一竖干（证据不具逐栋区分力）"
+                               " —— 须人工裁定各楼栋覆盖；**不得**按「缺线索」去补提取"
+                               % (fid, blk, un))
+                        R.fail("C6", "%s 跨楼共用竖干·覆盖已撤回（待人工裁定）" % fid)
+                        n_crossshared += 1
                     else:
                         R.emit("  ✗ %s（%s/%s）缺覆盖范围线索" % (fid, blk, un))
                         R.fail("C6", "%s 缺覆盖范围线索" % fid)
@@ -1132,13 +1161,13 @@ def main():
                         "parse 侧 0 箱，覆盖闭合无对象可核（空集合不得判 PASS）")
             else:
                 st = ("PASS" if (n_noclue == 0 and n_outof == 0 and n_badbasis == 0
-                                 and n_cluepend == 0) else "FAIL")
+                                 and n_cluepend == 0 and n_crossshared == 0) else "FAIL")
                 # 2026-10-05（一百五十九）：`覆盖待裁决` 单独计数并写进状态串 —— 与
                 #   「缺线索」分列，人工据此知道该去裁决还是去补提取（两者处置相反）。
                 R.check("C6", "覆盖闭合", st,
-                        "闭合 %d / 缺线索 %d / 覆盖待裁决 %d / 安装层越界 %d / "
-                        "判定依据不可枚举 %d"
-                        % (n_ok, n_noclue, n_cluepend, n_outof, n_badbasis))
+                        "闭合 %d / 缺线索 %d / 覆盖待裁决 %d / 跨楼共用已撤回 %d / "
+                        "安装层越界 %d / 判定依据不可枚举 %d"
+                        % (n_ok, n_noclue, n_cluepend, n_crossshared, n_outof, n_badbasis))
 
     # ---------- C7 覆盖自检透传 ----------
     R.emit()

@@ -47,7 +47,10 @@ from ftth_common import (
     cluster_values_by_gap, measure_column_step, cluster_by_y,
     RE_DRAWING_WORD, auto_scaled, ensure_console_utf8, write_json,
 )
-from coverage_engine import vertical_floor_evidence  # V3 对称：竖线法统一证据唯一入口（纯构造）
+from coverage_engine import (  # V3 对称：竖线法统一证据唯一入口（纯构造）
+    vertical_floor_evidence,
+    classify_coverage_pending,  # 会审 P1-2：待裁决五分类（只打标，不改判据）
+)
 
 ensure_console_utf8()
 
@@ -958,12 +961,34 @@ for bldg_job in bldg_jobs:
     # （编号文字常在总图区，与主干无关）→ 竖干配对率 0%、覆盖结果全错但脚本照跑。
     # 静默错误数据不如失败。确认无符号画法后可用 --allow-low-pairing 强行继续。
     if _all_boxes and not _box_syms and not args.allow_low_pairing:
+        # 2026-10-07：报错必须带上**探查已给出的候选层**。实测柳辛庄 5-9 地块某带：
+        #   候选层 AXIS（得分0.333）就躺在同目录 profile.json 里，而本报错只说
+        #   「--fx-symbol-layer=未提供」，把排错方向指向「去核对/猜图层名」——
+        #   候选不可达 = 有答案却拿不到。此处**只列不决策**：候选未达自动下发门槛，
+        #   不由脚本采信，供人核对后显式传参。
+        _cand_hint = ""
+        try:
+            _pp = os.path.join(os.path.dirname(os.path.abspath(OUT)), "profile.json")
+            with open(_pp, "r", encoding="utf-8") as _pf:
+                _cands = (((json.load(_pf) or {}).get("probe_signals") or {})
+                          .get("fx_symbol_layer_candidates") or [])
+            if _cands:
+                _cand_hint = ("；探查已给出候选层 %s —— 均未达自动下发门槛，供人工核对后"
+                              "显式传 --fx-symbol-layer（脚本不代判）"
+                              % "、".join("%s(得分%.2f,推荐=%s)"
+                                          % (c.get("层"), c.get("得分", 0.0), c.get("推荐"))
+                                          for c in _cands[:3]))
+            else:
+                _cand_hint = ("；同目录 profile.json 中**无任何**箱符号层候选"
+                              "（本图箱体可能只写编号、不画符号）")
+        except Exception:                                              # noqa: BLE001
+            _cand_hint = ""     # 读不到画像不改变本条失败判据，只少一段提示
         log.error(
             "  [失败] %s：对照表有 %d 个箱，但本楼栋 x 范围内找不到任何箱图形符号"
             "（--fx-symbol-layer=%s）→ 箱位将回退编号文字坐标，覆盖计算必然失真，"
-            "已按失败退出（码 2，数据/参数错误非缺席）。处置：① 核对 --fx-symbol-layer 是否为符号所在图层；"
+            "已按失败退出（码 2，数据/参数错误非缺席）。处置：① 核对 --fx-symbol-layer 是否为符号所在图层%s；"
             "② 确认本图确实无符号画法后加 --allow-low-pairing 强行继续（结果须人工复核）。",
-            bldg_name, len(_all_boxes), args.fx_symbol_layer or "未提供")
+            bldg_name, len(_all_boxes), args.fx_symbol_layer or "未提供", _cand_hint)
         sys.exit(2)
 
     if _box_syms and _all_boxes:
@@ -1309,9 +1334,15 @@ for bldg_job in bldg_jobs:
         unclaimed = [{"x": round(t["x"], 1), "y_min": round(t["y_min"], 1), "y_max": round(t["y_max"], 1)}
                      for t in unit_trunks if id(t) not in claimed_map]
         if unclaimed:
+            # 2026-10-15（一百六十四，云峰实跑修复）：此处不再直接判「异常」——
+            #   unit_trunks 按「本单元箱位 ± fx_window」取 trunk，多单元/多栋共享同一张
+            #   系统图（x 边界重叠，见 parse 段[边界过近]告警）时，兄弟单元/邻楼栋的箱
+            #   认领的 trunk 也会落进本列表；claimed_map 是单元级局变量，于是本单元视角下
+            #   它就成了「没有任何分纤箱认领」。云峰实跑 9/9 条全假阳，而 C4/C4b 已从
+            #   geom/对照表两侧证明 23/23 箱无遗漏 —— 假告警还把人往「漏箱/图层过滤」
+            #   错方向引。真伪交由本函数末尾的全局重分类（以 _trunk_owners 全图认领登记
+            #   为准）判定，此处只落盘单元级事实。
             unit_result["未认领竖干连续体"] = unclaimed
-            log.warning(f"  [异常] {unit_name} 有 {len(unclaimed)} 个竖干连续体没有任何分纤箱认领，"
-                        f"可能是漏箱或图层过滤不当")
 
         shared = []
         for t in unit_trunks:
@@ -1446,6 +1477,11 @@ if args.bldg_map:
     log.info("安装楼层总图校验：可比对 %d 箱，冲突 %d 箱（冲突项已按总图取直写值）",
              _n_tb, len(_floor_conflicts))
 
+for _it in _judge:
+    # 会审 P1-2：待裁决五分类打标（加法式，只新增 pending_category 键）。
+    if isinstance(_it, dict) and not _it.get("pending_category"):
+        _it["pending_category"] = classify_coverage_pending(
+            _it.get("事项"), _it.get("说明"))
 if _judge:
     result["需人工裁决"] = _judge
     log.warning("需人工裁决 %d 项（详见输出 JSON 的『需人工裁决』）：", len(_judge))
@@ -1489,6 +1525,117 @@ _st_settled = _st_pending = 0
 # 2026-10-04（R1 缺陷 D1，与 V 型法同源同修）：共享窗**证据副本**不计入结果状态。
 #   判据与来源：见 analyze_coverage_vshape.py 同名块。本脚本当前不产共享窗节点，
 #   此块为**同一口径的对称实现**（有则生效、无则零成本），避免两个覆盖脚本再次漂移。
+# ---------- 跨楼共用竖干：撤掉不具逐栋区分力的覆盖结论（2026-10-07 立） ----------
+# 实测（云峰）：共享系统图形态下，7#楼/8#楼/10#楼 的箱因共用同一图形符号坐标
+#   (26696.5,-3855.3)，认领到**同一根竖干连续体** x≈26709.3 y=[-3974.0,-3703.6]，
+#   于是三栋楼各拿到一份**完全相同**的覆盖 1F~10F —— 一根竖干只能服务一处，
+#   「每栋各覆盖 1F~10F」是假象，不是图纸事实。
+# 处置：撤回该认领给出的覆盖结论（覆盖楼层置空 + 判定依据=待确认），并单列裁决项交人。
+#   **不按楼栋切分、不取最近者** —— 那是从位置推覆盖，属 L0-I2-P1 禁区。
+_trunk_owners = {}
+for _bk, _bv in (result.get("楼栋") or {}).items():
+    if not isinstance(_bv, dict):
+        continue
+    for _uk, _uv in ((_bv.get("单元") or {}) or {}).items():
+        if not isinstance(_uv, dict):
+            continue
+        for _bx in ((_uv.get("分纤箱") or []) or []):
+            _cl = _bx.get("覆盖范围线索")
+            _t = (_cl or {}).get("连续体") if isinstance(_cl, dict) else None
+            if not isinstance(_t, dict):
+                continue
+            try:
+                _key = (round(float(_t.get("x")), 1), round(float(_t.get("y_min")), 1),
+                        round(float(_t.get("y_max")), 1))
+            except (TypeError, ValueError):
+                continue
+            _trunk_owners.setdefault(_key, {}).setdefault(str(_bk), []).append(
+                (str(_uk), str(_bx.get("编号"))))
+
+for _key in sorted(k for k, v in _trunk_owners.items() if len(v) >= 2):
+    _owners = _trunk_owners[_key]
+    _who = ["%s/%s/%s" % (b, u, n) for b in sorted(_owners) for u, n in _owners[b]]
+    for _bk in _owners:
+        _bv = (result.get("楼栋") or {}).get(_bk)
+        for _uk, _bid in _owners[_bk]:
+            _uv = ((_bv or {}).get("单元") or {}).get(_uk)
+            for _bx in ((_uv or {}).get("分纤箱") or []):
+                if str(_bx.get("编号")) != _bid:
+                    continue
+                _cl = _bx.get("覆盖范围线索") or {}
+                _cl["覆盖楼层"] = []
+                _cl["floor_min"] = None
+                _cl["floor_max"] = None
+                _cl["性质"] = ("线索撤回：竖干连续体 x≈%s y=[%s, %s] 被 %d 栋楼共用（%s），"
+                               "图面无逐栋区分证据 —— 不输出覆盖楼层，须人工裁决"
+                               % (_key[0], _key[1], _key[2], len(_owners),
+                                  '/'.join(sorted(_owners))))
+                _cl["跨楼共用"] = sorted(_owners)
+                _bx["覆盖范围线索"] = _cl
+                _bx["判定依据"] = "待确认"
+                _bx["依据来源"] = ("E-DXF-GEOM:竖干连续体 x≈%s y=[%s, %s] 被 %d 栋楼共用，"
+                                   "不具逐栋区分力" % (_key[0], _key[1], _key[2], len(_owners)))
+    _judge.append({
+        "对象": "（跨楼共用竖干）x≈%s y=[%s, %s]" % _key,
+        "事项": "同一竖干连续体被 %d 栋楼的箱认领" % len(_owners),
+        "说明": "认领它的箱：%s —— 图面只画了一处竖干/箱符号，无逐栋区分证据；"
+                "已撤回这些箱的覆盖结论（置空 + 判定依据=待确认），未自行择一。"
+                "请人工核对配纤表/系统图后裁定各楼栋的实际覆盖范围"
+                % '、'.join(_who),
+    })
+    log.warning("  [跨楼共用竖干] x≈%s y=[%s, %s] 被 %d 栋楼共用（%s）→ 覆盖结论已撤回，交人工裁决"
+                % (_key[0], _key[1], _key[2], len(_owners), '、'.join(_who)))
+
+# ---------- 「未认领竖干连续体」全局重分类（2026-10-15 一百六十四，云峰实跑修复） ----------
+# 病灶（详见上方 unit 循环内注释）：多单元/多栋共享系统图时，单元级 claimed_map 把
+#   「被兄弟单元/邻楼栋的箱认领的 trunk」误报成「没有任何分纤箱认领，可能是漏箱或
+#   图层过滤不当」——云峰实跑 9/9 条全假阳，而 C4/C4b 已从 geom/对照表两侧证明
+#   23/23 箱无遗漏；假告警把人往错方向引，违背告警「指向真问题」的用意。
+# 修复：以 _trunk_owners（全图认领登记，key 与未认领条目同构：x/y_min/y_max 各 round 1）
+#   为准重新分类 ——
+#   ① 全图有箱认领 → 移出「未认领」，改记「被他处认领的连续体」+ INFO（共享几何，非漏箱）；
+#   ② 全图无箱认领 → 保留「未认领」真异常，WARNING 照旧。
+# 语义边界：只改告警作用域与记录字段，**不新增/撤回任何覆盖结论**（红线 L0-I2 不动）。
+for _rk, _rv in (result.get("楼栋") or {}).items():
+    if not isinstance(_rv, dict):
+        continue
+    for _ruk, _ruv in ((_rv.get("单元") or {}) or {}).items():
+        if not isinstance(_ruv, dict):
+            continue
+        _unc = _ruv.get("未认领竖干连续体")
+        if not _unc:
+            continue
+        _real, _shared = [], []
+        for _t in _unc:
+            try:
+                _key = (round(float(_t.get("x")), 1), round(float(_t.get("y_min")), 1),
+                        round(float(_t.get("y_max")), 1))
+            except (TypeError, ValueError):
+                _real.append(_t)   # 键都取不出 ⇒ 无从核对，保守保留原告警
+                continue
+            if _key in _trunk_owners:
+                _shared.append((_t, _trunk_owners[_key]))
+            else:
+                _real.append(_t)
+        if _shared:
+            _ruv["被他处认领的连续体"] = [
+                {"x": _t.get("x"), "y_min": _t.get("y_min"), "y_max": _t.get("y_max"),
+                 "认领方": ["%s/%s/%s" % (_b, _u, _n)
+                            for _b in sorted(_o) for _u, _n in _o[_b]]}
+                for _t, _o in _shared]
+            for _t, _o in _shared:
+                log.info("  [注意] %s/%s：竖干连续体 x≈%s y=[%s, %s] 被其他单元/楼栋的箱认领"
+                         "（%s）—— 多栋共享系统图的共享几何，非本单元漏箱"
+                         % (_rk, _ruk, _t.get("x"), _t.get("y_min"), _t.get("y_max"),
+                            "、".join("%s/%s/%s" % (_b, _u, _n)
+                                      for _b in sorted(_o) for _u, _n in _o[_b])))
+        if _real:
+            _ruv["未认领竖干连续体"] = _real
+            log.warning("  [异常] %s/%s 有 %d 个竖干连续体全图没有任何分纤箱认领，"
+                        "可能是漏箱或图层过滤不当" % (_rk, _ruk, len(_real)))
+        else:
+            _ruv.pop("未认领竖干连续体", None)
+
 _expanded_copies = set()
 for _nk, _nv in (result.get("楼栋") or {}).items():
     if not isinstance(_nv, dict):

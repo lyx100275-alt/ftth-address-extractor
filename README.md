@@ -102,7 +102,7 @@ python "$SK\scripts\ftth_launcher.py" budget                                   r
 
 ## 版本
 
-`version.json`：`minor` = 修订序号（当前 0.161.0＝一百六十一），`major` 固定 0、
+`version.json`：`minor` = 修订序号（当前 0.165.0＝一百六十五），`major` 固定 0、
 对外发布时由人工提升；不采用未经验证的语义化版本号。GitHub tag 与 release
 只在人工确认后打。
 

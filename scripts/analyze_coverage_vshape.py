@@ -65,7 +65,11 @@ import re
 import sys
 
 import ftth_common
-from coverage_engine import vshape_floor_evidence  # V3 对称：V 谷底统一证据唯一入口（纯构造）
+from coverage_engine import (  # V3 对称：V 谷底统一证据唯一入口（纯构造）
+    vshape_floor_evidence,
+    classify_coverage_pending,  # 会审 P1-2：待裁决五分类（只打标，不改判据）
+    evidence_tier_for,  # 会审 P1-3：共享证据三层（只打标，不改克隆行为）
+)
 from ftth_common import (
     clean_text, collect_texts, cluster_chain_mean, cluster_values_by_gap,
     ensure_console_utf8, floor_num, floor_num_or_zero, unit_num,
@@ -1502,14 +1506,33 @@ def main():
                   % (_bk, _un,
                      '/'.join(_miss),
                      _fmt_floors(_covered, 12)))
+            # 2026-10-07：缺层的**成因分档**——两档处置方向相反，混在一句里会把人
+            #   引向错误的排查方向。实测柳辛庄某共享系统图窗：V 型本窗**一个覆盖都没
+            #   产出**（箱锚全在布线图区，折合字高 65×），原提示却建议「检查窗口边界
+            #   /米数列是否被截断」，而窗口与米数列都完好 —— 按该提示调参只会越调越错。
+            _no_cov = (bool(_uv.get('分纤箱'))
+                       and all(not (_bx.get('覆盖范围线索') or {}).get('覆盖楼层')
+                               for _bx in _uv.get('分纤箱', [])))
+            _far = _bv.get('超邻域箱锚') or []
+            _far_txt = ('；本楼箱锚距最近米数列折合字高 %s（%d 个超邻域锚）'
+                        % ('/'.join(str(x.get('折合字高')) for x in _far[:6]), len(_far))
+                        if _far else '')
+            if _no_cov:
+                _item = 'V形法本窗未产出任何覆盖（非窗口截断）→ 覆盖缺失楼层 %s' % '/'.join(_miss)
+                _note = ('覆盖并集 无；户数标注楼层 %s。'
+                         '本窗 V 型法未产出任何箱的覆盖（箱锚缺席或全部落在米数列邻域之外%s），'
+                         '**与窗口边界/米数列截断无关** —— 调 --fx-window/--min-col-rows 无效。'
+                         '覆盖须改由其他测量方法或人工按图面直读补齐，不得由本窗米数列推算。'
+                         % (_fmt_floors(_hu, 40), _far_txt))
+            else:
+                _item = '覆盖范围缺失楼层 %s（V形法结果与户数标注不符）' % '/'.join(_miss)
+                _note = ('覆盖并集 %s；户数标注楼层 %s。'
+                         '请检查窗口边界/米数列是否被截断（参考凤鸣朝阳 8#楼 P0-12 修复）。%s'
+                         % (_fmt_floors(_covered, 8), _fmt_floors(_hu, 40), _far_txt))
             result['需人工裁决'].append({
                 '对象': '%s %s' % (_bk, _un),
-                '事项': '覆盖范围缺失楼层 %s（V形法结果与户数标注不符）'
-                        % '/'.join(_miss),
-                '说明': '覆盖并集 %s；户数标注楼层 %s。'
-                        '请检查窗口边界/米数列是否被截断（参考凤鸣朝阳 8#楼 P0-12 修复）。'
-                        % (_fmt_floors(_covered, 8),
-                           _fmt_floors(_hu, 40))})
+                '事项': _item,
+                '说明': _note})
 
     # ---- 自检：偏差可信门禁（2026-09-16，12坑复核·坑7）----
     #   阈值 = --dev-gate-factor × 层高（尺度无关，禁用绝对坐标值）。
@@ -1624,6 +1647,21 @@ def main():
     #           （待裁决，禁止进成品，由 C9 拦下）；否则 settled。
     #           口径与 parse 侧一致：有客观依据（自检通过、几何归属成立）即可定案。
     merge_pending_items(result)
+    # 会审 P1-2：待裁决五分类打标（加法式：只新增 pending_category 键，
+    # 判据/rc/pending 判定逐字不动；老产物无该键时 inspect 按缺键跳过）。
+    for _it in (result.get('需人工裁决') or []):
+        if isinstance(_it, dict) and not _it.get('pending_category'):
+            _it['pending_category'] = classify_coverage_pending(
+                _it.get('事项'), _it.get('说明'))
+    # 会审 P1-3：共享证据三层打标（只新增 evidence_tier 键，不改克隆行为）。
+    # 窗节点 = shared_geometry；成员条目 = shared_business_evidence。
+    for _bk3, _bv3 in (result.get('楼栋') or {}).items():
+        _is_win3 = str(_bk3 or '').startswith('[共享]')
+        for _uk3, _uv3 in ((_bv3 or {}).get('单元') or {}).items():
+            if not isinstance(_uv3, dict):
+                continue
+            _sw3 = _uv3.get('来源共享窗')
+            _uv3['evidence_tier'] = evidence_tier_for(_bk3, bool(_sw3), _is_win3)
 
     _dg_concl = (result.get('自检_偏差门禁') or {}).get('结论')
     _dg_ok = (_dg_concl == '可信')

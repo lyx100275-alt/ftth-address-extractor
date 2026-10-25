@@ -181,17 +181,22 @@ for i, r in enumerate(rulings, 1):
             die("第 %d 条户数为负：%d" % (i, r["值"]))
 
 
-def norm_unit(u):
+def norm_unit(u, bkey=None):
     """单元键归一（与 assemble_households.norm_unit / gen_addressbook 同则）。
 
     2026-09-19 八十九：改走 ftth_common.unit_num 唯一入口（此前自写双分支只认
     ASCII 数字，`7#楼二单元` 等中文写法原样返回致失配；ASCII 输入行为不变）。
+    2026-10-15（一百六十五）：补 第二参 bkey（楼名型单元键→1单元，与 assemble/gen 同则）。
     """
     s = str(u).strip()
     if not s:
         return s
     _n = unit_num(s)
-    return "%d单元" % _n if _n is not None else s
+    if _n is not None:
+        return "%d单元" % _n
+    if bkey is not None and s == str(bkey).strip():
+        return "1单元"
+    return s
 
 
 def pick_units(bkey, ukey):
@@ -209,10 +214,18 @@ def pick_units(bkey, ukey):
     if not ukey:
         return list(units.items())
     uk = norm_unit(ukey)
-    if uk not in units:
+    # 2026-10-15（一百六十五）：现有单元键同样归一后比对（§七七5「两边都归一」文档口径，
+    #   实现漏了；实测云峰：传「1单元」vs coverage 键「7#楼1单元」恒失配，
+    #   值裁决对 coverage 产物落数进不去；配套楼「楼名型单元键」也随 bkey 归 1单元）。
+    _hits = [k for k in units if norm_unit(k, bkey) == uk] or \
+        [k for k in units if str(k).strip() == uk]
+    if len(_hits) == 1:
+        return [(_hits[0], units[_hits[0]])]
+    if not _hits:
         die("单元 %r（归一 %r）在楼栋 %s 中不存在。现有单元：%s"
             % (ukey, uk, bkey, "、".join(sorted(units)) or "(空)"))
-    return [(uk, units[uk])]
+    die("单元 %r（归一 %r）在楼栋 %s 归一后命中多个键（歧义，须人工指定）：%s"
+        % (ukey, uk, bkey, "、".join(sorted(_hits))))
 
 
 # ---------- 执行 ----------
@@ -379,9 +392,29 @@ for r in rulings:
         tgt_key = {"安装楼层": "安装楼层", "覆盖范围": "覆盖范围线索"}[t]
         for b in hit:
             old = b.get(tgt_key)
-            b[tgt_key] = r["值"]
-            changes.append("%s %s/%s %s(%s): %s -> %s"
-                           % (t, r["楼栋"], uk, r["箱"], tgt_key, old, r["值"]))
+            _extra = ""
+            if t == "覆盖范围" and isinstance(old, dict):
+                # 2026-10-15（一百六十五）：旧值是 dict 时就地保留结构，仅改「覆盖楼层」子键。
+                #   整体替换成 list 会破坏下游按 dict 读 `.get("覆盖楼层")` 的约定
+                #   （inspect cmap / gen cov_floors），实测会 AttributeError。
+                _nv = dict(old)
+                _nv["覆盖楼层"] = r["值"]
+                b[tgt_key] = _nv
+            else:
+                b[tgt_key] = r["值"]
+            # 2026-10-15（一百六十五）：值落数后同步翻转箱状态（C8 正交字段）：
+            #   ① origin=unresolved→derived（人工已给值，非「无解」）；
+            #   ② confirmation pending→settled；不动已为 derived/measured 的 origin
+            #   （人工裁决不改变「怎么来的」）。此前无任何工具翻转，实测云峰
+            #   7/8/10 三箱用户裁决后出口门禁仍被拦，流程无法走通。
+            if b.get("result_origin") == "unresolved":
+                b["result_origin"] = "derived"
+                _extra += "〃origin:unresolved→derived"
+            if b.get("result_confirmation") == "pending":
+                b["result_confirmation"] = "settled"
+                _extra += "〃confirmation→settled"
+            changes.append("%s %s/%s %s(%s): %s -> %s%s"
+                           % (t, r["楼栋"], uk, r["箱"], tgt_key, old, r["值"], _extra))
 
 # ---------- 统计 ----------
 print("[apply-ruling] 裁决 %d 条，落数 %d 处：" % (len(rulings), len(changes)))

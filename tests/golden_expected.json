@@ -5,7 +5,7 @@
       "dxf": "C:\\Users\\Alpha\\.config\\TeleAgent\\users\\v1_public_1903017811319390212\\技能版本库\\ftth-address-extractor\\tests\\corpus\\test_a.dxf",
       "expect": {
         "files_md5": {
-          "coverage.json": "cf3d826a1b0c3bd12a444a6df6bf6345",
+          "coverage.json": "deaf46bcf15adbfac2bf19bc426a4ee9",
           "parsed.json": "69b01dcf373927fe4fc2d5ab12a4c8fc",
           "titleblock.json": "654b8ad4c96bcc05fbca465d47a3b72f",
           "unit_box_gaps.json": "7828ab5a72037036a2bee516936b5d6e"
@@ -41,21 +41,21 @@
         },
         "files_md5": {
           "count_box.json": "6d8eb0e858cfcf5b498e71dbab675fc6",
-          "coverage.json": "fc82118a6534477d735f08684532f384",
+          "coverage.json": "3bfdb8716ddb07f46b9df8168885d285",
           "fxmap.json": "fddbb5d2f3442860dbae2c12d88a4680",
-          "parsed.json": "6413330d60e43babc3d83e6dd0e8baf7",
+          "parsed.json": "64b97cfc79e10bec668050225349fc35",
           "unit_box_gaps.json": "1329c0915708cd3ef94a024cf08cc78b"
         },
         "inspect": {
-          "fails_h": "37532c67a743",
-          "fails_n": 5,
+          "fails_h": "a13ae922bb0c",
+          "fails_n": 8,
           "rc": 2,
-          "warns_h": "79cd10977ea0",
-          "warns_n": 12
+          "warns_h": "e34e7c8d1066",
+          "warns_n": 13
         }
       }
     }
   },
-  "generated_from": "0.161.0",
+  "generated_from": "0.165.0",
   "version": 2
 }

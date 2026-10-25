@@ -846,6 +846,11 @@ for _g in _shared_groups:
     _g2 = dict(_g)
     _g2["源标题"] = _titles
     _g2["判据"] = "同一标题展开多栋" if len(_titles) == 1 else "不同标题同区间（疑假共享）"
+    # 会审 P1-3：共享证据三层（只打标，不改克隆行为）。
+    # 同一标题展开多栋 = 几何可克隆，业务结论仍须按栋绑定复核；
+    # 疑假共享 = 本栋私有证据，不得跨栋复制。
+    _g2["evidence_tier"] = ("shared_geometry" if len(_titles) == 1
+                            else "building_specific_evidence")
     if len(_titles) != 1:
         log.warning("  [疑假共享] %s 落在同一 x 区间，但来源标题不止一种：%s —— 不得克隆，须人工裁决"
                     % ("、".join(_g["names"]), _titles))

@@ -631,6 +631,69 @@ def bldg_range_evidence(texts, lo, hi, skip_text=None):
     return out
 
 
+def bldg_range_evidence_bundle(texts, lo, hi, skip_text=None):
+    """区间写法 N-M 号楼的四点证据汇总（纯组织，不裁决；会审 P2）。
+
+    只把"请人工判断 2-3 是什么意思"升级成"已有 X 条支持并列、Y 条支持区间"，
+    仍由人工裁决，不自动选边。
+
+    四点（均为客观计数，可复核）：
+      ① 中间编号独立实体（复用 bldg_range_evidence，不含区间标题自证）；
+      ② 独立标题锚点（中间编号拥有**非区间**系统图/布线图标题）；
+      ③ 箱位标注（`K号楼…单元…层`，K 在区间内）；
+      ④ 区间标题原文（触发本次判定的那条 N-M 标题本身，列出备查）。
+
+    返回 dict（含"小结"一行人读句）；输入非法/无区间时返回空证据的 bundle，不抛错。
+    """
+    _b = {"区间": None, "中间编号": [], "独立标题": [], "箱位标注": [],
+          "区间标题": None, "小结": "无区间写法，不适用"}
+    try:
+        _lo, _hi = int(lo), int(hi)
+    except (TypeError, ValueError):
+        return _b
+    if _hi - _lo < 2:
+        return _b
+    _b["区间"] = "%s-%s" % (_lo, _hi)
+    _b["中间编号"] = list(range(_lo + 1, _hi))
+    _skip_id = id(skip_text) if skip_text is not None else None
+    _mid = []
+    for _t in (texts or []):
+        if not isinstance(_t, dict) or id(_t) == _skip_id:
+            continue
+        _s = str(_t.get("内容") or "")
+        if not _s or _RANGE_TITLE_RE.search(_s):
+            continue
+        for _k in range(_lo + 1, _hi):
+            _pat = re.compile(r"(?<![0-9])%d\s*[#\uff03]?\s*\u53f7?\s*\u697c" % _k)
+            if _pat.search(_s):
+                _mid.append((_k, _s[:40], _t.get("x"), _t.get("y")))
+                break
+    # 去重到编号级（同一编号多条文字只计一条证据，计数不虚增）
+    _seen, _uniq = set(), []
+    for _k, _s, _x, _y in _mid:
+        if _k not in _seen:
+            _seen.add(_k)
+            _uniq.append({"编号": str(_k), "文字": _s, "x": _x, "y": _y})
+    # ②/③拆分：标题 vs 箱位标注（`单元`+`层`同现即箱位口径原文）
+    for _e in _uniq:
+        _s = str(_e.get("文字") or "")
+        if ("单元" in _s and "层" in _s):
+            _b["箱位标注"].append(_e)
+        elif bool(re.search(r"系统图|布线图|示意图", _s)):
+            _b["独立标题"].append(_e)
+        else:
+            _b["独立标题"].append(_e)
+    if skip_text is not None and isinstance(skip_text, dict):
+        _b["区间标题"] = str(skip_text.get("内容") or "")[:60]
+    _n_par = len(_uniq)  # 支持"并列/区间需逐栋有实体"的证据数
+    _b["小结"] = ("区间 %s：中间编号 %s 在图上各有独立实体证据 %d 条"
+                  "（独立标题 %d / 箱位标注 %d），"
+                  "支持按区间理解；无证据的编号仍按字面取，须人工裁决" % (
+                      _b["区间"], _b["中间编号"], _n_par,
+                      len(_b["独立标题"]), len(_b["箱位标注"])))
+    return _b
+
+
 def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
     """
     从文字列表中搜索楼栋标题，建立锚点。
@@ -705,6 +768,8 @@ def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
                     except (TypeError, ValueError):
                         _lo2 = _hi2 = None
                 _ev = bldg_range_evidence(texts, _lo2, _hi2, t)
+                # 会审 P2：四点证据汇总（只组织证据，不自动裁决；日志-only，不改锚点行为）。
+                _bundle = bldg_range_evidence_bundle(texts, _lo2, _hi2, t)
                 if _ev:
                     for _k, _s, _ex, _ey in _ev:
                         if str(_k) not in nums:
@@ -715,20 +780,29 @@ def find_bldg_anchors(texts, title_re, log=None, expand_ranges=None):
                         "补入楼栋": [str(e[0]) for e in _ev],
                         "证据": [{"编号": str(e[0]), "文字": e[1], "x": e[2], "y": e[3]}
                                  for e in _ev],
+                        "证据汇总": _bundle,
                     })
                     _log.info("  [楼栋区间按证据展开] %r：区间 %s 的中间编号 %s 在图上有独立实体"
                               "证据（%s）→ 按区间语义补入；其余无证据编号仍按字面取。"
+                              "证据汇总：%s"
                               % (str(t.get("内容"))[:40], _rng, [e[0] for e in _ev],
-                                 "、".join("%s\u2190%r" % (e[0], e[1][:18]) for e in _ev)))
+                                 "、".join("%s\u2190%r" % (e[0], e[1][:18]) for e in _ev),
+                                 _bundle.get("小结")))
                 else:
+                    BLDG_RANGE_EXPANDED.append({
+                        "标题": str(t.get("内容"))[:60], "区间": _rng,
+                        "补入楼栋": [],
+                        "证据": [],
+                        "证据汇总": _bundle,
+                    })
                     _log.warning(
                         "  [楼栋区间待裁决] 标题 %r 命中连字符写法「%s号楼」，"
                         "语义存疑（并列 %s 栋 vs 区间 %s 至 %s 共 %d 栋）；"
                         "当前按**字面**取到 %s —— 若实为区间，将静默少解中间楼栋。"
-                        "请向用户确认后加 --expand-bldg-ranges 重跑。",
+                        "证据汇总：%s。请向用户确认后加 --expand-bldg-ranges 重跑。",
                         t["内容"][:40], _rng, len(nums), _rng.split("-")[0], _rng.split("-")[-1],
                         (int(_rng.split("-")[-1]) - int(_rng.split("-")[0]) + 1)
-                        if "-" in _rng else len(nums), nums)
+                        if "-" in _rng else len(nums), nums, _bundle.get("小结"))
         # 标题正则自带捕获组：若给出 parse 未覆盖的楼号（自定义写法），一并并入。
         # 用 first_group 安全取组——正则可能是 `\d+号楼` 这种**无捕获组**写法。
         for m in matches:

@@ -435,6 +435,45 @@ ck("META 域", "summarize 按域计数",
 ck("META 域", "老议题（无域键）按域回算不崩",
    CE.summarize([{"类型": "UNASSIGNED", "对象": "FX09"}]).get("按域") == {"relation": 1})
 
+# ============================================================
+# 场景 16：会审 P1-2/P1-3/P2 纯函数回归（无 DXF，秒级）
+#   P1-2 待裁决五分类只打标不改判据；P1-3 证据三层只打标不改克隆；
+#   P2 区间证据包只组织证据不自动裁决。三者均为纯函数，判别力在此锁定。
+# ============================================================
+import coverage_engine as CVE  # noqa: E402
+import ftth_common as FC  # noqa: E402
+ck("S16 五分类", "无箱号锚归绑定失败",
+   CVE.classify_coverage_pending("窗口内无箱号锚", "该带内容未判定") == "COVERAGE_BOX_BINDING_UNKNOWN")
+ck("S16 五分类", "V段箱数不一致归绑定失败",
+   CVE.classify_coverage_pending("V段数与箱数不一致", "x") == "COVERAGE_BOX_BINDING_UNKNOWN")
+ck("S16 五分类", "双源不一致归来源冲突",
+   CVE.classify_coverage_pending("安装层两来源不一致", "V型谷底判1F，直读为2F") == "COVERAGE_SOURCE_CONFLICT")
+ck("S16 五分类", "缺层+截断提示归窗口截断（优先于冲突）",
+   CVE.classify_coverage_pending("覆盖范围缺失楼层 1F/2F", "请检查窗口边界/米数列是否被截断") == "COVERAGE_WINDOW_INCOMPLETE")
+ck("S16 五分类", "缺层无截断归真缺口",
+   CVE.classify_coverage_pending("覆盖范围缺失楼层 1F", "覆盖并集 2F") == "COVERAGE_TRUE_GAP")
+ck("S16 五分类", "无判定依据归缺数据（不得伪装真缺口）",
+   CVE.classify_coverage_pending("覆盖范围无法判定", "找不到任何竖干连续体") == "COVERAGE_DATA_INCOMPLETE"
+   and CVE.classify_coverage_pending("未知事项", "未知说明") == "COVERAGE_DATA_INCOMPLETE")
+ck("S16 五分类", "五类枚举封闭",
+   set(CVE.PENDING_COVERAGE_CATEGORIES) == {"COVERAGE_DATA_INCOMPLETE", "COVERAGE_WINDOW_INCOMPLETE",
+    "COVERAGE_BOX_BINDING_UNKNOWN", "COVERAGE_SOURCE_CONFLICT", "COVERAGE_TRUE_GAP"})
+ck("S16 三层", "窗节点归几何层",
+   CVE.evidence_tier_for("[共享]1-3号楼综合布线系统图", False, True) == "shared_geometry")
+ck("S16 三层", "成员条目归业务层",
+   CVE.evidence_tier_for("1#楼", True, False) == "shared_business_evidence")
+ck("S16 三层", "普通条目归本栋私有层",
+   CVE.evidence_tier_for("1#楼", False, False) == "building_specific_evidence")
+_s16t = [{"内容": "2#楼系统图", "x": 1.0, "y": 2.0},
+         {"内容": "2号楼1单元1层", "x": 3.0, "y": 4.0},
+         {"内容": "1-3号楼综合布线系统图", "x": 0.0, "y": 0.0}]
+_s16b = FC.bldg_range_evidence_bundle(_s16t, 1, 3, _s16t[2])
+ck("S16 证据包", "中间编号独立实体被收录且不自动裁决",
+   _s16b.get("区间") == "1-3" and len(_s16b.get("独立标题") or []) >= 1
+   and "须人工裁决" in str(_s16b.get("小结")))
+ck("S16 证据包", "非法输入返回空包不抛错",
+   FC.bldg_range_evidence_bundle([], None, None).get("小结") == "无区间写法，不适用")
+
 for p in TMP:
     try:
         if os.path.isdir(p):
